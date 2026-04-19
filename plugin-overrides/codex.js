@@ -2,6 +2,7 @@ globalThis.__openusage_ast_patch = {
   functions: [
     { target: "loadAuth", with: "patchLoadAuth", mode: "wrap" },
     { target: "saveAuth", with: "patchSaveAuth", mode: "wrap" },
+    { target: "refreshToken", with: "patchRefreshToken", mode: "wrap" },
   ],
 };
 
@@ -24,6 +25,28 @@ function patchSaveAuth(originalSaveAuth, ctx, authState) {
     return persistAuthToOpencode(ctx, authState);
   }
   return originalSaveAuth(ctx, authState);
+}
+
+function patchRefreshToken(originalRefreshToken, ctx, authState) {
+  if (!authState || authState.source !== "opencode") {
+    return originalRefreshToken(ctx, authState);
+  }
+
+  const currentAccessToken = readAccessToken(authState);
+  const latestAuthState = reloadOpencodeAuthState(ctx, authState);
+  if (latestAuthState) {
+    applyAuthState(authState, latestAuthState);
+    const reloadedAccessToken = readAccessToken(authState);
+    if (
+      isNonEmptyString(reloadedAccessToken) &&
+      (!isNonEmptyString(currentAccessToken) || reloadedAccessToken !== currentAccessToken)
+    ) {
+      logInfo(ctx, "codex override: token reloaded from opencode auth.json, refresh skipped");
+      return reloadedAccessToken;
+    }
+  }
+
+  return originalRefreshToken(ctx, authState);
 }
 
 function logInfo(ctx, message) {
@@ -65,6 +88,23 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function readAccessToken(authState) {
+  if (!authState || !authState.auth || !authState.auth.tokens) {
+    return "";
+  }
+  const accessToken = authState.auth.tokens.access_token;
+  return isNonEmptyString(accessToken) ? accessToken.trim() : "";
+}
+
+function applyAuthState(targetAuthState, latestAuthState) {
+  if (!targetAuthState || !latestAuthState) {
+    return;
+  }
+  targetAuthState.source = latestAuthState.source;
+  targetAuthState.authPath = latestAuthState.authPath;
+  targetAuthState.auth = latestAuthState.auth;
+}
+
 function buildCodexAuthStateFromOpencodeDoc(doc, sourcePath) {
   if (!doc || typeof doc !== "object") {
     return null;
@@ -100,6 +140,53 @@ function buildCodexAuthStateFromOpencodeDoc(doc, sourcePath) {
   };
 }
 
+function loadOpencodeAuthAtPath(ctx, authPath) {
+  if (!ctx || !ctx.host || !ctx.host.fs || !isNonEmptyString(authPath)) {
+    return null;
+  }
+
+  if (!ctx.host.fs.exists(authPath)) {
+    return null;
+  }
+
+  const text = ctx.host.fs.readText(authPath);
+  const doc = parseJsonLoose(text);
+  if (!doc) {
+    logWarn(ctx, "codex override: opencode auth file is invalid JSON: " + authPath);
+    return null;
+  }
+
+  const authState = buildCodexAuthStateFromOpencodeDoc(doc, authPath);
+  if (!authState) {
+    logWarn(ctx, "codex override: openai auth payload not found in " + authPath);
+    return null;
+  }
+
+  return authState;
+}
+
+function reloadOpencodeAuthState(ctx, authState) {
+  if (!ctx || !ctx.host || !ctx.host.fs) {
+    return null;
+  }
+
+  if (authState && isNonEmptyString(authState.authPath)) {
+    try {
+      const fromCurrentPath = loadOpencodeAuthAtPath(ctx, authState.authPath);
+      if (fromCurrentPath) {
+        return fromCurrentPath;
+      }
+    } catch (e) {
+      logWarn(
+        ctx,
+        "codex override: failed to reload opencode auth from " + authState.authPath + ": " + String(e)
+      );
+    }
+  }
+
+  return loadOpencodeAuthFallback(ctx);
+}
+
 function loadOpencodeAuthFallback(ctx) {
   if (!ctx || !ctx.host || !ctx.host.fs) {
     return null;
@@ -108,20 +195,8 @@ function loadOpencodeAuthFallback(ctx) {
   for (let i = 0; i < OPENCODE_AUTH_PATHS.length; i++) {
     const authPath = OPENCODE_AUTH_PATHS[i];
     try {
-      if (!ctx.host.fs.exists(authPath)) {
-        continue;
-      }
-
-      const text = ctx.host.fs.readText(authPath);
-      const doc = parseJsonLoose(text);
-      if (!doc) {
-        logWarn(ctx, "codex override: opencode auth file is invalid JSON: " + authPath);
-        continue;
-      }
-
-      const fallback = buildCodexAuthStateFromOpencodeDoc(doc, authPath);
+      const fallback = loadOpencodeAuthAtPath(ctx, authPath);
       if (!fallback) {
-        logWarn(ctx, "codex override: openai auth payload not found in " + authPath);
         continue;
       }
 

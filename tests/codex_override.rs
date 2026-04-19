@@ -204,6 +204,81 @@ fn codex_override_persists_refresh_back_to_opencode_auth_file() {
 }
 
 #[test]
+fn codex_override_reloads_opencode_auth_before_refresh() {
+    let output = execute_probe_with_setup(
+        r#"
+        __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({
+          openai: {
+            type: "oauth",
+            refresh: "old-refresh",
+            access: "old-access",
+            expires: 1776806966592,
+            accountId: "acc-123"
+          }
+        });
+        __test_state.responses.usage.push({
+          status: 401,
+          headers: {},
+          bodyText: JSON.stringify({ error: "expired" })
+        });
+        __test_state.responses.usage.push({
+          status: 200,
+          headers: {},
+          bodyText: JSON.stringify({})
+        });
+
+        __test_ctx.util.retryOnceOnAuth = function (opts) {
+          var first = opts.request();
+          if (!__test_ctx.util.isAuthStatus(first.status)) return first;
+
+          __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({
+            openai: {
+              type: "oauth",
+              refresh: "new-refresh-from-opencode",
+              access: "new-access-from-opencode",
+              expires: 1776806966592,
+              accountId: "acc-123"
+            }
+          });
+
+          var refreshed = opts.refresh();
+          if (!refreshed) return first;
+          return opts.request(refreshed);
+        };
+        "#,
+    );
+
+    assert_eq!(output["ok"], Value::Bool(true));
+
+    let requests = output["state"]["requests"]
+        .as_array()
+        .expect("requests array");
+
+    assert!(
+        requests.iter().all(|req| !req["url"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("oauth/token")),
+        "refresh endpoint should not be called when auth.json already has a new token"
+    );
+
+    let usage_requests: Vec<&Value> = requests
+        .iter()
+        .filter(|req| {
+            req["url"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("/wham/usage")
+        })
+        .collect();
+    assert!(usage_requests.len() >= 2, "expected two usage requests");
+    assert_eq!(
+        usage_requests[1]["authorization"],
+        Value::String("Bearer new-access-from-opencode".to_string())
+    );
+}
+
+#[test]
 fn codex_override_preserves_other_providers_when_persisting_refresh() {
     let output = execute_probe_with_setup(
         r#"
