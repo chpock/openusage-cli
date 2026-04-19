@@ -18,6 +18,19 @@
   - `cargo test --test http_smoke`
   - `cargo test --test plugin_compatibility`
 
+## Configuration contract (required for all new params)
+- Config file is `config.yaml` (YAML) resolved in `src/config.rs` via `ProjectDirs::from("com", "openusage", "openusage-cli")` (`config_dir()/config.yaml`), with fallback to `./.openusage-cli/config.yaml`.
+- On startup, config file must be auto-created if missing, using a full template that includes all supported fields and explanatory comments.
+- Source-of-truth precedence is strict: CLI flags (and supported env vars) > `config.yaml` > built-in defaults.
+- If you add a new runtime setting, update **all** of the following in the same change:
+  1) CLI flag parsing in `src/main.rs` (`Cli`),
+  2) YAML schema in `src/config.rs` (`AppConfig`),
+  3) default config template in `src/config.rs` (include comments + explicit default value or documented `null` behavior),
+  4) source merge logic in `RuntimeCli::from_sources` so precedence stays consistent,
+  5) tests covering defaults and override precedence.
+- Do not add config-only settings that cannot be overridden via CLI when a corresponding runtime CLI option exists.
+- Keep comments in default template practical: what parameter does, valid values/units, and what happens when `null`/unset.
+
 ## Runtime wiring (entrypoints)
 - Process entrypoint: `src/main.rs`
 - HTTP routes: `src/http_api.rs`

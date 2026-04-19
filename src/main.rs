@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use directories::ProjectDirs;
+use openusage_cli::config;
 use openusage_cli::daemon::{CachedPluginSnapshot, DaemonState};
 use openusage_cli::http_api::{self, ApiState};
 use openusage_cli::plugin_engine::manifest;
@@ -17,11 +18,11 @@ use tokio::net::TcpListener;
 #[command(name = "openusage-cli")]
 #[command(about = "HTTP daemon for AI usage limit plugins")]
 struct Cli {
-    #[arg(long, default_value = "127.0.0.1")]
-    host: String,
+    #[arg(long)]
+    host: Option<String>,
 
-    #[arg(long, default_value_t = 6736)]
-    port: u16,
+    #[arg(long)]
+    port: Option<u16>,
 
     #[arg(long, env = "OPENUSAGE_PLUGINS_DIR")]
     plugins_dir: Option<PathBuf>,
@@ -32,8 +33,8 @@ struct Cli {
     #[arg(long, env = "OPENUSAGE_PLUGIN_OVERRIDES_DIR")]
     plugin_overrides_dir: Option<PathBuf>,
 
-    #[arg(long, default_value_t = 300)]
-    refresh_interval_secs: u64,
+    #[arg(long)]
+    refresh_interval_secs: Option<u64>,
 
     #[arg(long, default_value_t = false)]
     daemon: bool,
@@ -59,30 +60,33 @@ async fn main() -> Result<()> {
 async fn run() -> Result<()> {
     let raw_args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let cli = Cli::parse();
+    let loaded_config = config::load_or_create_config().context("failed to load config")?;
+    let runtime = RuntimeCli::from_sources(cli, loaded_config.config);
     let app_version = env!("CARGO_PKG_VERSION").to_string();
 
     log::info!("starting openusage-cli v{}", app_version);
+    log::info!("using config file: {}", loaded_config.path.display());
     log::debug!(
         "startup options: host={}, port={}, refresh_interval_secs={}, daemon={}, daemon_child={}, plugins_dir={:?}, app_data_dir={:?}, plugin_overrides_dir={:?}",
-        cli.host,
-        cli.port,
-        cli.refresh_interval_secs,
-        cli.daemon,
-        cli.daemon_child,
-        cli.plugins_dir,
-        cli.app_data_dir,
-        cli.plugin_overrides_dir
+        runtime.host,
+        runtime.port,
+        runtime.refresh_interval_secs,
+        runtime.daemon,
+        runtime.daemon_child,
+        runtime.plugins_dir,
+        runtime.app_data_dir,
+        runtime.plugin_overrides_dir
     );
 
-    if cli.daemon && !cli.daemon_child {
+    if runtime.daemon && !runtime.daemon_child {
         let child_pid =
             spawn_daemon_process(&raw_args).context("failed to spawn background daemon process")?;
         log::info!("daemon mode enabled; spawned background process pid={child_pid}");
         return Ok(());
     }
 
-    let app_data_dir =
-        resolve_app_data_dir(cli.app_data_dir).context("failed to resolve app data directory")?;
+    let app_data_dir = resolve_app_data_dir(runtime.app_data_dir)
+        .context("failed to resolve app data directory")?;
     log::info!("using app data dir: {}", app_data_dir.display());
     std::fs::create_dir_all(&app_data_dir).with_context(|| {
         format!(
@@ -93,7 +97,7 @@ async fn run() -> Result<()> {
     log::debug!("ensured app data directory exists");
 
     let plugins_dir =
-        resolve_plugins_dir(cli.plugins_dir).context("failed to resolve plugins directory")?;
+        resolve_plugins_dir(runtime.plugins_dir).context("failed to resolve plugins directory")?;
     log::info!("using plugins dir: {}", plugins_dir.display());
     let plugins = manifest::load_plugins_from_dir(&plugins_dir);
     if plugins.is_empty() {
@@ -111,7 +115,7 @@ async fn run() -> Result<()> {
     let plugin_ids: Vec<String> = plugins.iter().map(|p| p.manifest.id.clone()).collect();
     log::debug!("loaded plugin ids: {:?}", plugin_ids);
 
-    let plugin_overrides_dir = resolve_plugin_overrides_dir(cli.plugin_overrides_dir)
+    let plugin_overrides_dir = resolve_plugin_overrides_dir(runtime.plugin_overrides_dir)
         .context("failed to resolve plugin overrides directory")?;
     if let Some(path) = &plugin_overrides_dir {
         log::info!("using plugin overrides dir: {}", path.display());
@@ -138,12 +142,12 @@ async fn run() -> Result<()> {
         }
     }
 
-    let refresh_task = if cli.refresh_interval_secs > 0 {
+    let refresh_task = if runtime.refresh_interval_secs > 0 {
         let refresh_state = daemon.clone();
-        let refresh_every = Duration::from_secs(cli.refresh_interval_secs);
+        let refresh_every = Duration::from_secs(runtime.refresh_interval_secs);
         log::info!(
             "background refresh enabled (every {}s)",
-            cli.refresh_interval_secs
+            runtime.refresh_interval_secs
         );
         Some(tokio::spawn(async move {
             log::debug!("background refresh task started");
@@ -162,7 +166,7 @@ async fn run() -> Result<()> {
         None
     };
 
-    let addr: SocketAddr = format!("{}:{}", cli.host, cli.port)
+    let addr: SocketAddr = format!("{}:{}", runtime.host, runtime.port)
         .parse()
         .context("invalid bind address")?;
     log::info!("attempting to bind HTTP listener on {}", addr);
@@ -207,6 +211,142 @@ async fn run() -> Result<()> {
 
     log::info!("HTTP server stopped");
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeCli {
+    host: String,
+    port: u16,
+    plugins_dir: Option<PathBuf>,
+    app_data_dir: Option<PathBuf>,
+    plugin_overrides_dir: Option<PathBuf>,
+    refresh_interval_secs: u64,
+    daemon: bool,
+    daemon_child: bool,
+}
+
+impl RuntimeCli {
+    fn from_sources(cli: Cli, config: config::AppConfig) -> Self {
+        let host = cli
+            .host
+            .or(config.host)
+            .unwrap_or_else(|| config::DEFAULT_HOST.to_string());
+        let port = cli.port.or(config.port).unwrap_or(config::DEFAULT_PORT);
+        let refresh_interval_secs = cli
+            .refresh_interval_secs
+            .or(config.refresh_interval_secs)
+            .unwrap_or(config::DEFAULT_REFRESH_INTERVAL_SECS);
+        let daemon = if cli.daemon {
+            true
+        } else {
+            config.daemon.unwrap_or(false)
+        };
+
+        Self {
+            host,
+            port,
+            plugins_dir: cli.plugins_dir.or(config.plugins_dir),
+            app_data_dir: cli.app_data_dir.or(config.app_data_dir),
+            plugin_overrides_dir: cli.plugin_overrides_dir.or(config.plugin_overrides_dir),
+            refresh_interval_secs,
+            daemon,
+            daemon_child: cli.daemon_child,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_cli() -> Cli {
+        Cli {
+            host: None,
+            port: None,
+            plugins_dir: None,
+            app_data_dir: None,
+            plugin_overrides_dir: None,
+            refresh_interval_secs: None,
+            daemon: false,
+            daemon_child: false,
+        }
+    }
+
+    #[test]
+    fn runtime_cli_uses_defaults_when_no_input_values() {
+        let runtime = RuntimeCli::from_sources(empty_cli(), config::AppConfig::default());
+
+        assert_eq!(runtime.host, config::DEFAULT_HOST);
+        assert_eq!(runtime.port, config::DEFAULT_PORT);
+        assert_eq!(
+            runtime.refresh_interval_secs,
+            config::DEFAULT_REFRESH_INTERVAL_SECS
+        );
+        assert!(!runtime.daemon);
+    }
+
+    #[test]
+    fn runtime_cli_uses_config_values_when_cli_is_empty() {
+        let app_config = config::AppConfig {
+            host: Some("0.0.0.0".to_string()),
+            port: Some(9000),
+            plugins_dir: Some(PathBuf::from("/tmp/plugins")),
+            app_data_dir: Some(PathBuf::from("/tmp/data")),
+            plugin_overrides_dir: Some(PathBuf::from("/tmp/overrides")),
+            refresh_interval_secs: Some(42),
+            daemon: Some(true),
+            proxy: None,
+        };
+        let runtime = RuntimeCli::from_sources(empty_cli(), app_config);
+
+        assert_eq!(runtime.host, "0.0.0.0");
+        assert_eq!(runtime.port, 9000);
+        assert_eq!(runtime.plugins_dir, Some(PathBuf::from("/tmp/plugins")));
+        assert_eq!(runtime.app_data_dir, Some(PathBuf::from("/tmp/data")));
+        assert_eq!(
+            runtime.plugin_overrides_dir,
+            Some(PathBuf::from("/tmp/overrides"))
+        );
+        assert_eq!(runtime.refresh_interval_secs, 42);
+        assert!(runtime.daemon);
+    }
+
+    #[test]
+    fn runtime_cli_prioritizes_cli_values_over_config() {
+        let cli = Cli {
+            host: Some("127.0.0.2".to_string()),
+            port: Some(7001),
+            plugins_dir: Some(PathBuf::from("/cli/plugins")),
+            app_data_dir: Some(PathBuf::from("/cli/data")),
+            plugin_overrides_dir: Some(PathBuf::from("/cli/overrides")),
+            refresh_interval_secs: Some(7),
+            daemon: true,
+            daemon_child: false,
+        };
+        let app_config = config::AppConfig {
+            host: Some("0.0.0.0".to_string()),
+            port: Some(9000),
+            plugins_dir: Some(PathBuf::from("/cfg/plugins")),
+            app_data_dir: Some(PathBuf::from("/cfg/data")),
+            plugin_overrides_dir: Some(PathBuf::from("/cfg/overrides")),
+            refresh_interval_secs: Some(60),
+            daemon: Some(false),
+            proxy: None,
+        };
+
+        let runtime = RuntimeCli::from_sources(cli, app_config);
+
+        assert_eq!(runtime.host, "127.0.0.2");
+        assert_eq!(runtime.port, 7001);
+        assert_eq!(runtime.plugins_dir, Some(PathBuf::from("/cli/plugins")));
+        assert_eq!(runtime.app_data_dir, Some(PathBuf::from("/cli/data")));
+        assert_eq!(
+            runtime.plugin_overrides_dir,
+            Some(PathBuf::from("/cli/overrides"))
+        );
+        assert_eq!(runtime.refresh_interval_secs, 7);
+        assert!(runtime.daemon);
+    }
 }
 
 fn resolve_app_data_dir(cli_value: Option<PathBuf>) -> Result<PathBuf> {
