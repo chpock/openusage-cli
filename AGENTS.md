@@ -18,6 +18,12 @@
   - `cargo test --test http_smoke`
   - `cargo test --test plugin_compatibility`
 
+## Commit message policy
+- Use Conventional Commits for all new commits in this repository.
+- Preferred types: `feat`, `fix`, `chore`, `docs`, `refactor`, `test`, `build`, `ci`, `perf`.
+- Subject line format: `<type>(optional-scope): <short imperative summary>`.
+- Commit messages are multi-line: keep the first line as Conventional Commit subject, then add a detailed body describing what changed and why.
+
 ## Configuration contract (required for all new params)
 - Config file is `config.yaml` (YAML) resolved in `src/config.rs` via `ProjectDirs::from("com", "openusage", "openusage-cli")` (`config_dir()/config.yaml`), with fallback to `./.openusage-cli/config.yaml`.
 - On startup, missing config file must not be auto-created; runtime uses CLI/env/default values.

@@ -1,0 +1,207 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-packages:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract app version from tag
+        run: |
+          app_version="${GITHUB_REF_NAME#v}"
+          if [ -z "$app_version" ] || [ "$app_version" = "$GITHUB_REF_NAME" ]; then
+            echo "Unable to extract app version from tag: $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          echo "APP_VERSION=$app_version" >> "$GITHUB_ENV"
+
+      - name: Apply release version to Cargo manifest
+        run: |
+          sed -i -E "0,/^version = \".*\"/s//version = \"${APP_VERSION}\"/" Cargo.toml
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo directories
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.arch }}
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm
+          cargo install --locked cargo-deb cargo-generate-rpm
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Build deb package
+        run: cargo deb --no-build
+
+      - name: Build rpm package
+        run: cargo generate-rpm
+
+      - name: Collect release packages
+        run: |
+          mkdir -p dist
+          cp target/debian/*.deb dist/
+          cp target/generate-rpm/*.rpm dist/
+
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish-release:
+    needs: build-packages
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Download package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: linux-packages-*
+          merge-multiple: true
+          path: dist
+
+      - name: Generate release notes from tags and commits
+        run: |
+          current_tag="$GITHUB_REF_NAME"
+          previous_tag="$(git describe --tags --abbrev=0 --match 'v*.*.*' "${current_tag}^" 2>/dev/null || true)"
+
+          if [ -n "$previous_tag" ]; then
+            commit_range="$previous_tag..$current_tag"
+            range_label="$previous_tag -> $current_tag"
+          else
+            commit_range="$current_tag"
+            range_label="initial release"
+          fi
+
+          tmp_dir="$(mktemp -d)"
+          trap 'rm -rf "$tmp_dir"' EXIT
+
+          touch \
+            "$tmp_dir/features.txt" \
+            "$tmp_dir/fixes.txt" \
+            "$tmp_dir/performance.txt" \
+            "$tmp_dir/refactoring.txt" \
+            "$tmp_dir/docs.txt" \
+            "$tmp_dir/tests.txt" \
+            "$tmp_dir/build.txt" \
+            "$tmp_dir/ci.txt" \
+            "$tmp_dir/chore.txt" \
+            "$tmp_dir/other.txt"
+
+          git log --no-merges --pretty=format:'%s|%h' "$commit_range" > "$tmp_dir/commits.txt"
+
+          while IFS='|' read -r subject short_sha; do
+            [ -n "$subject" ] || continue
+            entry="- $subject ($short_sha)"
+            if [[ "$subject" =~ ^feat(\([^)]+\))?!?:[[:space:]] ]]; then
+              printf '%s\n' "$entry" >> "$tmp_dir/features.txt"
+            elif [[ "$subject" =~ ^fix(\([^)]+\))?!?:[[:space:]] ]]; then
+              printf '%s\n' "$entry" >> "$tmp_dir/fixes.txt"
+            elif [[ "$subject" =~ ^perf(\([^)]+\))?!?:[[:space:]] ]]; then
+              printf '%s\n' "$entry" >> "$tmp_dir/performance.txt"
+            elif [[ "$subject" =~ ^refactor(\([^)]+\))?!?:[[:space:]] ]]; then
+              printf '%s\n' "$entry" >> "$tmp_dir/refactoring.txt"
+            elif [[ "$subject" =~ ^docs(\([^)]+\))?!?:[[:space:]] ]]; then
+              printf '%s\n' "$entry" >> "$tmp_dir/docs.txt"
+            elif [[ "$subject" =~ ^test(\([^)]+\))?!?:[[:space:]] ]]; then
+              printf '%s\n' "$entry" >> "$tmp_dir/tests.txt"
+            elif [[ "$subject" =~ ^build(\([^)]+\))?!?:[[:space:]] ]]; then
+              printf '%s\n' "$entry" >> "$tmp_dir/build.txt"
+            elif [[ "$subject" =~ ^ci(\([^)]+\))?!?:[[:space:]] ]]; then
+              printf '%s\n' "$entry" >> "$tmp_dir/ci.txt"
+            elif [[ "$subject" =~ ^chore(\([^)]+\))?!?:[[:space:]] ]]; then
+              printf '%s\n' "$entry" >> "$tmp_dir/chore.txt"
+            else
+              printf '%s\n' "$entry" >> "$tmp_dir/other.txt"
+            fi
+          done < "$tmp_dir/commits.txt"
+
+          append_section() {
+            section_title="$1"
+            section_file="$2"
+            if [ -s "$section_file" ]; then
+              echo
+              echo "#### $section_title"
+              cat "$section_file"
+            fi
+          }
+
+          {
+            echo "## Release $current_tag"
+            echo
+            echo "### Changelog"
+            echo "Range: $range_label"
+            if [ -s "$tmp_dir/commits.txt" ]; then
+              append_section "Features" "$tmp_dir/features.txt"
+              append_section "Fixes" "$tmp_dir/fixes.txt"
+              append_section "Performance" "$tmp_dir/performance.txt"
+              append_section "Refactoring" "$tmp_dir/refactoring.txt"
+              append_section "Documentation" "$tmp_dir/docs.txt"
+              append_section "Tests" "$tmp_dir/tests.txt"
+              append_section "Build" "$tmp_dir/build.txt"
+              append_section "CI" "$tmp_dir/ci.txt"
+              append_section "Chore" "$tmp_dir/chore.txt"
+              append_section "Other" "$tmp_dir/other.txt"
+            else
+              echo "- No commits found in this range"
+            fi
+            echo
+            echo
+            echo "### Checksums (SHA256)"
+            echo '```text'
+            for file in dist/*; do
+              [ -f "$file" ] || continue
+              read -r checksum _ < <(sha256sum "$file")
+              printf '%s  %s\n' "$checksum" "$(basename "$file")"
+            done
+            echo '```'
+          } > RELEASE_NOTES.md
+
+      - name: Show generated release notes
+        run: cat RELEASE_NOTES.md
+
+      - name: Verify release artifacts exist
+        run: |
+          for file in dist/*; do
+            [ -f "$file" ] || continue
+            exit 0
+          done
+          echo "No release artifacts found in dist/" >&2
+          exit 1
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          body_path: RELEASE_NOTES.md

@@ -17,10 +17,15 @@ use tokio::net::TcpListener;
 
 const SYSTEM_PLUGINS_DIR: &str = "/usr/share/openusage-cli/openusage-plugins";
 const SYSTEM_PLUGIN_OVERRIDES_DIR: &str = "/usr/share/openusage-cli/plugin-overrides";
+const APP_VERSION: &str = match option_env!("OPENUSAGE_BUILD_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "openusage-cli")]
 #[command(about = "HTTP daemon for AI usage limit plugins")]
+#[command(version = APP_VERSION)]
 struct Cli {
     #[arg(long)]
     host: Option<String>,
@@ -100,7 +105,7 @@ async fn run() -> Result<()> {
             RuntimeCli::from_sources(cli, config::AppConfig::default())
         }
     };
-    let app_version = env!("CARGO_PKG_VERSION").to_string();
+    let app_version = APP_VERSION.to_string();
 
     log::info!("starting openusage-cli v{}", app_version);
     log::debug!(
