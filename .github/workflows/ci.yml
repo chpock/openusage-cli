@@ -29,6 +29,16 @@ jobs:
           shared-key: ubuntu-stable
           save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
 
+      - name: Verify dev manifest version
+        run: |
+          expected_version="0.0.0"
+          actual_version="$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml)"
+          if [ "$actual_version" != "$expected_version" ]; then
+            echo "Cargo.toml version must stay at $expected_version on branches; found $actual_version" >&2
+            echo "Use a vX.Y.Z git tag to define release version in release workflow." >&2
+            exit 1
+          fi
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 

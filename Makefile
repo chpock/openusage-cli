@@ -1,4 +1,4 @@
-.PHONY: help build test run run-daemon deb rpm packages clean
+.PHONY: help build test run run-daemon deb rpm packages release-tag clean
 
 CARGO ?= cargo
 HOST ?= 127.0.0.1
@@ -24,6 +24,7 @@ help:
 	@printf "  make deb          Build .deb package (cargo-deb)\n"
 	@printf "  make rpm          Build .rpm package (cargo-generate-rpm)\n"
 	@printf "  make packages     Build both .deb and .rpm\n"
+	@printf "  make release-tag VERSION=X.Y.Z  Create release tag\n"
 	@printf "  make clean        Remove build artifacts\n"
 	@printf "\nRun variables (optional):\n"
 	@printf "  HOST=127.0.0.1 PORT=6737 REFRESH_INTERVAL_SECS=300\n"
@@ -50,6 +51,23 @@ rpm:
 	$(CARGO) generate-rpm
 
 packages: deb rpm
+
+release-tag:
+	@if [ -z "$(VERSION)" ]; then \
+		printf "VERSION is required (example: make release-tag VERSION=0.2.0)\\n" >&2; \
+		exit 1; \
+	fi
+	@if ! printf "%s" "$(VERSION)" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$$'; then \
+		printf "VERSION must match X.Y.Z; got: %s\\n" "$(VERSION)" >&2; \
+		exit 1; \
+	fi
+	@if git rev-parse -q --verify "refs/tags/v$(VERSION)" >/dev/null; then \
+		printf "Tag v%s already exists\\n" "$(VERSION)" >&2; \
+		exit 1; \
+	fi
+	@git tag "v$(VERSION)"
+	@printf "Created tag v%s\n" "$(VERSION)"
+	@printf "Push it with: git push origin v%s\n" "$(VERSION)"
 
 clean:
 	$(CARGO) clean

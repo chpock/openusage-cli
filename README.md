@@ -160,3 +160,15 @@ Package layout:
 - Binary: `/usr/bin/openusage-cli`
 - Upstream plugins: `/usr/share/openusage-cli/openusage-plugins`
 - Override plugins: `/usr/share/openusage-cli/plugin-overrides`
+
+## Release Versioning
+
+- `Cargo.toml` keeps a fixed dev version (`0.0.0`) on branches.
+- Production release version comes from the git tag (`vX.Y.Z`) in GitHub Actions.
+- The release workflow validates tag format, injects tag version into `Cargo.toml` for packaging, and exports `OPENUSAGE_BUILD_VERSION` so the binary reports the tagged version.
+- To avoid tag typos locally, use:
+
+```bash
+make release-tag VERSION=0.2.0
+git push origin v0.2.0
+```

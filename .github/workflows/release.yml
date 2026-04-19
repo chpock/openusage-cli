@@ -26,12 +26,17 @@ jobs:
 
       - name: Extract app version from tag
         run: |
+          if ! [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tag must match vX.Y.Z; got: $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
           app_version="${GITHUB_REF_NAME#v}"
           if [ -z "$app_version" ] || [ "$app_version" = "$GITHUB_REF_NAME" ]; then
             echo "Unable to extract app version from tag: $GITHUB_REF_NAME" >&2
             exit 1
           fi
           echo "APP_VERSION=$app_version" >> "$GITHUB_ENV"
+          echo "OPENUSAGE_BUILD_VERSION=$app_version" >> "$GITHUB_ENV"
 
       - name: Apply release version to Cargo manifest
         run: |
