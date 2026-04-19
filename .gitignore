@@ -22,3 +22,6 @@ target
 
 # Upstream reference source (kept out of git changes)
 /openusage/
+
+# Local compact CI logs
+/.ci-logs/

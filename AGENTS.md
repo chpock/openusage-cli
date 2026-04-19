@@ -6,15 +6,22 @@
 - Do not edit `openusage/` or `vendor/*` during feature work; implement fixes in `src/`.
 
 ## Verification commands
-- CI parity order: `cargo fmt --all -- --check` -> `cargo clippy --locked --all-targets -- -D warnings` -> `cargo build --locked --verbose` -> `cargo test --locked --verbose`.
-- Run the full CI parity order after every code change before finishing work.
+- Full CI parity command: `make ci-compact`.
+- Under the hood, parity order is: `cargo fmt --all -- --check` -> `cargo clippy --locked --all-targets -- -D warnings` -> `cargo build --locked` -> `cargo test --locked`.
+- Run `make ci-compact` after every code change before finishing work.
 - Fast local loop: `cargo fmt && cargo test`.
+- `make ci-compact` keeps agent-facing output compact:
+  - Redirect each step to a dedicated log file under `.ci-logs/` (override via `CI_LOG_DIR=...`).
+  - Print only short step status lines in stdout (`[OK]` / `[FAIL]`).
+  - On failure, print only diagnostic matches (`error:`, `error[`, `FAILED`, `panicked`, `failures:`) plus the full log path.
+  - Preserve full logs for debugging (CI artifact or local file), do not stream them by default.
+- For deeper troubleshooting, rerun with verbose cargo output: `make ci-compact VERBOSE=1`.
 - Focused suites:
   - `cargo test --test http_smoke`
   - `cargo test --test plugin_compatibility`
   - `cargo test --test codex_override`
 - Run daemon from source: `cargo run -- --host 127.0.0.1 --port 6737`.
-- Make shortcuts: `make run`, `make run-daemon`, `make test`, `make build`.
+- Make shortcuts: `make ci-compact`, `make run`, `make run-daemon`, `make test`, `make build`.
 
 ## Runtime wiring
 - Process entrypoint and source merge logic: `src/main.rs`.
