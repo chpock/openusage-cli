@@ -1,86 +1,86 @@
 # openusage-cli agent notes
 
-## Scope and boundaries
+## Non-negotiable scope
 - Active project is the root Rust crate (`Cargo.toml`, `src/`, `tests/`).
-- `openusage/` is upstream reference source; `vendor/openusage/` is vendored runtime assets/docs used for compatibility.
-- Do not casually edit `openusage/`; it is reference source only.
+- `openusage/` is upstream reference source; `vendor/openusage/` is runtime compatibility mirror.
+- Do not edit `openusage/` or `vendor/*` during feature work; implement fixes in `src/`.
 
-## Vendor policy (strict)
-- `vendor/*` is a read-only mirror of upstream `https://github.com/robinebers/openusage.git`.
-- Treat `vendor/*` as immutable during normal feature work. Do not edit vendored plugins, docs, or runtime files in-place.
-- If behavior differs from upstream plugins, fix Rust host/runtime code in `src/` first (`host_api`, `runtime`, HTTP/cache wiring), not vendored JS.
-- Allowed `vendor/*` changes are sync-only updates from upstream (intentional mirror refresh), done as a separate scoped change.
-
-## Core commands
-- Format + full verification: `cargo fmt && cargo test`
-- Run daemon locally: `openusage-cli --host 127.0.0.1 --port 6737`
-- Focused tests:
+## Verification commands
+- CI parity order: `cargo fmt --all -- --check` -> `cargo clippy --locked --all-targets -- -D warnings` -> `cargo build --locked --verbose` -> `cargo test --locked --verbose`.
+- Fast local loop: `cargo fmt && cargo test`.
+- Focused suites:
   - `cargo test --test http_smoke`
   - `cargo test --test plugin_compatibility`
+  - `cargo test --test codex_override`
+- Run daemon from source: `cargo run -- --host 127.0.0.1 --port 6737`.
+- Make shortcuts: `make run`, `make run-daemon`, `make test`, `make build`.
 
-## Commit message policy
-- Use Conventional Commits for all new commits in this repository.
-- Preferred types: `feat`, `fix`, `chore`, `docs`, `refactor`, `test`, `build`, `ci`, `perf`.
-- Subject line format: `<type>(optional-scope): <short imperative summary>`.
-- Commit messages are multi-line: keep the first line as Conventional Commit subject, then add a detailed body describing what changed and why.
+## Runtime wiring
+- Process entrypoint and source merge logic: `src/main.rs`.
+- Config schema, template, and proxy resolution: `src/config.rs`.
+- HTTP routes and response semantics: `src/http_api.rs`.
+- Cache/refresh state machine: `src/daemon.rs`.
+- Plugin load/eval/host bridge/AST patching: `src/plugin_engine/{manifest.rs,runtime.rs,host_api.rs,script_patch.rs}`.
 
-## Configuration contract (required for all new params)
-- Config file is `config.yaml` (YAML) resolved in `src/config.rs` via `ProjectDirs::from("com", "openusage", "openusage-cli")` (`config_dir()/config.yaml`), with fallback to `./.openusage-cli/config.yaml`.
-- On startup, missing config file must not be auto-created; runtime uses CLI/env/default values.
-- Default config template generation is explicit via CLI (`--init-config`) and must include all supported fields with explanatory comments.
-- Source-of-truth precedence is strict: CLI flags (and supported env vars) > `config.yaml` > built-in defaults.
-- If you add a new runtime setting, update **all** of the following in the same change:
-  1) CLI flag parsing in `src/main.rs` (`Cli`),
-  2) YAML schema in `src/config.rs` (`AppConfig`),
-  3) default config template in `src/config.rs` (include comments + explicit default value or documented `null` behavior),
-  4) source merge logic in `RuntimeCli::from_sources` so precedence stays consistent,
-  5) tests covering defaults and override precedence.
-- Do not add config-only settings that cannot be overridden via CLI when a corresponding runtime CLI option exists.
-- Keep comments in default template practical: what parameter does, valid values/units, and what happens when `null`/unset.
+## Config contract (keep in sync)
+- Config path resolution: `ProjectDirs::from("com", "openusage", "openusage-cli")/config.yaml`, fallback `./.openusage-cli/config.yaml`.
+- Missing config is valid at startup (no auto-create). Template generation is explicit via `--init-config`.
+- Precedence is strict: CLI flags/env > `config.yaml` > built-in defaults.
+- For any new runtime setting, update together:
+  1) `Cli` args in `src/main.rs`,
+  2) `AppConfig` in `src/config.rs`,
+  3) `default_config_template()` in `src/config.rs`,
+  4) `RuntimeCli::from_sources` merge logic,
+  5) tests for defaults and CLI-over-config precedence.
+- Keep `default_config_template()` valid YAML and synchronized with `AppConfig`.
+- Do not introduce config-only knobs for behavior already controlled by runtime CLI/env.
+- Practical defaults: host `127.0.0.1`, port `6737`, refresh interval `300s`.
+- `--daemon` spawns background child (`--daemon-child`) and exits parent; preserve this flow when changing startup.
+- If no plugins are discovered/enabled, startup must fail early with explicit error.
 
-## Runtime wiring (entrypoints)
-- Process entrypoint: `src/main.rs`
-- HTTP routes: `src/http_api.rs`
-- Daemon state/cache/refresh: `src/daemon.rs`
-- Plugin compatibility engine: `src/plugin_engine/{manifest.rs,runtime.rs,host_api.rs}`
-
-## Plugin source resolution (important)
-- Resolution order in `src/main.rs`:
-  1) `--plugins-dir` or `OPENUSAGE_PLUGINS_DIR`
-  2) `./vendor/openusage/plugins`
-  3) `./plugins`
-  4) `<executable_dir>/vendor/openusage/plugins`
-  5) `<executable_dir>/plugins`
-- If no plugins are found, daemon exits with error.
-
-## Plugin overrides (without vendor edits)
-- Use `plugin-overrides/` for local extensions instead of editing `vendor/openusage/plugins/*`.
-- Override dir resolution in `src/main.rs`:
-  1) `--plugin-overrides-dir` or `OPENUSAGE_PLUGIN_OVERRIDES_DIR`
-  2) `./plugin-overrides`
-  3) `<executable_dir>/plugin-overrides`
-- Override file candidates per plugin id in `src/plugin_engine/runtime.rs`:
-  - `<id>.js`, `<id>.override.js`, `<id>/override.js`
-- Override scripts get `globalThis.__openusage_override` with `originalProbe`, `replaceProbe`, `wrapProbe`, `resetProbe`.
-- For internal function monkey-patching, override may declare `globalThis.__openusage_ast_patch` manifest; runtime rewrites plugin AST before eval and renames originals to `__openusage_original_<target>`.
-
-## HTTP behavior that tests enforce
-- `GET /v1/usage` returns cached snapshots only.
-- Refresh happens only when `refresh=true` (collection or single provider).
-- `GET /v1/usage/{provider}`:
-  - unknown provider -> `404 {"error":"provider_not_found"}`
-  - known but uncached (without refresh) -> `204 No Content`
+## Plugin and override resolution
+- Plugin dir resolution order (`src/main.rs`):
+  1) `--plugins-dir` / `OPENUSAGE_PLUGINS_DIR`
+  2) source checkout roots (`vendor/openusage/plugins`, then `plugins`)
+  3) current working dir (`vendor/openusage/plugins`, then `plugins`)
+  4) executable dir (`vendor/openusage/plugins`, then `plugins`)
+  5) packaged path (`<prefix>/share/openusage-cli/openusage-plugins`)
+  6) `/usr/share/openusage-cli/openusage-plugins`
+- Override dir resolution order (`src/main.rs`):
+  1) `--plugin-overrides-dir` / `OPENUSAGE_PLUGIN_OVERRIDES_DIR`
+  2) source checkout root `plugin-overrides`
+  3) current working dir `plugin-overrides`
+  4) executable dir `plugin-overrides`
+  5) `<prefix>/share/openusage-cli/plugin-overrides`
+  6) `/usr/share/openusage-cli/plugin-overrides`
+- If `--plugin-overrides-dir` is set, path must exist and be a directory.
+- Override file candidates per plugin id (`src/plugin_engine/runtime.rs`): `<id>.js`, `<id>.override.js`, `<id>/override.js`.
+- Runtime override helpers are exposed on `globalThis.__openusage_override` (`pluginId`, `originalProbe`, `replaceProbe`, `wrapProbe`, `resetProbe`).
+- AST patching is declared via `globalThis.__openusage_ast_patch`; transformed functions are renamed to `__openusage_original_<target>` (`src/plugin_engine/script_patch.rs`).
 
 ## Compatibility guardrails
-- Keep upstream plugin contract compatibility first; avoid changing host API shapes unless required.
-- Goal of this repo: maximum runtime compatibility with OpenUsage plugins from `vendor/openusage/plugins` with minimal/no plugin edits.
-- After changes touching plugin runtime/host API/routes, run both integration tests (`http_smoke`, `plugin_compatibility`) in addition to full `cargo test`.
-- `tests/plugin_compatibility.rs` assumes `vendor/openusage/plugins` exists and includes `mock`, `claude`, `codex`, `cursor`.
-- When adding/changing host API fields (`ctx.host.*`, `ctx.util.*`, line formatting), update tests first to protect plugin compatibility.
+- Keep upstream plugin contract compatibility first; prefer host/runtime fixes over vendored JS edits.
+- `host.env.get` is intentionally restricted: process env only, and only for `WHITELISTED_ENV_VARS` (`src/plugin_engine/host_api.rs`).
+- Intentional behavior diffs vs upstream are documented in `OPENUSAGE_DIFFERENCES.md` (check before changing host behavior).
+- HTTP behavior enforced by tests:
+  - `GET /v1/usage` returns cached snapshots unless `refresh=true`.
+  - `GET /v1/usage/{provider}` unknown provider -> `404 {"error":"provider_not_found"}`.
+  - Known provider with no cached snapshot and no refresh -> `204 No Content`.
+- `tests/plugin_compatibility.rs` expects vendored plugins including `mock`, `claude`, `codex`, `cursor`.
+- `tests/codex_override.rs` couples `vendor/openusage/plugins/codex/plugin.js` with `plugin-overrides/codex.js`.
+- After runtime/host API/HTTP changes, run at least `http_smoke` + `plugin_compatibility`; include `codex_override` when touching override/AST flow.
 
-## Vendor sync checklist
-- Sync `vendor/openusage/*` only from upstream `https://github.com/robinebers/openusage.git` (no manual local edits in vendored files).
-- Keep sync changes isolated from feature changes (separate commit/PR scope).
-- After sync, verify required plugin dirs still exist in `vendor/openusage/plugins` (at least `mock`, `claude`, `codex`, `cursor`).
-- Re-run compatibility checks: `cargo test --test plugin_compatibility`, `cargo test --test http_smoke`, then `cargo test`.
-- If sync changes plugin manifests/API usage, adapt Rust host/runtime code in `src/` to preserve compatibility rather than patching vendored plugin code.
+## Commit and release conventions
+- Use Conventional Commits (`feat|fix|chore|docs|refactor|test|build|ci|perf`).
+- Subject format should stay `type(scope): summary` (scope optional) so release classification remains predictable.
+- Keep commit messages multi-line: subject first, then body with what/why.
+- Release notes workflow classifies commits by Conventional Commit prefixes (`.github/workflows/release.yml`); wrong prefixes go to `Other`.
+- Releases run from tags matching `v*.*.*` and CI rewrites `Cargo.toml` version from tag during packaging.
+- Packaging publishes `.deb` and `.rpm` artifacts for amd64/arm64.
+
+## Vendor sync policy
+- Sync `vendor/openusage/*` only from upstream `https://github.com/robinebers/openusage.git`.
+- Keep vendor sync changes isolated from feature changes.
+- Do not hand-edit vendored plugin files to fix runtime behavior; implement compatibility in `src/`.
+- Ensure expected vendored plugin ids remain present (`mock`, `claude`, `codex`, `cursor`) because compatibility tests rely on them.
+- After sync, run: `cargo test --test plugin_compatibility`, `cargo test --test http_smoke`, then full `cargo test`.
