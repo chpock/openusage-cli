@@ -7,6 +7,7 @@
 
 ## Verification commands
 - CI parity order: `cargo fmt --all -- --check` -> `cargo clippy --locked --all-targets -- -D warnings` -> `cargo build --locked --verbose` -> `cargo test --locked --verbose`.
+- Run the full CI parity order after every code change before finishing work.
 - Fast local loop: `cargo fmt && cargo test`.
 - Focused suites:
   - `cargo test --test http_smoke`

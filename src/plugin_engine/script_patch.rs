@@ -139,9 +139,7 @@ impl FunctionPatchInjector {
         };
 
         let target_name = fn_decl.ident.sym.as_ref().to_string();
-        let Some(patch_idx) = self.patch_by_target.get(&target_name).copied() else {
-            return None;
-        };
+        let patch_idx = self.patch_by_target.get(&target_name).copied()?;
 
         if self.patches[patch_idx].applied {
             return None;

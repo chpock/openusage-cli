@@ -11,19 +11,10 @@ pub const DEFAULT_PORT: u16 = 6737;
 pub const DEFAULT_REFRESH_INTERVAL_SECS: u64 = 300;
 pub const DEFAULT_ENABLED_PLUGINS: &str = "*";
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ProxyConfig {
     pub enabled: bool,
     pub url: String,
-}
-
-impl Default for ProxyConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            url: String::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

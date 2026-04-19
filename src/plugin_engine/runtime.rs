@@ -53,7 +53,7 @@ pub struct PluginOutput {
 
 pub fn run_probe(
     plugin: &LoadedPlugin,
-    app_data_dir: &PathBuf,
+    app_data_dir: &Path,
     app_version: &str,
     plugin_overrides_dir: Option<&Path>,
 ) -> PluginOutput {
@@ -96,7 +96,7 @@ pub fn run_probe(
         Err(err) => return error_output(plugin, format!("script transform failed: {}", err)),
     };
     let icon_url = plugin.icon_data_url.clone();
-    let app_data = app_data_dir.clone();
+    let app_data = app_data_dir.to_path_buf();
 
     ctx.with(|ctx| {
         if host_api::inject_host_api(&ctx, &plugin_id, &app_data, app_version).is_err() {
@@ -504,10 +504,11 @@ fn parse_lines(result: &Object) -> Result<Vec<MetricLine>, String> {
                                 } else {
                                     // ISO-like but missing timezone: assume UTC.
                                     let is_missing_tz =
-                                        value.contains('T') && !value.ends_with('Z') && {
-                                            let tail = value.splitn(2, 'T').nth(1).unwrap_or("");
-                                            !tail.contains('+') && !tail.contains('-')
-                                        };
+                                        value.split_once('T').is_some_and(|(_, tail)| {
+                                            !value.ends_with('Z')
+                                                && !tail.contains('+')
+                                                && !tail.contains('-')
+                                        });
                                     if is_missing_tz {
                                         let with_z = format!("{}Z", value);
                                         let parsed_with_z = time::OffsetDateTime::parse(

@@ -129,10 +129,8 @@ async fn get_usage_single(
             .into_response();
     }
 
-    if force_refresh {
-        if let Err(err) = state.daemon.refresh(Some(vec![provider.clone()])).await {
-            return internal_error(err);
-        }
+    if force_refresh && let Err(err) = state.daemon.refresh(Some(vec![provider.clone()])).await {
+        return internal_error(err);
     }
 
     match state.daemon.cached_one(&provider).await {

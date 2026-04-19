@@ -28,7 +28,7 @@ fn mock_plugin_runs_in_real_runtime() {
         .expect("mock plugin not found");
 
     let tmp = tempfile::tempdir().expect("temp dir");
-    let output = runtime::run_probe(&plugin, &tmp.path().to_path_buf(), "0.1.0-test", None);
+    let output = runtime::run_probe(&plugin, tmp.path(), "0.1.0-test", None);
     assert_eq!(output.provider_id, "mock");
     assert!(output.lines.len() > 5);
 }

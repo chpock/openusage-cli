@@ -407,7 +407,7 @@ fn encrypt_aes_256_gcm_envelope(plaintext: &str, key_b64: &str) -> Result<String
 pub fn inject_host_api<'js>(
     ctx: &Ctx<'js>,
     plugin_id: &str,
-    app_data_dir: &PathBuf,
+    app_data_dir: &Path,
     app_version: &str,
 ) -> rquickjs::Result<()> {
     let globals = ctx.globals();
@@ -1335,11 +1335,12 @@ fn ls_parse_listening_ports(output: &str) -> Vec<i32> {
         for token in line.split_whitespace().rev() {
             if let Some(colon_pos) = token.rfind(':') {
                 let port_str = &token[colon_pos + 1..];
-                if let Ok(port) = port_str.parse::<i32>() {
-                    if port > 0 && port < 65536 {
-                        ports.insert(port);
-                        break;
-                    }
+                if let Ok(port) = port_str.parse::<i32>()
+                    && port > 0
+                    && port < 65536
+                {
+                    ports.insert(port);
+                    break;
                 }
             }
         }
@@ -1445,10 +1446,7 @@ fn ccusage_package_spec(provider: CcusageProvider) -> String {
     format!("{}@{}", config.package_name, CCUSAGE_VERSION)
 }
 
-fn ccusage_home_override<'a>(
-    opts: &'a CcusageQueryOpts,
-    provider: CcusageProvider,
-) -> Option<&'a str> {
+fn ccusage_home_override(opts: &CcusageQueryOpts, provider: CcusageProvider) -> Option<&str> {
     if let Some(home_path) = opts
         .home_path
         .as_deref()
@@ -1743,7 +1741,7 @@ fn run_ccusage_with_runner(
 
     if let Some(home_path) = ccusage_home_override(opts, provider) {
         let config = ccusage_provider_config(provider);
-        command.env(config.home_env_var, expand_path(&home_path));
+        command.env(config.home_env_var, expand_path(home_path));
     }
 
     let redacted_program = redact_log_message(program);
@@ -2065,16 +2063,16 @@ fn inject_keychain<'js>(
                     .stdin(Stdio::null())
                     .output();
 
-                if let Ok(output) = find_output {
-                    if output.status.success() {
-                        let stdout = String::from_utf8_lossy(&output.stdout);
-                        for line in stdout.lines() {
-                            if let Some(start) = line.find("\"acct\"<blob>=\"") {
-                                let rest = &line[start + 14..];
-                                if let Some(end) = rest.find('"') {
-                                    account_arg = Some(rest[..end].to_string());
-                                    break;
-                                }
+                if let Ok(output) = find_output
+                    && output.status.success()
+                {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    for line in stdout.lines() {
+                        if let Some(start) = line.find("\"acct\"<blob>=\"") {
+                            let rest = &line[start + 14..];
+                            if let Some(end) = rest.find('"') {
+                                account_arg = Some(rest[..end].to_string());
+                                break;
                             }
                         }
                     }
@@ -2296,15 +2294,15 @@ fn iso_now() -> String {
 }
 
 fn expand_path(path: &str) -> String {
-    if path == "~" {
-        if let Some(home) = dirs::home_dir() {
-            return home.to_string_lossy().to_string();
-        }
+    if path == "~"
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.to_string_lossy().to_string();
     }
-    if path.starts_with("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(&path[2..]).to_string_lossy().to_string();
-        }
+    if let Some(stripped) = path.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(stripped).to_string_lossy().to_string();
     }
     path.to_string()
 }

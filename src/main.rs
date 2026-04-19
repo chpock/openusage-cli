@@ -372,222 +372,6 @@ impl EnabledPluginsMatcher {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn empty_cli() -> Cli {
-        Cli {
-            host: None,
-            port: None,
-            plugins_dir: None,
-            enabled_plugins: None,
-            app_data_dir: None,
-            plugin_overrides_dir: None,
-            refresh_interval_secs: None,
-            init_config: false,
-            daemon: false,
-            daemon_child: false,
-        }
-    }
-
-    #[test]
-    fn runtime_cli_uses_defaults_when_no_input_values() {
-        let runtime = RuntimeCli::from_sources(empty_cli(), config::AppConfig::default());
-
-        assert_eq!(runtime.host, config::DEFAULT_HOST);
-        assert_eq!(runtime.port, config::DEFAULT_PORT);
-        assert_eq!(
-            runtime.refresh_interval_secs,
-            config::DEFAULT_REFRESH_INTERVAL_SECS
-        );
-        assert_eq!(runtime.enabled_plugins, config::DEFAULT_ENABLED_PLUGINS);
-        assert!(!runtime.daemon);
-    }
-
-    #[test]
-    fn runtime_cli_uses_config_values_when_cli_is_empty() {
-        let app_config = config::AppConfig {
-            host: Some("0.0.0.0".to_string()),
-            port: Some(9000),
-            plugins_dir: Some(PathBuf::from("/tmp/plugins")),
-            enabled_plugins: Some("codex,cur*".to_string()),
-            app_data_dir: Some(PathBuf::from("/tmp/data")),
-            plugin_overrides_dir: Some(PathBuf::from("/tmp/overrides")),
-            refresh_interval_secs: Some(42),
-            daemon: Some(true),
-            proxy: None,
-        };
-        let runtime = RuntimeCli::from_sources(empty_cli(), app_config);
-
-        assert_eq!(runtime.host, "0.0.0.0");
-        assert_eq!(runtime.port, 9000);
-        assert_eq!(runtime.plugins_dir, Some(PathBuf::from("/tmp/plugins")));
-        assert_eq!(runtime.enabled_plugins, "codex,cur*");
-        assert_eq!(runtime.app_data_dir, Some(PathBuf::from("/tmp/data")));
-        assert_eq!(
-            runtime.plugin_overrides_dir,
-            Some(PathBuf::from("/tmp/overrides"))
-        );
-        assert_eq!(runtime.refresh_interval_secs, 42);
-        assert!(runtime.daemon);
-    }
-
-    #[test]
-    fn runtime_cli_prioritizes_cli_values_over_config() {
-        let cli = Cli {
-            host: Some("127.0.0.2".to_string()),
-            port: Some(7001),
-            plugins_dir: Some(PathBuf::from("/cli/plugins")),
-            enabled_plugins: Some("mock".to_string()),
-            app_data_dir: Some(PathBuf::from("/cli/data")),
-            plugin_overrides_dir: Some(PathBuf::from("/cli/overrides")),
-            refresh_interval_secs: Some(7),
-            init_config: false,
-            daemon: true,
-            daemon_child: false,
-        };
-        let app_config = config::AppConfig {
-            host: Some("0.0.0.0".to_string()),
-            port: Some(9000),
-            plugins_dir: Some(PathBuf::from("/cfg/plugins")),
-            enabled_plugins: Some("codex".to_string()),
-            app_data_dir: Some(PathBuf::from("/cfg/data")),
-            plugin_overrides_dir: Some(PathBuf::from("/cfg/overrides")),
-            refresh_interval_secs: Some(60),
-            daemon: Some(false),
-            proxy: None,
-        };
-
-        let runtime = RuntimeCli::from_sources(cli, app_config);
-
-        assert_eq!(runtime.host, "127.0.0.2");
-        assert_eq!(runtime.port, 7001);
-        assert_eq!(runtime.plugins_dir, Some(PathBuf::from("/cli/plugins")));
-        assert_eq!(runtime.enabled_plugins, "mock");
-        assert_eq!(runtime.app_data_dir, Some(PathBuf::from("/cli/data")));
-        assert_eq!(
-            runtime.plugin_overrides_dir,
-            Some(PathBuf::from("/cli/overrides"))
-        );
-        assert_eq!(runtime.refresh_interval_secs, 7);
-        assert!(runtime.daemon);
-    }
-
-    #[test]
-    fn enabled_plugins_matcher_supports_multiple_globs() {
-        let matcher = EnabledPluginsMatcher::from_csv("codex,cur*").expect("matcher should parse");
-
-        assert!(matcher.is_enabled("codex"));
-        assert!(matcher.is_enabled("cursor"));
-        assert!(!matcher.is_enabled("claude"));
-    }
-
-    #[test]
-    fn enabled_plugins_matcher_rejects_empty_list() {
-        let err = EnabledPluginsMatcher::from_csv(" , , ").expect_err("must reject empty list");
-        assert!(err.to_string().contains("empty"));
-    }
-
-    #[test]
-    fn enabled_plugins_matcher_rejects_invalid_glob() {
-        let err = EnabledPluginsMatcher::from_csv("[").expect_err("must reject invalid mask");
-        assert!(err.to_string().contains("invalid enabled plugin glob mask"));
-    }
-
-    #[test]
-    fn source_checkout_root_detects_cargo_target_layouts() {
-        assert_eq!(
-            source_checkout_root_from_exec_dir(Path::new("/repo/target/debug")),
-            Some(PathBuf::from("/repo"))
-        );
-        assert_eq!(
-            source_checkout_root_from_exec_dir(Path::new("/repo/target/release")),
-            Some(PathBuf::from("/repo"))
-        );
-        assert_eq!(
-            source_checkout_root_from_exec_dir(Path::new(
-                "/repo/target/x86_64-unknown-linux-gnu/release"
-            )),
-            Some(PathBuf::from("/repo"))
-        );
-        assert_eq!(
-            source_checkout_root_from_exec_dir(Path::new("/usr/bin")),
-            None
-        );
-    }
-
-    #[test]
-    fn plugins_dir_candidates_prefer_source_checkout_paths() {
-        let cwd = Path::new("/repo");
-        let exec_dir = Path::new("/repo/target/debug");
-
-        let candidates = plugins_dir_candidates(cwd, exec_dir);
-
-        assert_eq!(
-            candidates,
-            vec![
-                PathBuf::from("/repo/vendor/openusage/plugins"),
-                PathBuf::from("/repo/plugins"),
-                PathBuf::from("/repo/target/debug/vendor/openusage/plugins"),
-                PathBuf::from("/repo/target/debug/plugins"),
-                PathBuf::from("/repo/target/share/openusage-cli/openusage-plugins"),
-                PathBuf::from(SYSTEM_PLUGINS_DIR),
-            ]
-        );
-    }
-
-    #[test]
-    fn plugins_dir_candidates_for_installed_binary_use_prefix_share() {
-        let cwd = Path::new("/home/user");
-        let exec_dir = Path::new("/opt/openusage-cli/bin");
-
-        let candidates = plugins_dir_candidates(cwd, exec_dir);
-
-        assert_eq!(
-            candidates,
-            vec![
-                PathBuf::from("/opt/openusage-cli/share/openusage-cli/openusage-plugins"),
-                PathBuf::from(SYSTEM_PLUGINS_DIR),
-            ]
-        );
-    }
-
-    #[test]
-    fn plugin_overrides_candidates_prefer_source_checkout_paths() {
-        let cwd = Path::new("/repo");
-        let exec_dir = Path::new("/repo/target/debug");
-
-        let candidates = plugin_overrides_dir_candidates(cwd, exec_dir);
-
-        assert_eq!(
-            candidates,
-            vec![
-                PathBuf::from("/repo/plugin-overrides"),
-                PathBuf::from("/repo/target/debug/plugin-overrides"),
-                PathBuf::from("/repo/target/share/openusage-cli/plugin-overrides"),
-                PathBuf::from(SYSTEM_PLUGIN_OVERRIDES_DIR),
-            ]
-        );
-    }
-
-    #[test]
-    fn plugin_overrides_candidates_for_installed_binary_use_prefix_share() {
-        let cwd = Path::new("/home/user");
-        let exec_dir = Path::new("/opt/openusage-cli/bin");
-
-        let candidates = plugin_overrides_dir_candidates(cwd, exec_dir);
-
-        assert_eq!(
-            candidates,
-            vec![
-                PathBuf::from("/opt/openusage-cli/share/openusage-cli/plugin-overrides"),
-                PathBuf::from(SYSTEM_PLUGIN_OVERRIDES_DIR),
-            ]
-        );
-    }
-}
-
 fn plugins_dir_candidates(cwd: &Path, exec_dir: &Path) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     let source_root = source_checkout_root_from_exec_dir(exec_dir);
@@ -922,10 +706,10 @@ fn log_plugin_initialization_failure_summary(plugin_ids: &[String], error: &str)
 
 fn snapshot_error(snapshot: &CachedPluginSnapshot) -> Option<String> {
     snapshot.lines.iter().find_map(|line| {
-        if let MetricLine::Badge { label, text, .. } = line {
-            if label.eq_ignore_ascii_case("error") {
-                return Some(text.clone());
-            }
+        if let MetricLine::Badge { label, text, .. } = line
+            && label.eq_ignore_ascii_case("error")
+        {
+            return Some(text.clone());
         }
         None
     })
@@ -979,4 +763,220 @@ fn install_panic_hook() {
             backtrace
         );
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_cli() -> Cli {
+        Cli {
+            host: None,
+            port: None,
+            plugins_dir: None,
+            enabled_plugins: None,
+            app_data_dir: None,
+            plugin_overrides_dir: None,
+            refresh_interval_secs: None,
+            init_config: false,
+            daemon: false,
+            daemon_child: false,
+        }
+    }
+
+    #[test]
+    fn runtime_cli_uses_defaults_when_no_input_values() {
+        let runtime = RuntimeCli::from_sources(empty_cli(), config::AppConfig::default());
+
+        assert_eq!(runtime.host, config::DEFAULT_HOST);
+        assert_eq!(runtime.port, config::DEFAULT_PORT);
+        assert_eq!(
+            runtime.refresh_interval_secs,
+            config::DEFAULT_REFRESH_INTERVAL_SECS
+        );
+        assert_eq!(runtime.enabled_plugins, config::DEFAULT_ENABLED_PLUGINS);
+        assert!(!runtime.daemon);
+    }
+
+    #[test]
+    fn runtime_cli_uses_config_values_when_cli_is_empty() {
+        let app_config = config::AppConfig {
+            host: Some("0.0.0.0".to_string()),
+            port: Some(9000),
+            plugins_dir: Some(PathBuf::from("/tmp/plugins")),
+            enabled_plugins: Some("codex,cur*".to_string()),
+            app_data_dir: Some(PathBuf::from("/tmp/data")),
+            plugin_overrides_dir: Some(PathBuf::from("/tmp/overrides")),
+            refresh_interval_secs: Some(42),
+            daemon: Some(true),
+            proxy: None,
+        };
+        let runtime = RuntimeCli::from_sources(empty_cli(), app_config);
+
+        assert_eq!(runtime.host, "0.0.0.0");
+        assert_eq!(runtime.port, 9000);
+        assert_eq!(runtime.plugins_dir, Some(PathBuf::from("/tmp/plugins")));
+        assert_eq!(runtime.enabled_plugins, "codex,cur*");
+        assert_eq!(runtime.app_data_dir, Some(PathBuf::from("/tmp/data")));
+        assert_eq!(
+            runtime.plugin_overrides_dir,
+            Some(PathBuf::from("/tmp/overrides"))
+        );
+        assert_eq!(runtime.refresh_interval_secs, 42);
+        assert!(runtime.daemon);
+    }
+
+    #[test]
+    fn runtime_cli_prioritizes_cli_values_over_config() {
+        let cli = Cli {
+            host: Some("127.0.0.2".to_string()),
+            port: Some(7001),
+            plugins_dir: Some(PathBuf::from("/cli/plugins")),
+            enabled_plugins: Some("mock".to_string()),
+            app_data_dir: Some(PathBuf::from("/cli/data")),
+            plugin_overrides_dir: Some(PathBuf::from("/cli/overrides")),
+            refresh_interval_secs: Some(7),
+            init_config: false,
+            daemon: true,
+            daemon_child: false,
+        };
+        let app_config = config::AppConfig {
+            host: Some("0.0.0.0".to_string()),
+            port: Some(9000),
+            plugins_dir: Some(PathBuf::from("/cfg/plugins")),
+            enabled_plugins: Some("codex".to_string()),
+            app_data_dir: Some(PathBuf::from("/cfg/data")),
+            plugin_overrides_dir: Some(PathBuf::from("/cfg/overrides")),
+            refresh_interval_secs: Some(60),
+            daemon: Some(false),
+            proxy: None,
+        };
+
+        let runtime = RuntimeCli::from_sources(cli, app_config);
+
+        assert_eq!(runtime.host, "127.0.0.2");
+        assert_eq!(runtime.port, 7001);
+        assert_eq!(runtime.plugins_dir, Some(PathBuf::from("/cli/plugins")));
+        assert_eq!(runtime.enabled_plugins, "mock");
+        assert_eq!(runtime.app_data_dir, Some(PathBuf::from("/cli/data")));
+        assert_eq!(
+            runtime.plugin_overrides_dir,
+            Some(PathBuf::from("/cli/overrides"))
+        );
+        assert_eq!(runtime.refresh_interval_secs, 7);
+        assert!(runtime.daemon);
+    }
+
+    #[test]
+    fn enabled_plugins_matcher_supports_multiple_globs() {
+        let matcher = EnabledPluginsMatcher::from_csv("codex,cur*").expect("matcher should parse");
+
+        assert!(matcher.is_enabled("codex"));
+        assert!(matcher.is_enabled("cursor"));
+        assert!(!matcher.is_enabled("claude"));
+    }
+
+    #[test]
+    fn enabled_plugins_matcher_rejects_empty_list() {
+        let err = EnabledPluginsMatcher::from_csv(" , , ").expect_err("must reject empty list");
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn enabled_plugins_matcher_rejects_invalid_glob() {
+        let err = EnabledPluginsMatcher::from_csv("[").expect_err("must reject invalid mask");
+        assert!(err.to_string().contains("invalid enabled plugin glob mask"));
+    }
+
+    #[test]
+    fn source_checkout_root_detects_cargo_target_layouts() {
+        assert_eq!(
+            source_checkout_root_from_exec_dir(Path::new("/repo/target/debug")),
+            Some(PathBuf::from("/repo"))
+        );
+        assert_eq!(
+            source_checkout_root_from_exec_dir(Path::new("/repo/target/release")),
+            Some(PathBuf::from("/repo"))
+        );
+        assert_eq!(
+            source_checkout_root_from_exec_dir(Path::new(
+                "/repo/target/x86_64-unknown-linux-gnu/release"
+            )),
+            Some(PathBuf::from("/repo"))
+        );
+        assert_eq!(
+            source_checkout_root_from_exec_dir(Path::new("/usr/bin")),
+            None
+        );
+    }
+
+    #[test]
+    fn plugins_dir_candidates_prefer_source_checkout_paths() {
+        let cwd = Path::new("/repo");
+        let exec_dir = Path::new("/repo/target/debug");
+
+        let candidates = plugins_dir_candidates(cwd, exec_dir);
+
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/repo/vendor/openusage/plugins"),
+                PathBuf::from("/repo/plugins"),
+                PathBuf::from("/repo/target/debug/vendor/openusage/plugins"),
+                PathBuf::from("/repo/target/debug/plugins"),
+                PathBuf::from("/repo/target/share/openusage-cli/openusage-plugins"),
+                PathBuf::from(SYSTEM_PLUGINS_DIR),
+            ]
+        );
+    }
+
+    #[test]
+    fn plugins_dir_candidates_for_installed_binary_use_prefix_share() {
+        let cwd = Path::new("/home/user");
+        let exec_dir = Path::new("/opt/openusage-cli/bin");
+
+        let candidates = plugins_dir_candidates(cwd, exec_dir);
+
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/opt/openusage-cli/share/openusage-cli/openusage-plugins"),
+                PathBuf::from(SYSTEM_PLUGINS_DIR),
+            ]
+        );
+    }
+
+    #[test]
+    fn plugin_overrides_candidates_prefer_source_checkout_paths() {
+        let cwd = Path::new("/repo");
+        let exec_dir = Path::new("/repo/target/debug");
+
+        let candidates = plugin_overrides_dir_candidates(cwd, exec_dir);
+
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/repo/plugin-overrides"),
+                PathBuf::from("/repo/target/debug/plugin-overrides"),
+                PathBuf::from("/repo/target/share/openusage-cli/plugin-overrides"),
+                PathBuf::from(SYSTEM_PLUGIN_OVERRIDES_DIR),
+            ]
+        );
+    }
+
+    #[test]
+    fn plugin_overrides_candidates_for_installed_binary_use_prefix_share() {
+        let cwd = Path::new("/home/user");
+        let exec_dir = Path::new("/opt/openusage-cli/bin");
+
+        let candidates = plugin_overrides_dir_candidates(cwd, exec_dir);
+
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/opt/openusage-cli/share/openusage-cli/plugin-overrides"),
+                PathBuf::from(SYSTEM_PLUGIN_OVERRIDES_DIR),
+            ]
+        );
+    }
 }
