@@ -34,7 +34,7 @@ This allows using upstream plugins with minimal or zero changes.
 ## Run
 
 ```bash
-cargo run -- --host 127.0.0.1 --port 6736
+cargo run -- --host 127.0.0.1 --port 6737
 ```
 
 CLI options:

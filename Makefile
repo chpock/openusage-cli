@@ -2,7 +2,7 @@
 
 CARGO ?= cargo
 HOST ?= 127.0.0.1
-PORT ?= 6736
+PORT ?= 6737
 REFRESH_INTERVAL_SECS ?= 300
 
 # Optional: set these when needed
@@ -23,7 +23,7 @@ help:
 	@printf "  make run-daemon   Run daemon in background\n"
 	@printf "  make clean        Remove build artifacts\n"
 	@printf "\nRun variables (optional):\n"
-	@printf "  HOST=127.0.0.1 PORT=6736 REFRESH_INTERVAL_SECS=300\n"
+	@printf "  HOST=127.0.0.1 PORT=6737 REFRESH_INTERVAL_SECS=300\n"
 	@printf "  PLUGINS_DIR=/path/to/plugins APP_DATA_DIR=/path/to/data\n"
 	@printf "  PLUGIN_OVERRIDES_DIR=/path/to/plugin-overrides\n"
 

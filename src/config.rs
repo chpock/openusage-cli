@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 
 pub const CONFIG_FILE_NAME: &str = "config.yaml";
 pub const DEFAULT_HOST: &str = "127.0.0.1";
-pub const DEFAULT_PORT: u16 = 6736;
+pub const DEFAULT_PORT: u16 = 6737;
 pub const DEFAULT_REFRESH_INTERVAL_SECS: u64 = 300;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -96,7 +96,7 @@ fn default_config_template() -> &'static str {
 host: 127.0.0.1
 
 # HTTP bind port.
-port: 6736
+port: 6737
 
 # Directory with plugin JS files. null = auto-discovery.
 # plugins_dir: /path/to/plugins
