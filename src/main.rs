@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use directories::ProjectDirs;
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use openusage_cli::config;
 use openusage_cli::daemon::{CachedPluginSnapshot, DaemonState};
 use openusage_cli::http_api::{self, ApiState};
@@ -27,6 +28,9 @@ struct Cli {
     #[arg(long, env = "OPENUSAGE_PLUGINS_DIR")]
     plugins_dir: Option<PathBuf>,
 
+    #[arg(long, env = "OPENUSAGE_ENABLED_PLUGINS")]
+    enabled_plugins: Option<String>,
+
     #[arg(long, env = "OPENUSAGE_APP_DATA_DIR")]
     app_data_dir: Option<PathBuf>,
 
@@ -35,6 +39,9 @@ struct Cli {
 
     #[arg(long)]
     refresh_interval_secs: Option<u64>,
+
+    #[arg(long, default_value_t = false)]
+    init_config: bool,
 
     #[arg(long, default_value_t = false)]
     daemon: bool,
@@ -60,20 +67,48 @@ async fn main() -> Result<()> {
 async fn run() -> Result<()> {
     let raw_args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let cli = Cli::parse();
-    let loaded_config = config::load_or_create_config().context("failed to load config")?;
-    let runtime = RuntimeCli::from_sources(cli, loaded_config.config);
+
+    if cli.init_config {
+        let (path, created) =
+            config::write_default_config_if_missing().context("failed to write default config")?;
+        if created {
+            log::info!("wrote default config template to {}", path.display());
+        } else {
+            log::info!(
+                "config file already exists at {}; keeping it",
+                path.display()
+            );
+        }
+        return Ok(());
+    }
+
+    let loaded_config = config::load_config_if_exists().context("failed to load config")?;
+    let runtime = match loaded_config {
+        Some(loaded) => {
+            log::info!("using config file: {}", loaded.path.display());
+            RuntimeCli::from_sources(cli, loaded.config)
+        }
+        None => {
+            let path = config::config_path().context("failed to resolve config path")?;
+            log::info!(
+                "config file not found at {}; using CLI/env/default values",
+                path.display()
+            );
+            RuntimeCli::from_sources(cli, config::AppConfig::default())
+        }
+    };
     let app_version = env!("CARGO_PKG_VERSION").to_string();
 
     log::info!("starting openusage-cli v{}", app_version);
-    log::info!("using config file: {}", loaded_config.path.display());
     log::debug!(
-        "startup options: host={}, port={}, refresh_interval_secs={}, daemon={}, daemon_child={}, plugins_dir={:?}, app_data_dir={:?}, plugin_overrides_dir={:?}",
+        "startup options: host={}, port={}, refresh_interval_secs={}, daemon={}, daemon_child={}, plugins_dir={:?}, enabled_plugins='{}', app_data_dir={:?}, plugin_overrides_dir={:?}",
         runtime.host,
         runtime.port,
         runtime.refresh_interval_secs,
         runtime.daemon,
         runtime.daemon_child,
         runtime.plugins_dir,
+        runtime.enabled_plugins,
         runtime.app_data_dir,
         runtime.plugin_overrides_dir
     );
@@ -99,21 +134,54 @@ async fn run() -> Result<()> {
     let plugins_dir =
         resolve_plugins_dir(runtime.plugins_dir).context("failed to resolve plugins directory")?;
     log::info!("using plugins dir: {}", plugins_dir.display());
-    let plugins = manifest::load_plugins_from_dir(&plugins_dir);
-    if plugins.is_empty() {
+    let loaded_plugins = manifest::load_plugins_from_dir(&plugins_dir);
+    if loaded_plugins.is_empty() {
         anyhow::bail!(
             "no plugins found in {} (expected vendor/openusage/plugins layout)",
             plugins_dir.display()
         );
     }
 
+    let loaded_plugin_ids: Vec<String> = loaded_plugins
+        .iter()
+        .map(|p| p.manifest.id.clone())
+        .collect();
     log::info!(
         "loaded {} plugins from {}",
-        plugins.len(),
+        loaded_plugins.len(),
         plugins_dir.display()
     );
+    log::debug!("loaded plugin ids: {:?}", loaded_plugin_ids);
+
+    let enabled_plugins_matcher = EnabledPluginsMatcher::from_csv(&runtime.enabled_plugins)
+        .with_context(|| {
+            format!(
+                "invalid enabled_plugins value '{}' (expected comma-separated glob masks)",
+                runtime.enabled_plugins
+            )
+        })?;
+    let total_loaded_plugins = loaded_plugins.len();
+    let plugins: Vec<_> = loaded_plugins
+        .into_iter()
+        .filter(|plugin| enabled_plugins_matcher.is_enabled(&plugin.manifest.id))
+        .collect();
+
+    if plugins.is_empty() {
+        anyhow::bail!(
+            "no plugins enabled after applying enabled_plugins='{}'. loaded plugin ids: {:?}",
+            runtime.enabled_plugins,
+            loaded_plugin_ids
+        );
+    }
+
     let plugin_ids: Vec<String> = plugins.iter().map(|p| p.manifest.id.clone()).collect();
-    log::debug!("loaded plugin ids: {:?}", plugin_ids);
+    log::info!(
+        "enabled {} of {} plugins (enabled_plugins='{}')",
+        plugins.len(),
+        total_loaded_plugins,
+        runtime.enabled_plugins
+    );
+    log::debug!("enabled plugin ids: {:?}", plugin_ids);
 
     let plugin_overrides_dir = resolve_plugin_overrides_dir(runtime.plugin_overrides_dir)
         .context("failed to resolve plugin overrides directory")?;
@@ -218,6 +286,7 @@ struct RuntimeCli {
     host: String,
     port: u16,
     plugins_dir: Option<PathBuf>,
+    enabled_plugins: String,
     app_data_dir: Option<PathBuf>,
     plugin_overrides_dir: Option<PathBuf>,
     refresh_interval_secs: u64,
@@ -241,17 +310,57 @@ impl RuntimeCli {
         } else {
             config.daemon.unwrap_or(false)
         };
+        let enabled_plugins = cli
+            .enabled_plugins
+            .or(config.enabled_plugins)
+            .unwrap_or_else(|| config::DEFAULT_ENABLED_PLUGINS.to_string());
 
         Self {
             host,
             port,
             plugins_dir: cli.plugins_dir.or(config.plugins_dir),
+            enabled_plugins,
             app_data_dir: cli.app_data_dir.or(config.app_data_dir),
             plugin_overrides_dir: cli.plugin_overrides_dir.or(config.plugin_overrides_dir),
             refresh_interval_secs,
             daemon,
             daemon_child: cli.daemon_child,
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EnabledPluginsMatcher {
+    glob_set: GlobSet,
+}
+
+impl EnabledPluginsMatcher {
+    fn from_csv(raw: &str) -> Result<Self> {
+        let masks = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|mask| !mask.is_empty())
+            .collect::<Vec<_>>();
+
+        if masks.is_empty() {
+            anyhow::bail!("enabled plugin mask list is empty");
+        }
+
+        let mut builder = GlobSetBuilder::new();
+        for mask in masks {
+            let glob = Glob::new(mask)
+                .with_context(|| format!("invalid enabled plugin glob mask '{mask}'"))?;
+            builder.add(glob);
+        }
+        let glob_set = builder
+            .build()
+            .context("failed to compile enabled plugin glob masks")?;
+
+        Ok(Self { glob_set })
+    }
+
+    fn is_enabled(&self, plugin_id: &str) -> bool {
+        self.glob_set.is_match(plugin_id)
     }
 }
 
@@ -264,9 +373,11 @@ mod tests {
             host: None,
             port: None,
             plugins_dir: None,
+            enabled_plugins: None,
             app_data_dir: None,
             plugin_overrides_dir: None,
             refresh_interval_secs: None,
+            init_config: false,
             daemon: false,
             daemon_child: false,
         }
@@ -282,6 +393,7 @@ mod tests {
             runtime.refresh_interval_secs,
             config::DEFAULT_REFRESH_INTERVAL_SECS
         );
+        assert_eq!(runtime.enabled_plugins, config::DEFAULT_ENABLED_PLUGINS);
         assert!(!runtime.daemon);
     }
 
@@ -291,6 +403,7 @@ mod tests {
             host: Some("0.0.0.0".to_string()),
             port: Some(9000),
             plugins_dir: Some(PathBuf::from("/tmp/plugins")),
+            enabled_plugins: Some("codex,cur*".to_string()),
             app_data_dir: Some(PathBuf::from("/tmp/data")),
             plugin_overrides_dir: Some(PathBuf::from("/tmp/overrides")),
             refresh_interval_secs: Some(42),
@@ -302,6 +415,7 @@ mod tests {
         assert_eq!(runtime.host, "0.0.0.0");
         assert_eq!(runtime.port, 9000);
         assert_eq!(runtime.plugins_dir, Some(PathBuf::from("/tmp/plugins")));
+        assert_eq!(runtime.enabled_plugins, "codex,cur*");
         assert_eq!(runtime.app_data_dir, Some(PathBuf::from("/tmp/data")));
         assert_eq!(
             runtime.plugin_overrides_dir,
@@ -317,9 +431,11 @@ mod tests {
             host: Some("127.0.0.2".to_string()),
             port: Some(7001),
             plugins_dir: Some(PathBuf::from("/cli/plugins")),
+            enabled_plugins: Some("mock".to_string()),
             app_data_dir: Some(PathBuf::from("/cli/data")),
             plugin_overrides_dir: Some(PathBuf::from("/cli/overrides")),
             refresh_interval_secs: Some(7),
+            init_config: false,
             daemon: true,
             daemon_child: false,
         };
@@ -327,6 +443,7 @@ mod tests {
             host: Some("0.0.0.0".to_string()),
             port: Some(9000),
             plugins_dir: Some(PathBuf::from("/cfg/plugins")),
+            enabled_plugins: Some("codex".to_string()),
             app_data_dir: Some(PathBuf::from("/cfg/data")),
             plugin_overrides_dir: Some(PathBuf::from("/cfg/overrides")),
             refresh_interval_secs: Some(60),
@@ -339,6 +456,7 @@ mod tests {
         assert_eq!(runtime.host, "127.0.0.2");
         assert_eq!(runtime.port, 7001);
         assert_eq!(runtime.plugins_dir, Some(PathBuf::from("/cli/plugins")));
+        assert_eq!(runtime.enabled_plugins, "mock");
         assert_eq!(runtime.app_data_dir, Some(PathBuf::from("/cli/data")));
         assert_eq!(
             runtime.plugin_overrides_dir,
@@ -346,6 +464,27 @@ mod tests {
         );
         assert_eq!(runtime.refresh_interval_secs, 7);
         assert!(runtime.daemon);
+    }
+
+    #[test]
+    fn enabled_plugins_matcher_supports_multiple_globs() {
+        let matcher = EnabledPluginsMatcher::from_csv("codex,cur*").expect("matcher should parse");
+
+        assert!(matcher.is_enabled("codex"));
+        assert!(matcher.is_enabled("cursor"));
+        assert!(!matcher.is_enabled("claude"));
+    }
+
+    #[test]
+    fn enabled_plugins_matcher_rejects_empty_list() {
+        let err = EnabledPluginsMatcher::from_csv(" , , ").expect_err("must reject empty list");
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn enabled_plugins_matcher_rejects_invalid_glob() {
+        let err = EnabledPluginsMatcher::from_csv("[").expect_err("must reject invalid mask");
+        assert!(err.to_string().contains("invalid enabled plugin glob mask"));
     }
 }
 

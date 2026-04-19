@@ -40,12 +40,24 @@ cargo run -- --host 127.0.0.1 --port 6737
 CLI options:
 
 - `--plugins-dir <path>` (or `OPENUSAGE_PLUGINS_DIR`)
+- `--enabled-plugins <csv-globs>` (or `OPENUSAGE_ENABLED_PLUGINS`, default: `*`)
 - `--app-data-dir <path>` (or `OPENUSAGE_APP_DATA_DIR`)
 - `--plugin-overrides-dir <path>` (or `OPENUSAGE_PLUGIN_OVERRIDES_DIR`)
 - `--refresh-interval-secs <seconds>` (default: `300`)
+- `--init-config` (write default `config.yaml` template and exit)
 - `--daemon` (spawn background process and exit parent)
 
 By default, the app runs in console mode and logs to stdout/stderr. Stop it with `Ctrl+C`.
+
+## Configuration File
+
+- Config path is resolved via `ProjectDirs::from("com", "openusage", "openusage-cli")` as `config_dir()/config.yaml`, with fallback to `./.openusage-cli/config.yaml`.
+- If the file is missing, daemon startup continues with CLI/env/default values (no auto-create).
+- To generate a full default config template with comments, run:
+
+```bash
+cargo run -- --init-config
+```
 
 ## Plugin Overrides (without editing `vendor/*`)
 

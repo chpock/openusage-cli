@@ -20,7 +20,8 @@
 
 ## Configuration contract (required for all new params)
 - Config file is `config.yaml` (YAML) resolved in `src/config.rs` via `ProjectDirs::from("com", "openusage", "openusage-cli")` (`config_dir()/config.yaml`), with fallback to `./.openusage-cli/config.yaml`.
-- On startup, config file must be auto-created if missing, using a full template that includes all supported fields and explanatory comments.
+- On startup, missing config file must not be auto-created; runtime uses CLI/env/default values.
+- Default config template generation is explicit via CLI (`--init-config`) and must include all supported fields with explanatory comments.
 - Source-of-truth precedence is strict: CLI flags (and supported env vars) > `config.yaml` > built-in defaults.
 - If you add a new runtime setting, update **all** of the following in the same change:
   1) CLI flag parsing in `src/main.rs` (`Cli`),
