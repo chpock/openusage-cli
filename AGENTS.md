@@ -13,7 +13,7 @@
 
 ## Core commands
 - Format + full verification: `cargo fmt && cargo test`
-- Run daemon locally: `cargo run -- --host 127.0.0.1 --port 6737`
+- Run daemon locally: `openusage-cli --host 127.0.0.1 --port 6737`
 - Focused tests:
   - `cargo test --test http_smoke`
   - `cargo test --test plugin_compatibility`

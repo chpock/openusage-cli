@@ -34,7 +34,7 @@ This allows using upstream plugins with minimal or zero changes.
 ## Run
 
 ```bash
-cargo run -- --host 127.0.0.1 --port 6737
+openusage-cli --host 127.0.0.1 --port 6737
 ```
 
 CLI options:
@@ -47,6 +47,22 @@ CLI options:
 - `--init-config` (write default `config.yaml` template and exit)
 - `--daemon` (spawn background process and exit parent)
 
+Default plugin auto-discovery order (when `--plugins-dir` is not set):
+
+When running from source (`openusage-cli` from `target/{debug,release}`):
+
+1. `<repo_root>/vendor/openusage/plugins`
+2. `<repo_root>/plugins`
+3. `<executable_dir>/vendor/openusage/plugins`
+4. `<executable_dir>/plugins`
+5. `<prefix>/share/openusage-cli/openusage-plugins` (derived from executable path)
+6. `/usr/share/openusage-cli/openusage-plugins`
+
+When running as an installed binary (Linux/FHS layout):
+
+1. `<prefix>/share/openusage-cli/openusage-plugins` (derived from executable path, e.g. `/usr/bin` -> `/usr/share`)
+2. `/usr/share/openusage-cli/openusage-plugins`
+
 By default, the app runs in console mode and logs to stdout/stderr. Stop it with `Ctrl+C`.
 
 ## Configuration File
@@ -56,14 +72,15 @@ By default, the app runs in console mode and logs to stdout/stderr. Stop it with
 - To generate a full default config template with comments, run:
 
 ```bash
-cargo run -- --init-config
+openusage-cli --init-config
 ```
 
 ## Plugin Overrides (without editing `vendor/*`)
 
 `openusage-cli` can load per-plugin override scripts from a separate directory.
 
-- Default lookup: `./plugin-overrides` then `<executable_dir>/plugin-overrides`
+- When running from source, default lookup is `<repo_root>/plugin-overrides`, then `<executable_dir>/plugin-overrides`, then packaged paths.
+- When running installed binary, lookup is `<prefix>/share/openusage-cli/plugin-overrides`, then `/usr/share/openusage-cli/plugin-overrides`.
 - Override filename patterns (first match wins):
   - `<plugin-id>.js`
   - `<plugin-id>.override.js`
@@ -120,3 +137,26 @@ Current tests include:
 - vendored plugin loading smoke test
 - real runtime probe test for `mock` plugin
 - compatibility harness that validates all vendored plugin scripts can register and run `probe(ctx)` in a stubbed OpenUsage-like JS context without missing host APIs
+
+## Build Linux Packages
+
+Install helper cargo subcommands once:
+
+```bash
+cargo install cargo-deb cargo-generate-rpm
+```
+
+Build packages:
+
+```bash
+make deb
+make rpm
+# or both
+make packages
+```
+
+Package layout:
+
+- Binary: `/usr/bin/openusage-cli`
+- Upstream plugins: `/usr/share/openusage-cli/openusage-plugins`
+- Override plugins: `/usr/share/openusage-cli/plugin-overrides`

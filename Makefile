@@ -1,4 +1,4 @@
-.PHONY: help build test run run-daemon clean
+.PHONY: help build test run run-daemon deb rpm packages clean
 
 CARGO ?= cargo
 HOST ?= 127.0.0.1
@@ -21,6 +21,9 @@ help:
 	@printf "  make test         Run full test suite\n"
 	@printf "  make run          Run daemon locally\n"
 	@printf "  make run-daemon   Run daemon in background\n"
+	@printf "  make deb          Build .deb package (cargo-deb)\n"
+	@printf "  make rpm          Build .rpm package (cargo-generate-rpm)\n"
+	@printf "  make packages     Build both .deb and .rpm\n"
 	@printf "  make clean        Remove build artifacts\n"
 	@printf "\nRun variables (optional):\n"
 	@printf "  HOST=127.0.0.1 PORT=6737 REFRESH_INTERVAL_SECS=300\n"
@@ -38,6 +41,15 @@ run:
 
 run-daemon:
 	$(CARGO) run -- $(RUN_ARGS) --daemon
+
+deb:
+	$(CARGO) deb
+
+rpm:
+	$(CARGO) build --release
+	$(CARGO) generate-rpm
+
+packages: deb rpm
 
 clean:
 	$(CARGO) clean

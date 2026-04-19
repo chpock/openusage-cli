@@ -15,6 +15,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 
+const SYSTEM_PLUGINS_DIR: &str = "/usr/share/openusage-cli/openusage-plugins";
+const SYSTEM_PLUGIN_OVERRIDES_DIR: &str = "/usr/share/openusage-cli/plugin-overrides";
+
 #[derive(Debug, Parser)]
 #[command(name = "openusage-cli")]
 #[command(about = "HTTP daemon for AI usage limit plugins")]
@@ -137,7 +140,7 @@ async fn run() -> Result<()> {
     let loaded_plugins = manifest::load_plugins_from_dir(&plugins_dir);
     if loaded_plugins.is_empty() {
         anyhow::bail!(
-            "no plugins found in {} (expected vendor/openusage/plugins layout)",
+            "no plugins found in {} (set --plugins-dir or install plugin data under <prefix>/share/openusage-cli/openusage-plugins)",
             plugins_dir.display()
         );
     }
@@ -486,6 +489,177 @@ mod tests {
         let err = EnabledPluginsMatcher::from_csv("[").expect_err("must reject invalid mask");
         assert!(err.to_string().contains("invalid enabled plugin glob mask"));
     }
+
+    #[test]
+    fn source_checkout_root_detects_cargo_target_layouts() {
+        assert_eq!(
+            source_checkout_root_from_exec_dir(Path::new("/repo/target/debug")),
+            Some(PathBuf::from("/repo"))
+        );
+        assert_eq!(
+            source_checkout_root_from_exec_dir(Path::new("/repo/target/release")),
+            Some(PathBuf::from("/repo"))
+        );
+        assert_eq!(
+            source_checkout_root_from_exec_dir(Path::new(
+                "/repo/target/x86_64-unknown-linux-gnu/release"
+            )),
+            Some(PathBuf::from("/repo"))
+        );
+        assert_eq!(
+            source_checkout_root_from_exec_dir(Path::new("/usr/bin")),
+            None
+        );
+    }
+
+    #[test]
+    fn plugins_dir_candidates_prefer_source_checkout_paths() {
+        let cwd = Path::new("/repo");
+        let exec_dir = Path::new("/repo/target/debug");
+
+        let candidates = plugins_dir_candidates(cwd, exec_dir);
+
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/repo/vendor/openusage/plugins"),
+                PathBuf::from("/repo/plugins"),
+                PathBuf::from("/repo/target/debug/vendor/openusage/plugins"),
+                PathBuf::from("/repo/target/debug/plugins"),
+                PathBuf::from("/repo/target/share/openusage-cli/openusage-plugins"),
+                PathBuf::from(SYSTEM_PLUGINS_DIR),
+            ]
+        );
+    }
+
+    #[test]
+    fn plugins_dir_candidates_for_installed_binary_use_prefix_share() {
+        let cwd = Path::new("/home/user");
+        let exec_dir = Path::new("/opt/openusage-cli/bin");
+
+        let candidates = plugins_dir_candidates(cwd, exec_dir);
+
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/opt/openusage-cli/share/openusage-cli/openusage-plugins"),
+                PathBuf::from(SYSTEM_PLUGINS_DIR),
+            ]
+        );
+    }
+
+    #[test]
+    fn plugin_overrides_candidates_prefer_source_checkout_paths() {
+        let cwd = Path::new("/repo");
+        let exec_dir = Path::new("/repo/target/debug");
+
+        let candidates = plugin_overrides_dir_candidates(cwd, exec_dir);
+
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/repo/plugin-overrides"),
+                PathBuf::from("/repo/target/debug/plugin-overrides"),
+                PathBuf::from("/repo/target/share/openusage-cli/plugin-overrides"),
+                PathBuf::from(SYSTEM_PLUGIN_OVERRIDES_DIR),
+            ]
+        );
+    }
+
+    #[test]
+    fn plugin_overrides_candidates_for_installed_binary_use_prefix_share() {
+        let cwd = Path::new("/home/user");
+        let exec_dir = Path::new("/opt/openusage-cli/bin");
+
+        let candidates = plugin_overrides_dir_candidates(cwd, exec_dir);
+
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/opt/openusage-cli/share/openusage-cli/plugin-overrides"),
+                PathBuf::from(SYSTEM_PLUGIN_OVERRIDES_DIR),
+            ]
+        );
+    }
+}
+
+fn plugins_dir_candidates(cwd: &Path, exec_dir: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let source_root = source_checkout_root_from_exec_dir(exec_dir);
+
+    if let Some(source_root) = source_root {
+        push_unique_path(
+            &mut candidates,
+            source_root.join("vendor/openusage/plugins"),
+        );
+        push_unique_path(&mut candidates, source_root.join("plugins"));
+        push_unique_path(&mut candidates, cwd.join("vendor/openusage/plugins"));
+        push_unique_path(&mut candidates, cwd.join("plugins"));
+        push_unique_path(&mut candidates, exec_dir.join("vendor/openusage/plugins"));
+        push_unique_path(&mut candidates, exec_dir.join("plugins"));
+    }
+
+    if let Some(packaged_path) = packaged_plugins_dir_from_exec_dir(exec_dir) {
+        push_unique_path(&mut candidates, packaged_path);
+    }
+    push_unique_path(&mut candidates, PathBuf::from(SYSTEM_PLUGINS_DIR));
+
+    candidates
+}
+
+fn plugin_overrides_dir_candidates(cwd: &Path, exec_dir: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let source_root = source_checkout_root_from_exec_dir(exec_dir);
+
+    if let Some(source_root) = source_root {
+        push_unique_path(&mut candidates, source_root.join("plugin-overrides"));
+        push_unique_path(&mut candidates, cwd.join("plugin-overrides"));
+        push_unique_path(&mut candidates, exec_dir.join("plugin-overrides"));
+    }
+
+    if let Some(packaged_path) = packaged_overrides_dir_from_exec_dir(exec_dir) {
+        push_unique_path(&mut candidates, packaged_path);
+    }
+    push_unique_path(&mut candidates, PathBuf::from(SYSTEM_PLUGIN_OVERRIDES_DIR));
+
+    candidates
+}
+
+fn source_checkout_root_from_exec_dir(exec_dir: &Path) -> Option<PathBuf> {
+    let profile = exec_dir.file_name()?.to_str()?;
+    if profile != "debug" && profile != "release" {
+        return None;
+    }
+
+    let parent = exec_dir.parent()?;
+    if parent.file_name().and_then(|name| name.to_str()) == Some("target") {
+        return parent.parent().map(Path::to_path_buf);
+    }
+
+    let maybe_target = parent.parent()?;
+    if maybe_target.file_name().and_then(|name| name.to_str()) == Some("target") {
+        return maybe_target.parent().map(Path::to_path_buf);
+    }
+
+    None
+}
+
+fn packaged_plugins_dir_from_exec_dir(exec_dir: &Path) -> Option<PathBuf> {
+    exec_dir
+        .parent()
+        .map(|prefix| prefix.join("share/openusage-cli/openusage-plugins"))
+}
+
+fn packaged_overrides_dir_from_exec_dir(exec_dir: &Path) -> Option<PathBuf> {
+    exec_dir
+        .parent()
+        .map(|prefix| prefix.join("share/openusage-cli/plugin-overrides"))
+}
+
+fn push_unique_path(candidates: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if !candidates.iter().any(|existing| existing == &candidate) {
+        candidates.push(candidate);
+    }
 }
 
 fn resolve_app_data_dir(cli_value: Option<PathBuf>) -> Result<PathBuf> {
@@ -518,16 +692,11 @@ fn resolve_plugins_dir(cli_value: Option<PathBuf>) -> Result<PathBuf> {
 
     let cwd = std::env::current_dir().context("cannot get current directory")?;
     let exec_dir = executable_dir()?;
-    let candidates = [
-        cwd.join("vendor/openusage/plugins"),
-        cwd.join("plugins"),
-        exec_dir.join("vendor/openusage/plugins"),
-        exec_dir.join("plugins"),
-    ];
+    let candidates = plugins_dir_candidates(&cwd, &exec_dir);
 
     for candidate in candidates {
         log::debug!("checking plugins dir candidate {}", candidate.display());
-        if candidate.exists() {
+        if candidate.is_dir() {
             log::debug!("plugins dir candidate selected: {}", candidate.display());
             return Ok(candidate);
         }
@@ -556,10 +725,7 @@ fn resolve_plugin_overrides_dir(cli_value: Option<PathBuf>) -> Result<Option<Pat
 
     let cwd = std::env::current_dir().context("cannot get current directory")?;
     let exec_dir = executable_dir()?;
-    let candidates = [
-        cwd.join("plugin-overrides"),
-        exec_dir.join("plugin-overrides"),
-    ];
+    let candidates = plugin_overrides_dir_candidates(&cwd, &exec_dir);
 
     for candidate in candidates {
         log::debug!(

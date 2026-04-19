@@ -2,6 +2,26 @@
 name = "openusage-cli"
 version = "0.1.0"
 edition = "2024"
+description = "HTTP daemon for OpenUsage plugins"
+license = "MIT"
+authors = ["Kostiantyn Kushnir"]
+
+[package.metadata.deb]
+depends = "$auto"
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/openusage-cli", "usr/bin/openusage-cli", "755"],
+    ["vendor/openusage/plugins/**/*", "usr/share/openusage-cli/openusage-plugins/", "644"],
+    ["plugin-overrides/**/*", "usr/share/openusage-cli/plugin-overrides/", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/openusage-cli", dest = "/usr/bin/openusage-cli", mode = "755" },
+    { source = "vendor/openusage/plugins/**/*", dest = "/usr/share/openusage-cli/openusage-plugins/", mode = "644" },
+    { source = "plugin-overrides/**/*", dest = "/usr/share/openusage-cli/plugin-overrides/", mode = "644" },
+]
 
 [dependencies]
 aes-gcm = "0.10.3"
