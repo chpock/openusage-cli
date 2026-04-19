@@ -45,7 +45,8 @@ CLI options:
 - `--plugin-overrides-dir <path>` (or `OPENUSAGE_PLUGIN_OVERRIDES_DIR`)
 - `--refresh-interval-secs <seconds>` (default: `300`)
 - `--default-config` (print default `config.yaml` template to stdout and exit)
-- `--daemon` (spawn background process and exit parent)
+- `--daemon[=true|false]` (when enabled, spawn background process and exit parent; default value for bare flag is `true`)
+- `--install-systemd` (create `~/.config/systemd/user/openusage-cli.service` for current user with `ExecStart=... --daemon=false`)
 
 Default plugin auto-discovery order (when `--plugins-dir` is not set):
 

@@ -7,7 +7,7 @@ use openusage_cli::daemon::{CachedPluginSnapshot, DaemonState};
 use openusage_cli::http_api::{self, ApiState};
 use openusage_cli::plugin_engine::manifest;
 use openusage_cli::plugin_engine::runtime::MetricLine;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -17,6 +17,7 @@ use tokio::net::TcpListener;
 
 const SYSTEM_PLUGINS_DIR: &str = "/usr/share/openusage-cli/openusage-plugins";
 const SYSTEM_PLUGIN_OVERRIDES_DIR: &str = "/usr/share/openusage-cli/plugin-overrides";
+const USER_SYSTEMD_SERVICE_NAME: &str = "openusage-cli.service";
 const APP_VERSION: &str = match option_env!("OPENUSAGE_BUILD_VERSION") {
     Some(version) => version,
     None => env!("CARGO_PKG_VERSION"),
@@ -51,8 +52,16 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     default_config: bool,
 
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true
+    )]
+    daemon: Option<bool>,
+
     #[arg(long, default_value_t = false)]
-    daemon: bool,
+    install_systemd: bool,
 
     #[arg(long, hide = true, default_value_t = false)]
     daemon_child: bool,
@@ -78,6 +87,11 @@ async fn run() -> Result<()> {
 
     if cli.default_config {
         print!("{}", config::default_config_template());
+        return Ok(());
+    }
+
+    if cli.install_systemd {
+        install_user_systemd_unit(&raw_args)?;
         return Ok(());
     }
 
@@ -304,11 +318,7 @@ impl RuntimeCli {
             .refresh_interval_secs
             .or(config.refresh_interval_secs)
             .unwrap_or(config::DEFAULT_REFRESH_INTERVAL_SECS);
-        let daemon = if cli.daemon {
-            true
-        } else {
-            config.daemon.unwrap_or(false)
-        };
+        let daemon = cli.daemon.or(config.daemon).unwrap_or(false);
         let enabled_plugins = cli
             .enabled_plugins
             .or(config.enabled_plugins)
@@ -609,7 +619,7 @@ async fn wait_for_ctrl_c() {
 
 fn spawn_daemon_process(raw_args: &[OsString]) -> Result<u32> {
     let executable = std::env::current_exe().context("cannot resolve current executable")?;
-    let forwarded_args = strip_daemon_flag(raw_args);
+    let forwarded_args = strip_flags_for_daemon_child(raw_args);
 
     let mut command = Command::new(executable);
     command
@@ -623,18 +633,106 @@ fn spawn_daemon_process(raw_args: &[OsString]) -> Result<u32> {
     Ok(child.id())
 }
 
-fn strip_daemon_flag(raw_args: &[OsString]) -> Vec<OsString> {
+fn strip_flags_for_daemon_child(raw_args: &[OsString]) -> Vec<OsString> {
     raw_args
         .iter()
         .filter_map(|arg| {
             let value = arg.to_string_lossy();
-            if value == "--daemon" || value.starts_with("--daemon=") || value == "--daemon-child" {
+            if value == "--daemon"
+                || value.starts_with("--daemon=")
+                || value == "--daemon-child"
+                || value == "--install-systemd"
+                || value.starts_with("--install-systemd=")
+            {
                 None
             } else {
                 Some(arg.clone())
             }
         })
         .collect()
+}
+
+fn install_user_systemd_unit(_raw_args: &[OsString]) -> Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        anyhow::bail!("--install-systemd is supported only on Linux");
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let home_dir = dirs::home_dir().context("cannot resolve current user home directory")?;
+        let required_dirs = [
+            home_dir.join(".config"),
+            home_dir.join(".config/systemd"),
+            home_dir.join(".config/systemd/user"),
+        ];
+        let missing_dirs: Vec<PathBuf> = required_dirs
+            .iter()
+            .filter(|path| !path.is_dir())
+            .cloned()
+            .collect();
+
+        if !missing_dirs.is_empty() {
+            let missing = missing_dirs
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "cannot install user systemd unit: required directories do not exist: {}",
+                missing
+            );
+        }
+
+        let unit_path = home_dir
+            .join(".config/systemd/user")
+            .join(USER_SYSTEMD_SERVICE_NAME);
+        let executable = std::env::current_exe().context("cannot resolve current executable")?;
+        let exec_start = systemd_exec_start(executable.as_os_str());
+
+        let unit_content = format!(
+            "[Unit]\nDescription=OpenUsage CLI daemon\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={}\nRestart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n",
+            exec_start
+        );
+
+        std::fs::write(&unit_path, unit_content)
+            .with_context(|| format!("failed to write unit file {}", unit_path.display()))?;
+
+        println!("Systemd user unit installed.");
+        println!("Created files:");
+        println!("  - {}", unit_path.display());
+        println!("Next commands:");
+        println!("  - systemctl --user daemon-reload");
+        println!(
+            "  - systemctl --user enable --now {}",
+            USER_SYSTEMD_SERVICE_NAME
+        );
+        println!("  - systemctl --user status {}", USER_SYSTEMD_SERVICE_NAME);
+        println!("Service logs:");
+        println!("  - journalctl --user -u {} -f", USER_SYSTEMD_SERVICE_NAME);
+
+        Ok(())
+    }
+}
+
+fn quote_systemd_argument(value: &OsStr) -> String {
+    let raw = value.to_string_lossy();
+    if raw.chars().all(|ch| {
+        ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':' | '=' | ',')
+    }) {
+        return raw.to_string();
+    }
+
+    let escaped = raw.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{}\"", escaped)
+}
+
+fn systemd_exec_start(executable: &OsStr) -> String {
+    [
+        quote_systemd_argument(executable),
+        "--daemon=false".to_string(),
+    ]
+    .join(" ")
 }
 
 fn log_plugin_initialization_summary(snapshots: &[CachedPluginSnapshot]) {
@@ -770,7 +868,8 @@ mod tests {
             plugin_overrides_dir: None,
             refresh_interval_secs: None,
             default_config: false,
-            daemon: false,
+            daemon: None,
+            install_systemd: false,
             daemon_child: false,
         }
     }
@@ -787,6 +886,27 @@ mod tests {
         let err = Cli::try_parse_from(["openusage-cli", "--init-config"])
             .expect_err("--init-config must be rejected");
         assert!(err.to_string().contains("--init-config"));
+    }
+
+    #[test]
+    fn cli_accepts_install_systemd_flag() {
+        let cli = Cli::try_parse_from(["openusage-cli", "--install-systemd"])
+            .expect("--install-systemd should parse");
+        assert!(cli.install_systemd);
+    }
+
+    #[test]
+    fn cli_accepts_daemon_without_value_as_true() {
+        let cli =
+            Cli::try_parse_from(["openusage-cli", "--daemon"]).expect("--daemon should parse");
+        assert_eq!(cli.daemon, Some(true));
+    }
+
+    #[test]
+    fn cli_accepts_daemon_false_value() {
+        let cli = Cli::try_parse_from(["openusage-cli", "--daemon=false"])
+            .expect("--daemon=false should parse");
+        assert_eq!(cli.daemon, Some(false));
     }
 
     #[test]
@@ -842,7 +962,8 @@ mod tests {
             plugin_overrides_dir: Some(PathBuf::from("/cli/overrides")),
             refresh_interval_secs: Some(7),
             default_config: false,
-            daemon: true,
+            daemon: Some(true),
+            install_systemd: false,
             daemon_child: false,
         };
         let app_config = config::AppConfig {
@@ -873,6 +994,22 @@ mod tests {
     }
 
     #[test]
+    fn runtime_cli_daemon_false_overrides_config_true() {
+        let cli = Cli {
+            daemon: Some(false),
+            ..empty_cli()
+        };
+        let app_config = config::AppConfig {
+            daemon: Some(true),
+            ..config::AppConfig::default()
+        };
+
+        let runtime = RuntimeCli::from_sources(cli, app_config);
+
+        assert!(!runtime.daemon);
+    }
+
+    #[test]
     fn enabled_plugins_matcher_supports_multiple_globs() {
         let matcher = EnabledPluginsMatcher::from_csv("codex,cur*").expect("matcher should parse");
 
@@ -891,6 +1028,35 @@ mod tests {
     fn enabled_plugins_matcher_rejects_invalid_glob() {
         let err = EnabledPluginsMatcher::from_csv("[").expect_err("must reject invalid mask");
         assert!(err.to_string().contains("invalid enabled plugin glob mask"));
+    }
+
+    #[test]
+    fn strip_flags_for_daemon_child_removes_internal_flags() {
+        let args = vec![
+            OsString::from("--host"),
+            OsString::from("127.0.0.1"),
+            OsString::from("--daemon"),
+            OsString::from("--daemon-child"),
+            OsString::from("--install-systemd"),
+            OsString::from("--port=6737"),
+        ];
+
+        assert_eq!(
+            strip_flags_for_daemon_child(&args),
+            vec![
+                OsString::from("--host"),
+                OsString::from("127.0.0.1"),
+                OsString::from("--port=6737"),
+            ]
+        );
+    }
+
+    #[test]
+    fn systemd_exec_start_always_uses_daemon_false() {
+        assert_eq!(
+            systemd_exec_start(OsStr::new("/usr/bin/openusage-cli")),
+            "/usr/bin/openusage-cli --daemon=false"
+        );
     }
 
     #[test]
