@@ -49,7 +49,7 @@ struct Cli {
     refresh_interval_secs: Option<u64>,
 
     #[arg(long, default_value_t = false)]
-    init_config: bool,
+    default_config: bool,
 
     #[arg(long, default_value_t = false)]
     daemon: bool,
@@ -76,17 +76,8 @@ async fn run() -> Result<()> {
     let raw_args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let cli = Cli::parse();
 
-    if cli.init_config {
-        let (path, created) =
-            config::write_default_config_if_missing().context("failed to write default config")?;
-        if created {
-            log::info!("wrote default config template to {}", path.display());
-        } else {
-            log::info!(
-                "config file already exists at {}; keeping it",
-                path.display()
-            );
-        }
+    if cli.default_config {
+        print!("{}", config::default_config_template());
         return Ok(());
     }
 
@@ -778,10 +769,24 @@ mod tests {
             app_data_dir: None,
             plugin_overrides_dir: None,
             refresh_interval_secs: None,
-            init_config: false,
+            default_config: false,
             daemon: false,
             daemon_child: false,
         }
+    }
+
+    #[test]
+    fn cli_accepts_default_config_flag() {
+        let cli = Cli::try_parse_from(["openusage-cli", "--default-config"])
+            .expect("--default-config should parse");
+        assert!(cli.default_config);
+    }
+
+    #[test]
+    fn cli_rejects_legacy_init_config_flag() {
+        let err = Cli::try_parse_from(["openusage-cli", "--init-config"])
+            .expect_err("--init-config must be rejected");
+        assert!(err.to_string().contains("--init-config"));
     }
 
     #[test]
@@ -836,7 +841,7 @@ mod tests {
             app_data_dir: Some(PathBuf::from("/cli/data")),
             plugin_overrides_dir: Some(PathBuf::from("/cli/overrides")),
             refresh_interval_secs: Some(7),
-            init_config: false,
+            default_config: false,
             daemon: true,
             daemon_child: false,
         };

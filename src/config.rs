@@ -91,9 +91,9 @@ fn write_default_config_to_path(path: &Path, overwrite: bool) -> Result<bool> {
     Ok(true)
 }
 
-fn default_config_template() -> &'static str {
+pub fn default_config_template() -> &'static str {
     r#"# openusage-cli configuration.
-# Generate this file explicitly with: openusage-cli --init-config
+# Print this template explicitly with: openusage-cli --default-config
 # CLI flags (and env vars for supported args) override this file.
 
 # HTTP bind host.

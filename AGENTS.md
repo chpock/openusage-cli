@@ -32,7 +32,7 @@
 
 ## Config contract (keep in sync)
 - Config path resolution: `ProjectDirs::from("com", "openusage", "openusage-cli")/config.yaml`, fallback `./.openusage-cli/config.yaml`.
-- Missing config is valid at startup (no auto-create). Template generation is explicit via `--init-config`.
+- Missing config is valid at startup (no auto-create). Template generation is explicit via `--default-config`.
 - Precedence is strict: CLI flags/env > `config.yaml` > built-in defaults.
 - For any new runtime setting, update together:
   1) `Cli` args in `src/main.rs`,
