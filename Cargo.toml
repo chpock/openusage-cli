@@ -1,0 +1,27 @@
+[package]
+name = "openusage-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aes-gcm = "0.10.3"
+anyhow = "1"
+axum = "0.8"
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
+dirs = "6"
+directories = "6"
+log = "0.4"
+regex-lite = "0.1.9"
+reqwest = { version = "0.13", features = ["blocking", "socks", "json", "rustls"] }
+rquickjs = { version = "0.11", features = ["bindgen"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+swc_core = { version = "64", features = ["common", "ecma_ast", "ecma_parser", "ecma_visit", "ecma_codegen"] }
+time = { version = "0.3.47", features = ["formatting", "parsing"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors"] }
+env_logger = "0.11"
+
+[dev-dependencies]
+tempfile = "3"
