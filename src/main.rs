@@ -319,10 +319,12 @@ impl RuntimeCli {
             .or(config.refresh_interval_secs)
             .unwrap_or(config::DEFAULT_REFRESH_INTERVAL_SECS);
         let daemon = cli.daemon.or(config.daemon).unwrap_or(false);
-        let enabled_plugins = cli
-            .enabled_plugins
-            .or(config.enabled_plugins)
-            .unwrap_or_else(|| config::DEFAULT_ENABLED_PLUGINS.to_string());
+        let enabled_plugins = cli.enabled_plugins.unwrap_or_else(|| {
+            config
+                .enabled_plugins
+                .map(|masks| masks.join(","))
+                .unwrap_or_else(|| config::DEFAULT_ENABLED_PLUGINS.to_string())
+        });
 
         Self {
             host,
@@ -929,7 +931,7 @@ mod tests {
             host: Some("0.0.0.0".to_string()),
             port: Some(9000),
             plugins_dir: Some(PathBuf::from("/tmp/plugins")),
-            enabled_plugins: Some("codex,cur*".to_string()),
+            enabled_plugins: Some(vec!["codex".to_string(), "cur*".to_string()]),
             app_data_dir: Some(PathBuf::from("/tmp/data")),
             plugin_overrides_dir: Some(PathBuf::from("/tmp/overrides")),
             refresh_interval_secs: Some(42),
@@ -970,7 +972,7 @@ mod tests {
             host: Some("0.0.0.0".to_string()),
             port: Some(9000),
             plugins_dir: Some(PathBuf::from("/cfg/plugins")),
-            enabled_plugins: Some("codex".to_string()),
+            enabled_plugins: Some(vec!["codex".to_string()]),
             app_data_dir: Some(PathBuf::from("/cfg/data")),
             plugin_overrides_dir: Some(PathBuf::from("/cfg/overrides")),
             refresh_interval_secs: Some(60),

@@ -22,7 +22,7 @@ pub struct AppConfig {
     pub host: Option<String>,
     pub port: Option<u16>,
     pub plugins_dir: Option<PathBuf>,
-    pub enabled_plugins: Option<String>,
+    pub enabled_plugins: Option<Vec<String>>,
     pub app_data_dir: Option<PathBuf>,
     pub plugin_overrides_dir: Option<PathBuf>,
     pub refresh_interval_secs: Option<u64>,
@@ -106,9 +106,10 @@ port: 6737
 # plugins_dir: /path/to/plugins
 plugins_dir: null
 
-# Comma-separated glob masks for enabled plugin IDs.
-# Examples: "*" (all), "codex,cursor", "c*"
-enabled_plugins: "*"
+# List of glob masks for enabled plugin IDs.
+# Examples: ["*"] (all), ["codex", "cursor"], ["c*"]
+enabled_plugins:
+  - "*"
 
 # Directory for provider data/cache. null = platform default.
 # app_data_dir: /path/to/app-data
@@ -178,8 +179,8 @@ mod tests {
         assert_eq!(parsed.host.as_deref(), Some(DEFAULT_HOST));
         assert_eq!(parsed.port, Some(DEFAULT_PORT));
         assert_eq!(
-            parsed.enabled_plugins.as_deref(),
-            Some(DEFAULT_ENABLED_PLUGINS)
+            parsed.enabled_plugins,
+            Some(vec![DEFAULT_ENABLED_PLUGINS.to_string()])
         );
         assert_eq!(
             parsed.refresh_interval_secs,
