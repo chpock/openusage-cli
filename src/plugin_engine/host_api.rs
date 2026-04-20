@@ -5,6 +5,7 @@ use aes_gcm::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use rquickjs::{Ctx, Exception, Function, Object};
+use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -278,6 +279,51 @@ fn redact_body(body: &str) -> String {
     }
 
     result
+}
+
+/// Format reqwest error with detailed context for better debugging.
+fn format_http_error(e: &reqwest::Error, url: &str) -> String {
+    let top_level = if let Some(raw_url) = e.url() {
+        e.to_string().replace(raw_url.as_str(), url)
+    } else {
+        e.to_string()
+    };
+    let mut parts = vec![top_level, format!("url: {}", url)];
+
+    // Add error kind/category
+    if e.is_timeout() {
+        parts.push("kind: timeout".to_string());
+    } else if e.is_connect() {
+        parts.push("kind: connection".to_string());
+    } else if e.is_request() {
+        parts.push("kind: request".to_string());
+    } else if e.is_body() {
+        parts.push("kind: body".to_string());
+    } else if e.is_decode() {
+        parts.push("kind: decode".to_string());
+    } else if e.is_redirect() {
+        parts.push("kind: redirect".to_string());
+    }
+
+    // Add HTTP status if available
+    if let Some(status) = e.status() {
+        parts.push(format!("status: {}", status));
+    }
+
+    // Add source/cause chain
+    let mut current: Option<&(dyn Error + 'static)> = e.source();
+    let mut depth = 0;
+    while let Some(err) = current {
+        parts.push(format!("caused by: {}", err));
+        current = err.source();
+        depth += 1;
+        if depth >= 3 {
+            // Limit depth to avoid overly verbose messages
+            break;
+        }
+    }
+
+    parts.join(" | ")
 }
 
 /// Lightweight redaction for log messages.
@@ -652,9 +698,11 @@ fn inject_http<'js>(ctx: &Ctx<'js>, host: &Object<'js>, plugin_id: &str) -> rqui
                 if req.dangerously_ignore_tls.unwrap_or(false) {
                     builder = builder.danger_accept_invalid_certs(true);
                 }
-                let client = builder
-                    .build()
-                    .map_err(|e| Exception::throw_message(&ctx_inner, &e.to_string()))?;
+                let client = builder.build().map_err(|e| {
+                    let error_msg = format!("failed to build HTTP client: {}", e);
+                    log::error!("[plugin:{}] {}", pid, error_msg);
+                    Exception::throw_message(&ctx_inner, &error_msg)
+                })?;
 
                 let method = req.method.as_deref().unwrap_or("GET");
                 let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| {
@@ -669,9 +717,11 @@ fn inject_http<'js>(ctx: &Ctx<'js>, host: &Object<'js>, plugin_id: &str) -> rqui
                     builder = builder.body(body);
                 }
 
-                let response = builder
-                    .send()
-                    .map_err(|e| Exception::throw_message(&ctx_inner, &e.to_string()))?;
+                let response = builder.send().map_err(|e| {
+                    let error_detail = format_http_error(&e, &redacted_url);
+                    log::error!("[plugin:{}] HTTP request failed: {}", pid, error_detail);
+                    Exception::throw_message(&ctx_inner, &error_detail)
+                })?;
 
                 let status = response.status().as_u16();
                 let mut resp_headers = std::collections::HashMap::new();
@@ -684,9 +734,15 @@ fn inject_http<'js>(ctx: &Ctx<'js>, host: &Object<'js>, plugin_id: &str) -> rqui
                     })?;
                     resp_headers.insert(key.to_string(), header_value.to_string());
                 }
-                let body = response
-                    .text()
-                    .map_err(|e| Exception::throw_message(&ctx_inner, &e.to_string()))?;
+                let body = response.text().map_err(|e| {
+                    let error_detail = format_http_error(&e, &redacted_url);
+                    log::error!(
+                        "[plugin:{}] HTTP response read failed: {}",
+                        pid,
+                        error_detail
+                    );
+                    Exception::throw_message(&ctx_inner, &error_detail)
+                })?;
 
                 // Redact BEFORE truncation to ensure sensitive values are caught while intact
                 let redacted_body = redact_body(&body);
