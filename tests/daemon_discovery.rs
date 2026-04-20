@@ -191,3 +191,187 @@ fn assert_process_still_running(child: &mut Child) {
         panic!("daemon process exited unexpectedly: {status}");
     }
 }
+
+#[test]
+fn query_mode_connects_to_running_daemon() {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home_dir = temp.path().join("home");
+    let app_data_dir = temp.path().join("app-data");
+
+    fs::create_dir_all(&home_dir).expect("create HOME dir");
+    fs::create_dir_all(&app_data_dir).expect("create app data dir");
+
+    // Start daemon
+    let mut daemon = DaemonProcess::spawn(&workspace_root, &home_dir, &app_data_dir);
+
+    let endpoint_path = app_data_dir
+        .join(RUNTIME_DIR_NAME)
+        .join(DAEMON_ENDPOINT_FILE_NAME);
+    wait_for_endpoint_file(&endpoint_path, daemon.child_mut());
+    let endpoint_url = read_endpoint_url(&endpoint_path);
+
+    wait_for_health_ok(&endpoint_url, daemon.child_mut());
+
+    // Now run query mode - it should connect to the daemon and return data
+    let daemon_bin = PathBuf::from(env!("CARGO_BIN_EXE_openusage-cli"));
+    let query_output = Command::new(daemon_bin)
+        .arg("--query")
+        .arg("--test-mode")
+        .arg("--app-data-dir")
+        .arg(&app_data_dir)
+        .env("HOME", &home_dir)
+        .output()
+        .expect("run query mode");
+
+    let stdout = String::from_utf8_lossy(&query_output.stdout);
+    let stderr = String::from_utf8_lossy(&query_output.stderr);
+
+    assert!(
+        query_output.status.success(),
+        "query mode should succeed. stdout: {}, stderr: {}",
+        stdout,
+        stderr
+    );
+
+    // Verify the output is valid JSON with expected structure
+    let json: Value = serde_json::from_str(&stdout).expect("query output should be valid JSON");
+    assert!(
+        json.is_array(),
+        "query output should be a JSON array of snapshots"
+    );
+
+    // Should have at least one snapshot (mock plugin)
+    let snapshots = json.as_array().expect("snapshots array");
+    assert!(!snapshots.is_empty(), "should have at least one snapshot");
+
+    // Verify the mock plugin is present
+    let has_mock = snapshots.iter().any(|s| {
+        s.get("providerId")
+            .map(|p| p.as_str() == Some("mock"))
+            .unwrap_or(false)
+    });
+    assert!(has_mock, "query result should include mock plugin data");
+
+    // Verify daemon is still running after query
+    assert_process_still_running(daemon.child_mut());
+
+    daemon.terminate_gracefully();
+}
+
+#[test]
+fn query_mode_falls_back_to_local_execution_when_no_daemon() {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home_dir = temp.path().join("home");
+    let app_data_dir = temp.path().join("app-data");
+
+    fs::create_dir_all(&home_dir).expect("create HOME dir");
+    fs::create_dir_all(&app_data_dir).expect("create app data dir");
+
+    // No daemon running - query should fall back to local plugin execution
+    let daemon_bin = PathBuf::from(env!("CARGO_BIN_EXE_openusage-cli"));
+    let plugins_dir = workspace_root.join("vendor/openusage/plugins");
+
+    let query_output = Command::new(daemon_bin)
+        .arg("--query")
+        .arg("--test-mode")
+        .arg("--plugins-dir")
+        .arg(&plugins_dir)
+        .arg("--enabled-plugins")
+        .arg("mock")
+        .arg("--app-data-dir")
+        .arg(&app_data_dir)
+        .env("HOME", &home_dir)
+        .output()
+        .expect("run query mode");
+
+    let stdout = String::from_utf8_lossy(&query_output.stdout);
+    let stderr = String::from_utf8_lossy(&query_output.stderr);
+
+    assert!(
+        query_output.status.success(),
+        "query mode should succeed even without daemon. stdout: {}, stderr: {}",
+        stdout,
+        stderr
+    );
+
+    // Verify the output is valid JSON with expected structure
+    let json: Value = serde_json::from_str(&stdout).expect("query output should be valid JSON");
+    assert!(
+        json.is_array(),
+        "query output should be a JSON array of snapshots"
+    );
+
+    // Verify we got plugin data from local execution
+    let snapshots = json.as_array().expect("snapshots array");
+    assert!(
+        !snapshots.is_empty(),
+        "should have at least one snapshot from local execution"
+    );
+}
+
+#[test]
+fn query_mode_falls_back_when_daemon_endpoint_file_exists_but_daemon_dead() {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home_dir = temp.path().join("home");
+    let app_data_dir = temp.path().join("app-data");
+
+    fs::create_dir_all(&home_dir).expect("create HOME dir");
+    fs::create_dir_all(&app_data_dir).expect("create app data dir");
+
+    // Create a stale endpoint file pointing to a non-existent daemon
+    let runtime_dir = app_data_dir.join(RUNTIME_DIR_NAME);
+    fs::create_dir_all(&runtime_dir).expect("create runtime dir");
+    let endpoint_path = runtime_dir.join(DAEMON_ENDPOINT_FILE_NAME);
+    fs::write(&endpoint_path, "http://127.0.0.1:1\n").expect("write stale endpoint file");
+
+    // Query should fail to connect, then fall back to local execution
+    let daemon_bin = PathBuf::from(env!("CARGO_BIN_EXE_openusage-cli"));
+    let plugins_dir = workspace_root.join("vendor/openusage/plugins");
+
+    let query_output = Command::new(daemon_bin)
+        .arg("--query")
+        .arg("--test-mode")
+        .arg("--plugins-dir")
+        .arg(&plugins_dir)
+        .arg("--enabled-plugins")
+        .arg("mock")
+        .arg("--app-data-dir")
+        .arg(&app_data_dir)
+        .env("HOME", &home_dir)
+        .output()
+        .expect("run query mode");
+
+    let stdout = String::from_utf8_lossy(&query_output.stdout);
+    let stderr = String::from_utf8_lossy(&query_output.stderr);
+
+    assert!(
+        query_output.status.success(),
+        "query mode should succeed with fallback. stdout: {}, stderr: {}",
+        stdout,
+        stderr
+    );
+
+    // Verify the output is valid JSON with expected structure
+    let json: Value = serde_json::from_str(&stdout).expect("query output should be valid JSON");
+    assert!(
+        json.is_array(),
+        "query output should be a JSON array of snapshots"
+    );
+
+    // Should have gotten data from local execution
+    let snapshots = json.as_array().expect("snapshots array");
+    assert!(
+        !snapshots.is_empty(),
+        "should have at least one snapshot from local execution"
+    );
+
+    // Verify fallback message is in logs
+    assert!(
+        stderr.contains("falling back to local plugin execution"),
+        "should log fallback message. stderr: {}",
+        stderr
+    );
+}

@@ -4,7 +4,7 @@ use directories::ProjectDirs;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use openusage_cli::config;
 use openusage_cli::daemon::{CachedPluginSnapshot, DaemonState};
-use openusage_cli::discovery::PublishedDiscovery;
+use openusage_cli::discovery::{PublishedDiscovery, discover_daemon_endpoint_with_override};
 use openusage_cli::http_api::{self, ApiState};
 use openusage_cli::plugin_engine::manifest;
 use openusage_cli::plugin_engine::runtime::MetricLine;
@@ -153,15 +153,49 @@ async fn run() -> Result<()> {
         log::warn!("query mode enabled; daemon mode is ignored");
     }
 
+    // Resolve app_data_dir early - needed for daemon discovery in test mode
+    let app_data_dir = resolve_app_data_dir(runtime.app_data_dir.clone(), runtime.test_mode)
+        .context("failed to resolve app data directory")?;
+
+    // Query mode: try to connect to an existing daemon first
+    if runtime.query {
+        log::debug!("query mode enabled; attempting to discover running daemon");
+
+        // In test mode, also check the test runtime directory for endpoint file
+        let test_runtime_dir = runtime
+            .test_mode
+            .then(|| app_data_dir.join(config::RUNTIME_DIR_NAME));
+
+        if let Some(daemon_url) =
+            discover_daemon_endpoint_with_override(test_runtime_dir.as_deref())
+        {
+            log::info!(
+                "discovered running daemon at {}; querying for data",
+                daemon_url
+            );
+            match query_daemon_via_http(&daemon_url).await {
+                Ok(json_output) => {
+                    println!("{}", json_output);
+                    return Ok(());
+                }
+                Err(err) => {
+                    log::warn!(
+                        "failed to query running daemon: {}; falling back to local plugin execution",
+                        err
+                    );
+                }
+            }
+        } else {
+            log::info!("no running daemon discovered; falling back to local plugin execution");
+        }
+    }
+
     if should_spawn_daemon_parent(&runtime) {
         let child_pid =
             spawn_daemon_process(&raw_args).context("failed to spawn background daemon process")?;
         log::info!("daemon mode enabled; spawned background process pid={child_pid}");
         return Ok(());
     }
-
-    let app_data_dir = resolve_app_data_dir(runtime.app_data_dir, runtime.test_mode)
-        .context("failed to resolve app data directory")?;
     log::info!("using app data dir: {}", app_data_dir.display());
     std::fs::create_dir_all(&app_data_dir).with_context(|| {
         format!(
@@ -950,6 +984,48 @@ fn truncate_for_log(value: &str, max_chars: usize) -> String {
     } else {
         result
     }
+}
+
+/// Queries a running daemon via HTTP and returns validated usage JSON.
+async fn query_daemon_via_http(base_url: &str) -> Result<String> {
+    let url = format!("{}/v1/usage", base_url);
+    log::debug!("querying daemon at {}", url);
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("failed to create HTTP client")?;
+
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .context("failed to connect to daemon")?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("daemon returned error: {} - {}", status, body);
+    }
+
+    let body = response
+        .text()
+        .await
+        .context("failed to read daemon response")?;
+
+    let payload: serde_json::Value =
+        serde_json::from_str(&body).context("daemon returned non-JSON usage payload")?;
+
+    let snapshots = payload
+        .as_array()
+        .context("daemon returned unexpected usage payload shape (expected JSON array)")?;
+    if !snapshots.iter().all(serde_json::Value::is_object) {
+        anyhow::bail!(
+            "daemon returned unexpected usage payload shape (array entries must be objects)"
+        );
+    }
+
+    Ok(body)
 }
 
 fn install_panic_hook() {

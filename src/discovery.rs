@@ -161,6 +161,46 @@ fn remove_discovery_file(path: &Path) {
     }
 }
 
+/// Attempts to discover a running daemon by reading the endpoint file.
+/// Returns the daemon's base URL if the endpoint file exists and is valid.
+pub fn discover_daemon_endpoint() -> Option<String> {
+    discover_daemon_endpoint_with_override(None)
+}
+
+/// Attempts to discover a running daemon, with optional test runtime directory override.
+/// When `test_runtime_dir` is provided (e.g., from --app-data-dir in test mode),
+/// checks only that location and does not fall back to the standard path.
+pub fn discover_daemon_endpoint_with_override(test_runtime_dir: Option<&Path>) -> Option<String> {
+    if let Some(dir) = test_runtime_dir {
+        let test_endpoint_file = dir.join(config::DAEMON_ENDPOINT_FILE_NAME);
+        let contents = std::fs::read_to_string(&test_endpoint_file).ok()?;
+        let url = contents.trim().to_string();
+        if is_valid_daemon_url(&url) {
+            log::debug!(
+                "discovered daemon endpoint in override runtime dir: {}",
+                url
+            );
+            Some(url)
+        } else {
+            None
+        }
+    } else {
+        let endpoint_path = config::daemon_endpoint_path().ok()?;
+        let contents = std::fs::read_to_string(&endpoint_path.endpoint_file).ok()?;
+        let url = contents.trim().to_string();
+        if is_valid_daemon_url(&url) {
+            log::debug!("discovered daemon endpoint in standard path: {}", url);
+            Some(url)
+        } else {
+            None
+        }
+    }
+}
+
+fn is_valid_daemon_url(url: &str) -> bool {
+    !url.is_empty() && (url.starts_with("http://") || url.starts_with("https://"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +229,40 @@ mod tests {
 
         drop(handle);
         assert!(!endpoint_path.endpoint_file.exists());
+    }
+
+    #[test]
+    fn discover_daemon_endpoint_with_override_returns_some_for_valid_url() {
+        let temp = tempdir().expect("temp dir");
+        let endpoint_path = test_endpoint_path(temp.path());
+
+        std::fs::create_dir_all(&endpoint_path.dir).expect("create runtime dir");
+        std::fs::write(&endpoint_path.endpoint_file, "http://127.0.0.1:6737\n").expect("write url");
+
+        let discovered = discover_daemon_endpoint_with_override(Some(&endpoint_path.dir));
+        assert_eq!(discovered.as_deref(), Some("http://127.0.0.1:6737"));
+    }
+
+    #[test]
+    fn discover_daemon_endpoint_with_override_returns_none_when_file_missing() {
+        let temp = tempdir().expect("temp dir");
+        let endpoint_path = test_endpoint_path(temp.path());
+
+        let discovered = discover_daemon_endpoint_with_override(Some(&endpoint_path.dir));
+        assert!(discovered.is_none());
+    }
+
+    #[test]
+    fn discover_daemon_endpoint_with_override_returns_none_for_invalid_url() {
+        let temp = tempdir().expect("temp dir");
+        let endpoint_path = test_endpoint_path(temp.path());
+
+        std::fs::create_dir_all(&endpoint_path.dir).expect("create runtime dir");
+        std::fs::write(&endpoint_path.endpoint_file, "not-a-valid-url\n")
+            .expect("write invalid url");
+
+        let discovered = discover_daemon_endpoint_with_override(Some(&endpoint_path.dir));
+        assert!(discovered.is_none());
     }
 
     #[test]
