@@ -2367,6 +2367,12 @@ fn expand_path(path: &str) -> String {
 mod tests {
     use super::*;
     use rquickjs::{Context, Function, Object, Runtime};
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     fn encrypt_aes_256_gcm_envelope_for_test(key: &[u8], plaintext: &str) -> String {
         let iv = [7_u8; 16];
@@ -2529,6 +2535,8 @@ mod tests {
 
     #[test]
     fn env_api_respects_allowlist_in_host_and_js() {
+        let _env_lock = env_test_lock().lock().expect("env test lock");
+
         let claude_env_vars = [
             "CLAUDE_CONFIG_DIR",
             "CLAUDE_CODE_OAUTH_TOKEN",
@@ -2592,6 +2600,8 @@ mod tests {
 
     #[test]
     fn env_api_prefers_process_env() {
+        let _env_lock = env_test_lock().lock().expect("env test lock");
+
         struct RestoreEnvVar {
             name: &'static str,
             old: Option<String>,
