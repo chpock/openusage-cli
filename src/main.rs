@@ -4,6 +4,7 @@ use directories::ProjectDirs;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use openusage_cli::config;
 use openusage_cli::daemon::{CachedPluginSnapshot, DaemonState};
+use openusage_cli::discovery::PublishedDiscovery;
 use openusage_cli::http_api::{self, ApiState};
 use openusage_cli::plugin_engine::manifest;
 use openusage_cli::plugin_engine::runtime::MetricLine;
@@ -34,16 +35,16 @@ struct Cli {
     #[arg(long)]
     port: Option<u16>,
 
-    #[arg(long, env = "OPENUSAGE_PLUGINS_DIR")]
+    #[arg(long)]
     plugins_dir: Option<PathBuf>,
 
-    #[arg(long, env = "OPENUSAGE_ENABLED_PLUGINS")]
+    #[arg(long)]
     enabled_plugins: Option<String>,
 
-    #[arg(long, env = "OPENUSAGE_APP_DATA_DIR")]
+    #[arg(long)]
     app_data_dir: Option<PathBuf>,
 
-    #[arg(long, env = "OPENUSAGE_PLUGIN_OVERRIDES_DIR")]
+    #[arg(long)]
     plugin_overrides_dir: Option<PathBuf>,
 
     #[arg(long)]
@@ -65,6 +66,9 @@ struct Cli {
 
     #[arg(long, hide = true, default_value_t = false)]
     daemon_child: bool,
+
+    #[arg(long, hide = true, default_value_t = false)]
+    test_mode: bool,
 }
 
 #[tokio::main]
@@ -84,6 +88,11 @@ async fn main() -> Result<()> {
 async fn run() -> Result<()> {
     let raw_args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let cli = Cli::parse();
+    let env_overrides = if cli.test_mode {
+        EnvOverrides::default()
+    } else {
+        EnvOverrides::from_process()
+    };
 
     if cli.default_config {
         print!("{}", config::default_config_template());
@@ -95,31 +104,41 @@ async fn run() -> Result<()> {
         return Ok(());
     }
 
-    let loaded_config = config::load_config_if_exists().context("failed to load config")?;
+    let loaded_config = if cli.test_mode {
+        log::info!(
+            "test mode enabled; ignoring config file and OPENUSAGE_* runtime environment overrides"
+        );
+        None
+    } else {
+        config::load_config_if_exists().context("failed to load config")?
+    };
     let runtime = match loaded_config {
         Some(loaded) => {
             log::info!("using config file: {}", loaded.path.display());
-            RuntimeCli::from_sources(cli, loaded.config)
+            RuntimeCli::from_sources(cli, env_overrides, loaded.config)
         }
         None => {
-            let path = config::config_path().context("failed to resolve config path")?;
-            log::info!(
-                "config file not found at {}; using CLI/env/default values",
-                path.display()
-            );
-            RuntimeCli::from_sources(cli, config::AppConfig::default())
+            if !cli.test_mode {
+                let path = config::config_path().context("failed to resolve config path")?;
+                log::info!(
+                    "config file not found at {}; using CLI/env/default values",
+                    path.display()
+                );
+            }
+            RuntimeCli::from_sources(cli, env_overrides, config::AppConfig::default())
         }
     };
     let app_version = APP_VERSION.to_string();
 
     log::info!("starting openusage-cli v{}", app_version);
     log::debug!(
-        "startup options: host={}, port={}, refresh_interval_secs={}, daemon={}, daemon_child={}, plugins_dir={:?}, enabled_plugins='{}', app_data_dir={:?}, plugin_overrides_dir={:?}",
+        "startup options: host={}, port={}, refresh_interval_secs={}, daemon={}, daemon_child={}, test_mode={}, plugins_dir={:?}, enabled_plugins='{}', app_data_dir={:?}, plugin_overrides_dir={:?}",
         runtime.host,
         runtime.port,
         runtime.refresh_interval_secs,
         runtime.daemon,
         runtime.daemon_child,
+        runtime.test_mode,
         runtime.plugins_dir,
         runtime.enabled_plugins,
         runtime.app_data_dir,
@@ -133,7 +152,7 @@ async fn run() -> Result<()> {
         return Ok(());
     }
 
-    let app_data_dir = resolve_app_data_dir(runtime.app_data_dir)
+    let app_data_dir = resolve_app_data_dir(runtime.app_data_dir, runtime.test_mode)
         .context("failed to resolve app data directory")?;
     log::info!("using app data dir: {}", app_data_dir.display());
     std::fs::create_dir_all(&app_data_dir).with_context(|| {
@@ -144,8 +163,8 @@ async fn run() -> Result<()> {
     })?;
     log::debug!("ensured app data directory exists");
 
-    let plugins_dir =
-        resolve_plugins_dir(runtime.plugins_dir).context("failed to resolve plugins directory")?;
+    let plugins_dir = resolve_plugins_dir(runtime.plugins_dir, runtime.test_mode)
+        .context("failed to resolve plugins directory")?;
     log::info!("using plugins dir: {}", plugins_dir.display());
     let loaded_plugins = manifest::load_plugins_from_dir(&plugins_dir);
     if loaded_plugins.is_empty() {
@@ -196,13 +215,18 @@ async fn run() -> Result<()> {
     );
     log::debug!("enabled plugin ids: {:?}", plugin_ids);
 
-    let plugin_overrides_dir = resolve_plugin_overrides_dir(runtime.plugin_overrides_dir)
-        .context("failed to resolve plugin overrides directory")?;
+    let plugin_overrides_dir =
+        resolve_plugin_overrides_dir(runtime.plugin_overrides_dir, runtime.test_mode)
+            .context("failed to resolve plugin overrides directory")?;
     if let Some(path) = &plugin_overrides_dir {
         log::info!("using plugin overrides dir: {}", path.display());
     } else {
         log::info!("plugin overrides disabled (no overrides dir found)");
     }
+
+    let test_runtime_dir = runtime
+        .test_mode
+        .then(|| app_data_dir.join(config::RUNTIME_DIR_NAME));
 
     let daemon = Arc::new(DaemonState::new(
         plugins,
@@ -261,7 +285,17 @@ async fn run() -> Result<()> {
             ));
         }
     };
-    log::debug!("HTTP listener successfully bound on {}", addr);
+    let bound_addr = listener
+        .local_addr()
+        .context("failed to resolve bound HTTP listener address")?;
+    log::debug!("HTTP listener successfully bound on {}", bound_addr);
+
+    let discovery = PublishedDiscovery::publish(bound_addr, test_runtime_dir.as_deref())
+        .context("failed to publish daemon endpoint")?;
+    log::info!(
+        "published daemon endpoint file: {}",
+        discovery.endpoint_file().display()
+    );
 
     let app = http_api::router(ApiState {
         daemon,
@@ -269,7 +303,7 @@ async fn run() -> Result<()> {
     });
     log::debug!("HTTP router initialized");
 
-    log::info!("openusage-cli daemon listening on http://{}", addr);
+    log::info!("openusage-cli daemon listening on {}", discovery.base_url());
     log::debug!("waiting for shutdown signal");
 
     let server_result = axum::serve(listener, app)
@@ -305,10 +339,11 @@ struct RuntimeCli {
     refresh_interval_secs: u64,
     daemon: bool,
     daemon_child: bool,
+    test_mode: bool,
 }
 
 impl RuntimeCli {
-    fn from_sources(cli: Cli, config: config::AppConfig) -> Self {
+    fn from_sources(cli: Cli, env: EnvOverrides, config: config::AppConfig) -> Self {
         let host = cli
             .host
             .or(config.host)
@@ -319,25 +354,80 @@ impl RuntimeCli {
             .or(config.refresh_interval_secs)
             .unwrap_or(config::DEFAULT_REFRESH_INTERVAL_SECS);
         let daemon = cli.daemon.or(config.daemon).unwrap_or(false);
-        let enabled_plugins = cli.enabled_plugins.unwrap_or_else(|| {
-            config
-                .enabled_plugins
-                .map(|masks| masks.join(","))
-                .unwrap_or_else(|| config::DEFAULT_ENABLED_PLUGINS.to_string())
-        });
+        let enabled_plugins = cli
+            .enabled_plugins
+            .or(env.enabled_plugins)
+            .or_else(|| config.enabled_plugins.map(|masks| masks.join(",")))
+            .unwrap_or_else(|| config::DEFAULT_ENABLED_PLUGINS.to_string());
 
         Self {
             host,
             port,
-            plugins_dir: cli.plugins_dir.or(config.plugins_dir),
+            plugins_dir: cli.plugins_dir.or(env.plugins_dir).or(config.plugins_dir),
             enabled_plugins,
-            app_data_dir: cli.app_data_dir.or(config.app_data_dir),
-            plugin_overrides_dir: cli.plugin_overrides_dir.or(config.plugin_overrides_dir),
+            app_data_dir: cli
+                .app_data_dir
+                .or(env.app_data_dir)
+                .or(config.app_data_dir),
+            plugin_overrides_dir: cli
+                .plugin_overrides_dir
+                .or(env.plugin_overrides_dir)
+                .or(config.plugin_overrides_dir),
             refresh_interval_secs,
             daemon,
             daemon_child: cli.daemon_child,
+            test_mode: cli.test_mode,
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct EnvOverrides {
+    plugins_dir: Option<PathBuf>,
+    enabled_plugins: Option<String>,
+    app_data_dir: Option<PathBuf>,
+    plugin_overrides_dir: Option<PathBuf>,
+}
+
+impl EnvOverrides {
+    fn from_process() -> Self {
+        Self::from_reader(|name| std::env::var_os(name))
+    }
+
+    fn from_reader<F>(mut reader: F) -> Self
+    where
+        F: FnMut(&str) -> Option<OsString>,
+    {
+        Self {
+            plugins_dir: env_path(&mut reader, "OPENUSAGE_PLUGINS_DIR"),
+            enabled_plugins: env_string(&mut reader, "OPENUSAGE_ENABLED_PLUGINS"),
+            app_data_dir: env_path(&mut reader, "OPENUSAGE_APP_DATA_DIR"),
+            plugin_overrides_dir: env_path(&mut reader, "OPENUSAGE_PLUGIN_OVERRIDES_DIR"),
+        }
+    }
+}
+
+fn env_path<F>(reader: &mut F, name: &str) -> Option<PathBuf>
+where
+    F: FnMut(&str) -> Option<OsString>,
+{
+    let value = reader(name)?;
+    if value.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(value))
+}
+
+fn env_string<F>(reader: &mut F, name: &str) -> Option<String>
+where
+    F: FnMut(&str) -> Option<OsString>,
+{
+    let value = reader(name)?;
+    let value = value.to_string_lossy().trim().to_string();
+    if value.is_empty() {
+        return None;
+    }
+    Some(value)
 }
 
 #[derive(Debug, Clone)]
@@ -454,10 +544,13 @@ fn push_unique_path(candidates: &mut Vec<PathBuf>, candidate: PathBuf) {
     }
 }
 
-fn resolve_app_data_dir(cli_value: Option<PathBuf>) -> Result<PathBuf> {
+fn resolve_app_data_dir(cli_value: Option<PathBuf>, test_mode: bool) -> Result<PathBuf> {
     if let Some(path) = cli_value {
         log::debug!("app data dir provided via CLI/env: {}", path.display());
         return Ok(path);
+    }
+    if test_mode {
+        anyhow::bail!("--app-data-dir is required when --test-mode is enabled");
     }
     if let Some(project_dirs) = ProjectDirs::from("com", "openusage", "openusage-cli") {
         let resolved = project_dirs.data_local_dir().to_path_buf();
@@ -476,10 +569,13 @@ fn resolve_app_data_dir(cli_value: Option<PathBuf>) -> Result<PathBuf> {
     Ok(fallback)
 }
 
-fn resolve_plugins_dir(cli_value: Option<PathBuf>) -> Result<PathBuf> {
+fn resolve_plugins_dir(cli_value: Option<PathBuf>, test_mode: bool) -> Result<PathBuf> {
     if let Some(path) = cli_value {
         log::debug!("plugins dir provided via CLI/env: {}", path.display());
         return Ok(path);
+    }
+    if test_mode {
+        anyhow::bail!("--plugins-dir is required when --test-mode is enabled");
     }
 
     let cwd = std::env::current_dir().context("cannot get current directory")?;
@@ -497,7 +593,10 @@ fn resolve_plugins_dir(cli_value: Option<PathBuf>) -> Result<PathBuf> {
     anyhow::bail!("plugins directory not found")
 }
 
-fn resolve_plugin_overrides_dir(cli_value: Option<PathBuf>) -> Result<Option<PathBuf>> {
+fn resolve_plugin_overrides_dir(
+    cli_value: Option<PathBuf>,
+    test_mode: bool,
+) -> Result<Option<PathBuf>> {
     if let Some(path) = cli_value {
         if !path.exists() {
             anyhow::bail!("plugin overrides dir does not exist: {}", path.display());
@@ -513,6 +612,10 @@ fn resolve_plugin_overrides_dir(cli_value: Option<PathBuf>) -> Result<Option<Pat
             path.display()
         );
         return Ok(Some(path));
+    }
+
+    if test_mode {
+        return Ok(None);
     }
 
     let cwd = std::env::current_dir().context("cannot get current directory")?;
@@ -873,6 +976,7 @@ mod tests {
             daemon: None,
             install_systemd: false,
             daemon_child: false,
+            test_mode: false,
         }
     }
 
@@ -912,8 +1016,19 @@ mod tests {
     }
 
     #[test]
+    fn cli_accepts_hidden_test_mode_flag() {
+        let cli = Cli::try_parse_from(["openusage-cli", "--test-mode"])
+            .expect("--test-mode should parse");
+        assert!(cli.test_mode);
+    }
+
+    #[test]
     fn runtime_cli_uses_defaults_when_no_input_values() {
-        let runtime = RuntimeCli::from_sources(empty_cli(), config::AppConfig::default());
+        let runtime = RuntimeCli::from_sources(
+            empty_cli(),
+            EnvOverrides::default(),
+            config::AppConfig::default(),
+        );
 
         assert_eq!(runtime.host, config::DEFAULT_HOST);
         assert_eq!(runtime.port, config::DEFAULT_PORT);
@@ -938,7 +1053,7 @@ mod tests {
             daemon: Some(true),
             proxy: None,
         };
-        let runtime = RuntimeCli::from_sources(empty_cli(), app_config);
+        let runtime = RuntimeCli::from_sources(empty_cli(), EnvOverrides::default(), app_config);
 
         assert_eq!(runtime.host, "0.0.0.0");
         assert_eq!(runtime.port, 9000);
@@ -967,6 +1082,7 @@ mod tests {
             daemon: Some(true),
             install_systemd: false,
             daemon_child: false,
+            test_mode: false,
         };
         let app_config = config::AppConfig {
             host: Some("0.0.0.0".to_string()),
@@ -980,7 +1096,7 @@ mod tests {
             proxy: None,
         };
 
-        let runtime = RuntimeCli::from_sources(cli, app_config);
+        let runtime = RuntimeCli::from_sources(cli, EnvOverrides::default(), app_config);
 
         assert_eq!(runtime.host, "127.0.0.2");
         assert_eq!(runtime.port, 7001);
@@ -1006,9 +1122,76 @@ mod tests {
             ..config::AppConfig::default()
         };
 
-        let runtime = RuntimeCli::from_sources(cli, app_config);
+        let runtime = RuntimeCli::from_sources(cli, EnvOverrides::default(), app_config);
 
         assert!(!runtime.daemon);
+    }
+
+    #[test]
+    fn env_overrides_parse_expected_runtime_variables() {
+        let env = EnvOverrides::from_reader(|name| match name {
+            "OPENUSAGE_PLUGINS_DIR" => Some(OsString::from("/env/plugins")),
+            "OPENUSAGE_ENABLED_PLUGINS" => Some(OsString::from("mock,codex")),
+            "OPENUSAGE_APP_DATA_DIR" => Some(OsString::from("/env/data")),
+            "OPENUSAGE_PLUGIN_OVERRIDES_DIR" => Some(OsString::from("/env/overrides")),
+            _ => None,
+        });
+
+        assert_eq!(env.plugins_dir, Some(PathBuf::from("/env/plugins")));
+        assert_eq!(env.enabled_plugins.as_deref(), Some("mock,codex"));
+        assert_eq!(env.app_data_dir, Some(PathBuf::from("/env/data")));
+        assert_eq!(
+            env.plugin_overrides_dir,
+            Some(PathBuf::from("/env/overrides"))
+        );
+    }
+
+    #[test]
+    fn runtime_cli_uses_env_overrides_between_cli_and_config() {
+        let cli = empty_cli();
+        let env = EnvOverrides {
+            plugins_dir: Some(PathBuf::from("/env/plugins")),
+            enabled_plugins: Some("mock".to_string()),
+            app_data_dir: Some(PathBuf::from("/env/data")),
+            plugin_overrides_dir: Some(PathBuf::from("/env/overrides")),
+        };
+        let app_config = config::AppConfig {
+            plugins_dir: Some(PathBuf::from("/cfg/plugins")),
+            enabled_plugins: Some(vec!["codex".to_string()]),
+            app_data_dir: Some(PathBuf::from("/cfg/data")),
+            plugin_overrides_dir: Some(PathBuf::from("/cfg/overrides")),
+            ..config::AppConfig::default()
+        };
+
+        let runtime = RuntimeCli::from_sources(cli, env, app_config);
+
+        assert_eq!(runtime.plugins_dir, Some(PathBuf::from("/env/plugins")));
+        assert_eq!(runtime.enabled_plugins, "mock");
+        assert_eq!(runtime.app_data_dir, Some(PathBuf::from("/env/data")));
+        assert_eq!(
+            runtime.plugin_overrides_dir,
+            Some(PathBuf::from("/env/overrides"))
+        );
+    }
+
+    #[test]
+    fn resolve_app_data_dir_requires_explicit_value_in_test_mode() {
+        let err =
+            resolve_app_data_dir(None, true).expect_err("test mode must require app data dir");
+        assert!(err.to_string().contains("--app-data-dir"));
+    }
+
+    #[test]
+    fn resolve_plugins_dir_requires_explicit_value_in_test_mode() {
+        let err = resolve_plugins_dir(None, true).expect_err("test mode must require plugins dir");
+        assert!(err.to_string().contains("--plugins-dir"));
+    }
+
+    #[test]
+    fn resolve_plugin_overrides_dir_is_disabled_in_test_mode_without_explicit_path() {
+        let resolved = resolve_plugin_overrides_dir(None, true)
+            .expect("test mode should disable auto-discovery for plugin overrides");
+        assert!(resolved.is_none());
     }
 
     #[test]

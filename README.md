@@ -15,6 +15,7 @@ The project is implemented in Rust with `tokio` + `rquickjs`, and is designed fo
   - `GET /v1/usage/{provider}`
   - `POST /v1/probe`
 - Keeps an in-memory snapshot cache with periodic background refresh
+- Publishes per-user daemon discovery files for local client auto-connect
 
 ## Upstream Compatibility Strategy
 
@@ -65,6 +66,34 @@ When running as an installed binary (Linux/FHS layout):
 2. `/usr/share/openusage-cli/openusage-plugins`
 
 By default, the app runs in console mode and logs to stdout/stderr. Stop it with `Ctrl+C`.
+
+## Daemon Discovery File
+
+To help other local applications auto-discover the running daemon, `openusage-cli` publishes one runtime file per user:
+
+- `daemon-endpoint` - plain-text full daemon URL including scheme (for example, `http://127.0.0.1:6737` or `http://[::1]:6737`)
+
+Path resolution for discovery files:
+
+1. `ProjectDirs::runtime_dir()/runtime` (preferred)
+2. fallback: `ProjectDirs::data_local_dir()/runtime`
+3. fallback when `ProjectDirs` is unavailable: `./.openusage-cli/runtime`
+
+Current filename inside that directory:
+
+- `daemon-endpoint`
+
+Lifecycle behavior:
+
+- File is written atomically after HTTP bind succeeds.
+- File is removed on graceful shutdown.
+- If daemon binds to `0.0.0.0` or `::`, published endpoint is normalized to localhost for client connections.
+
+Recommended client flow:
+
+1. Read `daemon-endpoint` from the discovery path.
+2. Use its content as base URL.
+3. Call `GET /health` to verify liveness, then query other API endpoints.
 
 ## Configuration File
 

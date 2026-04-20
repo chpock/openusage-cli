@@ -6,10 +6,18 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 pub const CONFIG_FILE_NAME: &str = "config.yaml";
+pub const RUNTIME_DIR_NAME: &str = "runtime";
+pub const DAEMON_ENDPOINT_FILE_NAME: &str = "daemon-endpoint";
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const DEFAULT_PORT: u16 = 6737;
 pub const DEFAULT_REFRESH_INTERVAL_SECS: u64 = 300;
 pub const DEFAULT_ENABLED_PLUGINS: &str = "*";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonEndpointPath {
+    pub dir: PathBuf,
+    pub endpoint_file: PathBuf,
+}
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ProxyConfig {
@@ -73,6 +81,26 @@ pub fn config_path() -> Result<PathBuf> {
 
     let cwd = std::env::current_dir().context("cannot get current directory")?;
     Ok(cwd.join(".openusage-cli").join(CONFIG_FILE_NAME))
+}
+
+pub fn daemon_endpoint_path() -> Result<DaemonEndpointPath> {
+    let dir = daemon_runtime_dir()?;
+    Ok(DaemonEndpointPath {
+        endpoint_file: dir.join(DAEMON_ENDPOINT_FILE_NAME),
+        dir,
+    })
+}
+
+fn daemon_runtime_dir() -> Result<PathBuf> {
+    if let Some(project_dirs) = ProjectDirs::from("com", "openusage", "openusage-cli") {
+        if let Some(runtime_dir) = project_dirs.runtime_dir() {
+            return Ok(runtime_dir.join(RUNTIME_DIR_NAME));
+        }
+        return Ok(project_dirs.data_local_dir().join(RUNTIME_DIR_NAME));
+    }
+
+    let cwd = std::env::current_dir().context("cannot get current directory")?;
+    Ok(cwd.join(".openusage-cli").join(RUNTIME_DIR_NAME))
 }
 
 fn write_default_config_to_path(path: &Path, overwrite: bool) -> Result<bool> {
@@ -215,5 +243,18 @@ mod tests {
 
         let written = std::fs::read_to_string(&path).expect("read existing config");
         assert_eq!(written, "host: 0.0.0.0\n");
+    }
+
+    #[test]
+    fn daemon_endpoint_path_uses_expected_file_name() {
+        let path = daemon_endpoint_path().expect("resolve daemon endpoint path");
+
+        assert_eq!(
+            path.endpoint_file
+                .file_name()
+                .and_then(|value| value.to_str()),
+            Some(DAEMON_ENDPOINT_FILE_NAME)
+        );
+        assert_eq!(path.endpoint_file.parent(), Some(path.dir.as_path()));
     }
 }
