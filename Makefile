@@ -12,7 +12,8 @@ PLUGINS_DIR ?=
 APP_DATA_DIR ?=
 PLUGIN_OVERRIDES_DIR ?=
 
-RUN_ARGS = --host $(HOST) --port $(PORT) --refresh-interval-secs $(REFRESH_INTERVAL_SECS)
+LOG_LEVEL ?= debug
+RUN_ARGS = --host $(HOST) --port $(PORT) --refresh-interval-secs $(REFRESH_INTERVAL_SECS) --log-level $(LOG_LEVEL)
 RUN_ARGS += $(if $(PLUGINS_DIR),--plugins-dir $(PLUGINS_DIR),)
 RUN_ARGS += $(if $(APP_DATA_DIR),--app-data-dir $(APP_DATA_DIR),)
 RUN_ARGS += $(if $(PLUGIN_OVERRIDES_DIR),--plugin-overrides-dir $(PLUGIN_OVERRIDES_DIR),)
@@ -33,7 +34,7 @@ help:
 	@printf "  make clean        Remove build artifacts\n"
 	@printf "\nRun variables (optional):\n"
 	@printf "  HOST=127.0.0.1 PORT=6737 REFRESH_INTERVAL_SECS=300\n"
-	@printf "  VERBOSE=1 CI_LOG_DIR=.ci-logs\n"
+	@printf "  LOG_LEVEL=debug VERBOSE=1 CI_LOG_DIR=.ci-logs\n"
 	@printf "  PLUGINS_DIR=/path/to/plugins APP_DATA_DIR=/path/to/data\n"
 	@printf "  PLUGIN_OVERRIDES_DIR=/path/to/plugin-overrides\n"
 
