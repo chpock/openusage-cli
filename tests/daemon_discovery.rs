@@ -340,6 +340,7 @@ fn query_mode_falls_back_when_daemon_endpoint_file_exists_but_daemon_dead() {
         .arg("mock")
         .arg("--app-data-dir")
         .arg(&app_data_dir)
+        .arg("--log-level=info")
         .env("HOME", &home_dir)
         .output()
         .expect("run query mode");

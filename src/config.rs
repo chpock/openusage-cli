@@ -12,6 +12,7 @@ pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const DEFAULT_PORT: u16 = 6737;
 pub const DEFAULT_REFRESH_INTERVAL_SECS: u64 = 300;
 pub const DEFAULT_ENABLED_PLUGINS: &str = "*";
+pub const DEFAULT_LOG_LEVEL: &str = "error";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonEndpointPath {
@@ -35,6 +36,7 @@ pub struct AppConfig {
     pub plugin_overrides_dir: Option<PathBuf>,
     pub refresh_interval_secs: Option<u64>,
     pub daemon: Option<bool>,
+    pub log_level: Option<String>,
     pub proxy: Option<ProxyConfig>,
 }
 
@@ -153,6 +155,9 @@ refresh_interval_secs: 300
 # Run as background daemon process.
 daemon: false
 
+# Log level: error, warn, info, debug, trace.
+log_level: error
+
 proxy:
   # Enable proxy for outgoing plugin HTTP requests.
   enabled: false
@@ -215,6 +220,7 @@ mod tests {
             Some(DEFAULT_REFRESH_INTERVAL_SECS)
         );
         assert_eq!(parsed.daemon, Some(false));
+        assert_eq!(parsed.log_level.as_deref(), Some(DEFAULT_LOG_LEVEL));
         let proxy = parsed.proxy.expect("proxy section must exist");
         assert!(!proxy.enabled);
         assert!(proxy.url.is_empty());

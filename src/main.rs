@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use directories::ProjectDirs;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use openusage_cli::config;
@@ -23,6 +23,29 @@ const APP_VERSION: &str = match option_env!("OPENUSAGE_BUILD_VERSION") {
     Some(version) => version,
     None => env!("CARGO_PKG_VERSION"),
 };
+const VALID_LOG_LEVELS: &str = "error, warn, info, debug, trace";
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "lower")]
+enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevel {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+            Self::Trace => "trace",
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "openusage-cli")]
@@ -50,6 +73,9 @@ struct Cli {
     #[arg(long)]
     refresh_interval_secs: Option<u64>,
 
+    #[arg(long)]
+    log_level: Option<LogLevel>,
+
     #[arg(long, default_value_t = false)]
     default_config: bool,
 
@@ -76,27 +102,13 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
     install_panic_hook();
 
-    let result = run().await;
-    match &result {
-        Ok(_) => log::info!("openusage-cli shutdown complete"),
-        Err(err) => log::error!("openusage-cli exiting with error: {err:#}"),
-    }
-
-    result
-}
-
-async fn run() -> Result<()> {
+    // Parse CLI args first to handle early-exit commands and resolve log level
     let raw_args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let cli = Cli::parse();
-    let env_overrides = if cli.test_mode {
-        EnvOverrides::default()
-    } else {
-        EnvOverrides::from_process()
-    };
 
+    // Handle early-exit commands before logger setup
     if cli.default_config {
         print!("{}", config::default_config_template());
         return Ok(());
@@ -107,6 +119,30 @@ async fn run() -> Result<()> {
         return Ok(());
     }
 
+    // Resolve log level from CLI/env/config (in that order of precedence)
+    let env_overrides = if cli.test_mode {
+        EnvOverrides::default()
+    } else {
+        EnvOverrides::from_process()
+    };
+
+    let log_level =
+        resolve_log_level(&cli, &env_overrides).context("failed to resolve log level")?;
+
+    // Initialize logger with resolved log level
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level.as_str()))
+        .init();
+
+    let result = run(cli, env_overrides, &raw_args).await;
+    match &result {
+        Ok(_) => log::info!("openusage-cli shutdown complete"),
+        Err(err) => log::error!("openusage-cli exiting with error: {err:#}"),
+    }
+
+    result
+}
+
+async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Result<()> {
     let loaded_config = if cli.test_mode {
         log::info!(
             "test mode enabled; ignoring config file and OPENUSAGE_* runtime environment overrides"
@@ -119,6 +155,7 @@ async fn run() -> Result<()> {
         Some(loaded) => {
             log::info!("using config file: {}", loaded.path.display());
             RuntimeCli::from_sources(cli, env_overrides, loaded.config)
+                .context("failed to resolve runtime options")?
         }
         None => {
             if !cli.test_mode {
@@ -129,13 +166,14 @@ async fn run() -> Result<()> {
                 );
             }
             RuntimeCli::from_sources(cli, env_overrides, config::AppConfig::default())
+                .context("failed to resolve runtime options")?
         }
     };
     let app_version = APP_VERSION.to_string();
 
     log::info!("starting openusage-cli v{}", app_version);
     log::debug!(
-        "startup options: host={}, port={}, refresh_interval_secs={}, daemon={}, daemon_child={}, query={}, test_mode={}, plugins_dir={:?}, enabled_plugins='{}', app_data_dir={:?}, plugin_overrides_dir={:?}",
+        "startup options: host={}, port={}, refresh_interval_secs={}, daemon={}, daemon_child={}, query={}, test_mode={}, plugins_dir={:?}, enabled_plugins='{}', app_data_dir={:?}, plugin_overrides_dir={:?}, log_level={}",
         runtime.host,
         runtime.port,
         runtime.refresh_interval_secs,
@@ -146,7 +184,8 @@ async fn run() -> Result<()> {
         runtime.plugins_dir,
         runtime.enabled_plugins,
         runtime.app_data_dir,
-        runtime.plugin_overrides_dir
+        runtime.plugin_overrides_dir,
+        runtime.log_level
     );
 
     if runtime.query && runtime.daemon && !runtime.daemon_child {
@@ -192,7 +231,7 @@ async fn run() -> Result<()> {
 
     if should_spawn_daemon_parent(&runtime) {
         let child_pid =
-            spawn_daemon_process(&raw_args).context("failed to spawn background daemon process")?;
+            spawn_daemon_process(raw_args).context("failed to spawn background daemon process")?;
         log::info!("daemon mode enabled; spawned background process pid={child_pid}");
         return Ok(());
     }
@@ -391,10 +430,11 @@ struct RuntimeCli {
     daemon_child: bool,
     test_mode: bool,
     query: bool,
+    log_level: String,
 }
 
 impl RuntimeCli {
-    fn from_sources(cli: Cli, env: EnvOverrides, config: config::AppConfig) -> Self {
+    fn from_sources(cli: Cli, env: EnvOverrides, config: config::AppConfig) -> Result<Self> {
         let host = cli
             .host
             .or(config.host)
@@ -410,8 +450,15 @@ impl RuntimeCli {
             .or(env.enabled_plugins)
             .or_else(|| config.enabled_plugins.map(|masks| masks.join(",")))
             .unwrap_or_else(|| config::DEFAULT_ENABLED_PLUGINS.to_string());
+        let raw_log_level = cli
+            .log_level
+            .map(|level| level.as_str().to_string())
+            .or(env.log_level)
+            .or(config.log_level)
+            .unwrap_or_else(|| config::DEFAULT_LOG_LEVEL.to_string());
+        let log_level = normalize_log_level(raw_log_level)?;
 
-        Self {
+        Ok(Self {
             host,
             port,
             plugins_dir: cli.plugins_dir.or(env.plugins_dir).or(config.plugins_dir),
@@ -429,7 +476,37 @@ impl RuntimeCli {
             daemon_child: cli.daemon_child,
             test_mode: cli.test_mode,
             query: cli.query,
-        }
+            log_level,
+        })
+    }
+}
+
+fn resolve_log_level(cli: &Cli, env_overrides: &EnvOverrides) -> Result<String> {
+    let config_log_level = if cli.test_mode {
+        None
+    } else {
+        config::load_config_if_exists()?.and_then(|loaded| loaded.config.log_level)
+    };
+
+    let raw_log_level = cli
+        .log_level
+        .map(|level| level.as_str().to_string())
+        .or(env_overrides.log_level.clone())
+        .or(config_log_level)
+        .unwrap_or_else(|| config::DEFAULT_LOG_LEVEL.to_string());
+
+    normalize_log_level(raw_log_level)
+}
+
+fn normalize_log_level(log_level: String) -> Result<String> {
+    let normalized = log_level.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "error" | "warn" | "info" | "debug" | "trace" => Ok(normalized),
+        _ => anyhow::bail!(
+            "invalid log level '{}'; expected one of: {}",
+            log_level,
+            VALID_LOG_LEVELS
+        ),
     }
 }
 
@@ -439,6 +516,7 @@ struct EnvOverrides {
     enabled_plugins: Option<String>,
     app_data_dir: Option<PathBuf>,
     plugin_overrides_dir: Option<PathBuf>,
+    log_level: Option<String>,
 }
 
 impl EnvOverrides {
@@ -455,6 +533,7 @@ impl EnvOverrides {
             enabled_plugins: env_string(&mut reader, "OPENUSAGE_ENABLED_PLUGINS"),
             app_data_dir: env_path(&mut reader, "OPENUSAGE_APP_DATA_DIR"),
             plugin_overrides_dir: env_path(&mut reader, "OPENUSAGE_PLUGIN_OVERRIDES_DIR"),
+            log_level: env_string(&mut reader, "OPENUSAGE_LOG_LEVEL"),
         }
     }
 }
@@ -892,6 +971,7 @@ fn systemd_exec_start(executable: &OsStr) -> String {
     [
         quote_systemd_argument(executable),
         "--daemon=false".to_string(),
+        "--log-level=info".to_string(),
     ]
     .join(" ")
 }
@@ -1070,6 +1150,7 @@ mod tests {
             app_data_dir: None,
             plugin_overrides_dir: None,
             refresh_interval_secs: None,
+            log_level: None,
             default_config: false,
             daemon: None,
             install_systemd: false,
@@ -1128,12 +1209,20 @@ mod tests {
     }
 
     #[test]
+    fn cli_rejects_invalid_log_level_value() {
+        let err = Cli::try_parse_from(["openusage-cli", "--log-level", "inof"])
+            .expect_err("invalid log level must be rejected");
+        assert!(err.to_string().contains("--log-level"));
+    }
+
+    #[test]
     fn runtime_cli_uses_defaults_when_no_input_values() {
         let runtime = RuntimeCli::from_sources(
             empty_cli(),
             EnvOverrides::default(),
             config::AppConfig::default(),
-        );
+        )
+        .expect("runtime defaults should resolve");
 
         assert_eq!(runtime.host, config::DEFAULT_HOST);
         assert_eq!(runtime.port, config::DEFAULT_PORT);
@@ -1142,6 +1231,7 @@ mod tests {
             config::DEFAULT_REFRESH_INTERVAL_SECS
         );
         assert_eq!(runtime.enabled_plugins, config::DEFAULT_ENABLED_PLUGINS);
+        assert_eq!(runtime.log_level, config::DEFAULT_LOG_LEVEL);
         assert!(!runtime.daemon);
         assert!(!runtime.query);
     }
@@ -1157,9 +1247,11 @@ mod tests {
             plugin_overrides_dir: Some(PathBuf::from("/tmp/overrides")),
             refresh_interval_secs: Some(42),
             daemon: Some(true),
+            log_level: Some("debug".to_string()),
             proxy: None,
         };
-        let runtime = RuntimeCli::from_sources(empty_cli(), EnvOverrides::default(), app_config);
+        let runtime = RuntimeCli::from_sources(empty_cli(), EnvOverrides::default(), app_config)
+            .expect("runtime config values should resolve");
 
         assert_eq!(runtime.host, "0.0.0.0");
         assert_eq!(runtime.port, 9000);
@@ -1171,6 +1263,7 @@ mod tests {
             Some(PathBuf::from("/tmp/overrides"))
         );
         assert_eq!(runtime.refresh_interval_secs, 42);
+        assert_eq!(runtime.log_level, "debug");
         assert!(runtime.daemon);
     }
 
@@ -1184,6 +1277,7 @@ mod tests {
             app_data_dir: Some(PathBuf::from("/cli/data")),
             plugin_overrides_dir: Some(PathBuf::from("/cli/overrides")),
             refresh_interval_secs: Some(7),
+            log_level: Some(LogLevel::Trace),
             default_config: false,
             daemon: Some(true),
             install_systemd: false,
@@ -1200,10 +1294,12 @@ mod tests {
             plugin_overrides_dir: Some(PathBuf::from("/cfg/overrides")),
             refresh_interval_secs: Some(60),
             daemon: Some(false),
+            log_level: Some("debug".to_string()),
             proxy: None,
         };
 
-        let runtime = RuntimeCli::from_sources(cli, EnvOverrides::default(), app_config);
+        let runtime = RuntimeCli::from_sources(cli, EnvOverrides::default(), app_config)
+            .expect("runtime CLI values should resolve");
 
         assert_eq!(runtime.host, "127.0.0.2");
         assert_eq!(runtime.port, 7001);
@@ -1215,6 +1311,7 @@ mod tests {
             Some(PathBuf::from("/cli/overrides"))
         );
         assert_eq!(runtime.refresh_interval_secs, 7);
+        assert_eq!(runtime.log_level, "trace");
         assert!(runtime.daemon);
     }
 
@@ -1229,7 +1326,8 @@ mod tests {
             ..config::AppConfig::default()
         };
 
-        let runtime = RuntimeCli::from_sources(cli, EnvOverrides::default(), app_config);
+        let runtime = RuntimeCli::from_sources(cli, EnvOverrides::default(), app_config)
+            .expect("runtime daemon value should resolve");
 
         assert!(!runtime.daemon);
     }
@@ -1242,7 +1340,8 @@ mod tests {
         };
 
         let runtime =
-            RuntimeCli::from_sources(cli, EnvOverrides::default(), config::AppConfig::default());
+            RuntimeCli::from_sources(cli, EnvOverrides::default(), config::AppConfig::default())
+                .expect("runtime query value should resolve");
 
         assert!(runtime.query);
     }
@@ -1253,7 +1352,8 @@ mod tests {
             empty_cli(),
             EnvOverrides::default(),
             config::AppConfig::default(),
-        );
+        )
+        .expect("runtime values should resolve");
 
         runtime.daemon = true;
         runtime.daemon_child = false;
@@ -1275,6 +1375,7 @@ mod tests {
             "OPENUSAGE_ENABLED_PLUGINS" => Some(OsString::from("mock,codex")),
             "OPENUSAGE_APP_DATA_DIR" => Some(OsString::from("/env/data")),
             "OPENUSAGE_PLUGIN_OVERRIDES_DIR" => Some(OsString::from("/env/overrides")),
+            "OPENUSAGE_LOG_LEVEL" => Some(OsString::from("warn")),
             _ => None,
         });
 
@@ -1285,6 +1386,7 @@ mod tests {
             env.plugin_overrides_dir,
             Some(PathBuf::from("/env/overrides"))
         );
+        assert_eq!(env.log_level.as_deref(), Some("warn"));
     }
 
     #[test]
@@ -1295,16 +1397,19 @@ mod tests {
             enabled_plugins: Some("mock".to_string()),
             app_data_dir: Some(PathBuf::from("/env/data")),
             plugin_overrides_dir: Some(PathBuf::from("/env/overrides")),
+            log_level: Some("info".to_string()),
         };
         let app_config = config::AppConfig {
             plugins_dir: Some(PathBuf::from("/cfg/plugins")),
             enabled_plugins: Some(vec!["codex".to_string()]),
             app_data_dir: Some(PathBuf::from("/cfg/data")),
             plugin_overrides_dir: Some(PathBuf::from("/cfg/overrides")),
+            log_level: Some("debug".to_string()),
             ..config::AppConfig::default()
         };
 
-        let runtime = RuntimeCli::from_sources(cli, env, app_config);
+        let runtime = RuntimeCli::from_sources(cli, env, app_config)
+            .expect("runtime env values should resolve");
 
         assert_eq!(runtime.plugins_dir, Some(PathBuf::from("/env/plugins")));
         assert_eq!(runtime.enabled_plugins, "mock");
@@ -1313,6 +1418,33 @@ mod tests {
             runtime.plugin_overrides_dir,
             Some(PathBuf::from("/env/overrides"))
         );
+        assert_eq!(runtime.log_level, "info");
+    }
+
+    #[test]
+    fn runtime_cli_rejects_invalid_env_log_level() {
+        let cli = empty_cli();
+        let env = EnvOverrides {
+            log_level: Some("inof".to_string()),
+            ..EnvOverrides::default()
+        };
+
+        let err = RuntimeCli::from_sources(cli, env, config::AppConfig::default())
+            .expect_err("invalid env log level must be rejected");
+        assert!(err.to_string().contains("invalid log level"));
+    }
+
+    #[test]
+    fn runtime_cli_rejects_invalid_config_log_level() {
+        let cli = empty_cli();
+        let app_config = config::AppConfig {
+            log_level: Some("loud".to_string()),
+            ..config::AppConfig::default()
+        };
+
+        let err = RuntimeCli::from_sources(cli, EnvOverrides::default(), app_config)
+            .expect_err("invalid config log level must be rejected");
+        assert!(err.to_string().contains("invalid log level"));
     }
 
     #[test]
@@ -1378,10 +1510,10 @@ mod tests {
     }
 
     #[test]
-    fn systemd_exec_start_always_uses_daemon_false() {
+    fn systemd_exec_start_always_uses_daemon_false_and_log_level_info() {
         assert_eq!(
             systemd_exec_start(OsStr::new("/usr/bin/openusage-cli")),
-            "/usr/bin/openusage-cli --daemon=false"
+            "/usr/bin/openusage-cli --daemon=false --log-level=info"
         );
     }
 
