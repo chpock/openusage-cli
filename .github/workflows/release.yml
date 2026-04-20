@@ -126,31 +126,43 @@ jobs:
 
           git log --no-merges --pretty=format:'%s|%h' "$commit_range" > "$tmp_dir/commits.txt"
 
-          while IFS='|' read -r subject short_sha; do
-            [ -n "$subject" ] || continue
-            entry="- $subject ($short_sha)"
-            if [[ "$subject" =~ ^feat(\([^)]+\))?!?:[[:space:]] ]]; then
-              printf '%s\n' "$entry" >> "$tmp_dir/features.txt"
-            elif [[ "$subject" =~ ^fix(\([^)]+\))?!?:[[:space:]] ]]; then
-              printf '%s\n' "$entry" >> "$tmp_dir/fixes.txt"
-            elif [[ "$subject" =~ ^perf(\([^)]+\))?!?:[[:space:]] ]]; then
-              printf '%s\n' "$entry" >> "$tmp_dir/performance.txt"
-            elif [[ "$subject" =~ ^refactor(\([^)]+\))?!?:[[:space:]] ]]; then
-              printf '%s\n' "$entry" >> "$tmp_dir/refactoring.txt"
-            elif [[ "$subject" =~ ^docs(\([^)]+\))?!?:[[:space:]] ]]; then
-              printf '%s\n' "$entry" >> "$tmp_dir/docs.txt"
-            elif [[ "$subject" =~ ^test(\([^)]+\))?!?:[[:space:]] ]]; then
-              printf '%s\n' "$entry" >> "$tmp_dir/tests.txt"
-            elif [[ "$subject" =~ ^build(\([^)]+\))?!?:[[:space:]] ]]; then
-              printf '%s\n' "$entry" >> "$tmp_dir/build.txt"
-            elif [[ "$subject" =~ ^ci(\([^)]+\))?!?:[[:space:]] ]]; then
-              printf '%s\n' "$entry" >> "$tmp_dir/ci.txt"
-            elif [[ "$subject" =~ ^chore(\([^)]+\))?!?:[[:space:]] ]]; then
-              printf '%s\n' "$entry" >> "$tmp_dir/chore.txt"
-            else
-              printf '%s\n' "$entry" >> "$tmp_dir/other.txt"
-            fi
-          done < "$tmp_dir/commits.txt"
+          awk -F'|' -v tmp_dir="$tmp_dir" '
+            function append(file_name, line) {
+              print line >> (tmp_dir "/" file_name)
+            }
+
+            {
+              subject = $1
+              short_sha = $2
+              if (subject == "") {
+                next
+              }
+
+              entry = "- " subject " (" short_sha ")"
+
+              if (subject ~ /^feat(\([[:alnum:]_.\/-]+\))?!?:[[:space:]]/) {
+                append("features.txt", entry)
+              } else if (subject ~ /^fix(\([[:alnum:]_.\/-]+\))?!?:[[:space:]]/) {
+                append("fixes.txt", entry)
+              } else if (subject ~ /^perf(\([[:alnum:]_.\/-]+\))?!?:[[:space:]]/) {
+                append("performance.txt", entry)
+              } else if (subject ~ /^refactor(\([[:alnum:]_.\/-]+\))?!?:[[:space:]]/) {
+                append("refactoring.txt", entry)
+              } else if (subject ~ /^docs(\([[:alnum:]_.\/-]+\))?!?:[[:space:]]/) {
+                append("docs.txt", entry)
+              } else if (subject ~ /^test(\([[:alnum:]_.\/-]+\))?!?:[[:space:]]/) {
+                append("tests.txt", entry)
+              } else if (subject ~ /^build(\([[:alnum:]_.\/-]+\))?!?:[[:space:]]/) {
+                append("build.txt", entry)
+              } else if (subject ~ /^ci(\([[:alnum:]_.\/-]+\))?!?:[[:space:]]/) {
+                append("ci.txt", entry)
+              } else if (subject ~ /^chore(\([[:alnum:]_.\/-]+\))?!?:[[:space:]]/) {
+                append("chore.txt", entry)
+              } else {
+                append("other.txt", entry)
+              }
+            }
+          ' "$tmp_dir/commits.txt"
 
           append_section() {
             section_title="$1"
