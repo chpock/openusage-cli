@@ -69,6 +69,9 @@ struct Cli {
 
     #[arg(long, hide = true, default_value_t = false)]
     test_mode: bool,
+
+    #[arg(long, default_value_t = false)]
+    query: bool,
 }
 
 #[tokio::main]
@@ -132,12 +135,13 @@ async fn run() -> Result<()> {
 
     log::info!("starting openusage-cli v{}", app_version);
     log::debug!(
-        "startup options: host={}, port={}, refresh_interval_secs={}, daemon={}, daemon_child={}, test_mode={}, plugins_dir={:?}, enabled_plugins='{}', app_data_dir={:?}, plugin_overrides_dir={:?}",
+        "startup options: host={}, port={}, refresh_interval_secs={}, daemon={}, daemon_child={}, query={}, test_mode={}, plugins_dir={:?}, enabled_plugins='{}', app_data_dir={:?}, plugin_overrides_dir={:?}",
         runtime.host,
         runtime.port,
         runtime.refresh_interval_secs,
         runtime.daemon,
         runtime.daemon_child,
+        runtime.query,
         runtime.test_mode,
         runtime.plugins_dir,
         runtime.enabled_plugins,
@@ -145,7 +149,11 @@ async fn run() -> Result<()> {
         runtime.plugin_overrides_dir
     );
 
-    if runtime.daemon && !runtime.daemon_child {
+    if runtime.query && runtime.daemon && !runtime.daemon_child {
+        log::warn!("query mode enabled; daemon mode is ignored");
+    }
+
+    if should_spawn_daemon_parent(&runtime) {
         let child_pid =
             spawn_daemon_process(&raw_args).context("failed to spawn background daemon process")?;
         log::info!("daemon mode enabled; spawned background process pid={child_pid}");
@@ -247,6 +255,14 @@ async fn run() -> Result<()> {
         }
     }
 
+    if runtime.query {
+        let snapshots = daemon.cached(None).await;
+        let json_output =
+            serde_json::to_string(&snapshots).context("failed to serialize query results")?;
+        println!("{}", json_output);
+        return Ok(());
+    }
+
     let refresh_task = if runtime.refresh_interval_secs > 0 {
         let refresh_state = daemon.clone();
         let refresh_every = Duration::from_secs(runtime.refresh_interval_secs);
@@ -340,6 +356,7 @@ struct RuntimeCli {
     daemon: bool,
     daemon_child: bool,
     test_mode: bool,
+    query: bool,
 }
 
 impl RuntimeCli {
@@ -377,6 +394,7 @@ impl RuntimeCli {
             daemon,
             daemon_child: cli.daemon_child,
             test_mode: cli.test_mode,
+            query: cli.query,
         }
     }
 }
@@ -646,6 +664,10 @@ fn executable_dir() -> Result<PathBuf> {
         .map(Path::to_path_buf)
         .context("executable has no parent directory")?;
     Ok(dir)
+}
+
+fn should_spawn_daemon_parent(runtime: &RuntimeCli) -> bool {
+    runtime.daemon && !runtime.daemon_child && !runtime.query
 }
 
 async fn shutdown_signal() {
@@ -977,6 +999,7 @@ mod tests {
             install_systemd: false,
             daemon_child: false,
             test_mode: false,
+            query: false,
         }
     }
 
@@ -1023,6 +1046,12 @@ mod tests {
     }
 
     #[test]
+    fn cli_accepts_query_flag() {
+        let cli = Cli::try_parse_from(["openusage-cli", "--query"]).expect("--query should parse");
+        assert!(cli.query);
+    }
+
+    #[test]
     fn runtime_cli_uses_defaults_when_no_input_values() {
         let runtime = RuntimeCli::from_sources(
             empty_cli(),
@@ -1038,6 +1067,7 @@ mod tests {
         );
         assert_eq!(runtime.enabled_plugins, config::DEFAULT_ENABLED_PLUGINS);
         assert!(!runtime.daemon);
+        assert!(!runtime.query);
     }
 
     #[test]
@@ -1083,6 +1113,7 @@ mod tests {
             install_systemd: false,
             daemon_child: false,
             test_mode: false,
+            query: false,
         };
         let app_config = config::AppConfig {
             host: Some("0.0.0.0".to_string()),
@@ -1125,6 +1156,40 @@ mod tests {
         let runtime = RuntimeCli::from_sources(cli, EnvOverrides::default(), app_config);
 
         assert!(!runtime.daemon);
+    }
+
+    #[test]
+    fn runtime_cli_preserves_query_flag() {
+        let cli = Cli {
+            query: true,
+            ..empty_cli()
+        };
+
+        let runtime =
+            RuntimeCli::from_sources(cli, EnvOverrides::default(), config::AppConfig::default());
+
+        assert!(runtime.query);
+    }
+
+    #[test]
+    fn should_spawn_daemon_parent_respects_query_mode() {
+        let mut runtime = RuntimeCli::from_sources(
+            empty_cli(),
+            EnvOverrides::default(),
+            config::AppConfig::default(),
+        );
+
+        runtime.daemon = true;
+        runtime.daemon_child = false;
+        runtime.query = false;
+        assert!(should_spawn_daemon_parent(&runtime));
+
+        runtime.query = true;
+        assert!(!should_spawn_daemon_parent(&runtime));
+
+        runtime.query = false;
+        runtime.daemon_child = true;
+        assert!(!should_spawn_daemon_parent(&runtime));
     }
 
     #[test]
