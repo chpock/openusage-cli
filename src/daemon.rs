@@ -4,6 +4,7 @@ use anyhow::anyhow;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 
 #[derive(Debug, Clone, Serialize)]
@@ -202,6 +203,72 @@ impl DaemonState {
         selected_ids.iter().all(|id| cache.contains_key(id))
     }
 
+    /// Calculates the duration until the next limit reset across all cached snapshots.
+    /// Returns None if no resets are scheduled or if all resets are in the past.
+    /// The `margin_secs` parameter adds a buffer after the reset time to ensure
+    /// the provider has actually updated their data.
+    pub async fn time_until_next_reset(&self, margin_secs: u64) -> Option<Duration> {
+        let cache = self.cache.read().await;
+        let now = time::OffsetDateTime::now_utc();
+        let mut next_reset: Option<time::OffsetDateTime> = None;
+
+        for snapshot in cache.values() {
+            for line in &snapshot.lines {
+                if let MetricLine::Progress {
+                    resets_at: Some(resets_at_str),
+                    ..
+                } = line
+                    && let Ok(reset_time) = time::OffsetDateTime::parse(
+                        resets_at_str,
+                        &time::format_description::well_known::Rfc3339,
+                    )
+                {
+                    // Add margin to the reset time
+                    let effective_reset = reset_time + time::Duration::seconds(margin_secs as i64);
+                    if effective_reset > now
+                        && (next_reset.is_none() || effective_reset < next_reset.unwrap())
+                    {
+                        next_reset = Some(effective_reset);
+                    }
+                }
+            }
+        }
+
+        next_reset.map(|reset_time| {
+            let duration_ms = (reset_time - now).whole_milliseconds().max(0) as u64;
+            Duration::from_millis(duration_ms)
+        })
+    }
+
+    /// Checks if there are any reset times that are in the past (plus margin).
+    /// This indicates that a limit was supposed to reset but the provider data
+    /// hasn't been updated yet. Returns true if at least one past reset is found.
+    pub async fn has_past_resets(&self, margin_secs: u64) -> bool {
+        let cache = self.cache.read().await;
+        let now = time::OffsetDateTime::now_utc();
+
+        for snapshot in cache.values() {
+            for line in &snapshot.lines {
+                if let MetricLine::Progress {
+                    resets_at: Some(resets_at_str),
+                    ..
+                } = line
+                    && let Ok(reset_time) = time::OffsetDateTime::parse(
+                        resets_at_str,
+                        &time::format_description::well_known::Rfc3339,
+                    )
+                {
+                    let effective_reset = reset_time + time::Duration::seconds(margin_secs as i64);
+                    if effective_reset <= now {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
     fn resolve_plugins(&self, plugin_ids: Option<&[String]>) -> Vec<LoadedPlugin> {
         let Some(plugin_ids) = plugin_ids else {
             return self.plugins.clone();
@@ -268,4 +335,156 @@ fn now_iso() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugin_engine::runtime::ProgressFormat;
+
+    fn iso_from_now(offset_secs: i64) -> String {
+        (time::OffsetDateTime::now_utc() + time::Duration::seconds(offset_secs))
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("rfc3339 timestamp")
+    }
+
+    fn progress_line(resets_at: Option<String>) -> MetricLine {
+        MetricLine::Progress {
+            label: "Limit".to_string(),
+            used: 10.0,
+            limit: 100.0,
+            format: ProgressFormat::Percent,
+            resets_at,
+            period_duration_ms: None,
+            color: None,
+        }
+    }
+
+    fn text_line() -> MetricLine {
+        MetricLine::Text {
+            label: "Info".to_string(),
+            value: "ok".to_string(),
+            color: None,
+            subtitle: None,
+        }
+    }
+
+    fn snapshot(provider_id: &str, lines: Vec<MetricLine>) -> CachedPluginSnapshot {
+        CachedPluginSnapshot {
+            provider_id: provider_id.to_string(),
+            display_name: provider_id.to_string(),
+            plan: None,
+            lines,
+            fetched_at: now_iso(),
+        }
+    }
+
+    async fn state_with_cache(snapshots: Vec<CachedPluginSnapshot>) -> DaemonState {
+        let state = DaemonState::new(
+            Vec::new(),
+            PathBuf::from("."),
+            "0.0.0-test".to_string(),
+            None,
+        );
+        let mut cache = state.cache.write().await;
+        for item in snapshots {
+            cache.insert(item.provider_id.clone(), item);
+        }
+        drop(cache);
+        state
+    }
+
+    #[tokio::test]
+    async fn reset_helpers_return_none_for_empty_cache() {
+        let state = state_with_cache(Vec::new()).await;
+
+        assert_eq!(state.time_until_next_reset(5).await, None);
+        assert!(!state.has_past_resets(5).await);
+    }
+
+    #[tokio::test]
+    async fn time_until_next_reset_picks_earliest_future_with_margin() {
+        let state = state_with_cache(vec![
+            snapshot("later", vec![progress_line(Some(iso_from_now(120)))]),
+            snapshot(
+                "earlier",
+                vec![
+                    progress_line(Some(iso_from_now(25))),
+                    progress_line(Some("not-a-date".to_string())),
+                ],
+            ),
+        ])
+        .await;
+
+        let delay = state
+            .time_until_next_reset(5)
+            .await
+            .expect("next reset should exist");
+
+        assert!(
+            delay >= Duration::from_secs(27) && delay <= Duration::from_secs(31),
+            "unexpected delay: {:?}",
+            delay
+        );
+    }
+
+    #[tokio::test]
+    async fn has_past_resets_true_when_any_effective_reset_is_past() {
+        let state = state_with_cache(vec![
+            snapshot("past", vec![progress_line(Some(iso_from_now(-20)))]),
+            snapshot("future", vec![progress_line(Some(iso_from_now(50)))]),
+        ])
+        .await;
+
+        assert!(state.has_past_resets(5).await);
+    }
+
+    #[tokio::test]
+    async fn margin_can_prevent_recent_reset_from_being_considered_past() {
+        let state = state_with_cache(vec![snapshot(
+            "recently-past",
+            vec![progress_line(Some(iso_from_now(-2)))],
+        )])
+        .await;
+
+        let delay = state
+            .time_until_next_reset(5)
+            .await
+            .expect("effective reset should still be in the future");
+
+        assert!(
+            delay <= Duration::from_secs(4),
+            "unexpected delay: {:?}",
+            delay
+        );
+        assert!(!state.has_past_resets(5).await);
+    }
+
+    #[tokio::test]
+    async fn reset_helpers_ignore_non_progress_and_invalid_lines() {
+        let state = state_with_cache(vec![snapshot(
+            "mixed",
+            vec![
+                text_line(),
+                progress_line(None),
+                progress_line(Some("bad-timestamp".to_string())),
+            ],
+        )])
+        .await;
+
+        assert_eq!(state.time_until_next_reset(5).await, None);
+        assert!(!state.has_past_resets(5).await);
+    }
+
+    #[tokio::test]
+    async fn time_until_next_reset_ignores_only_past_resets() {
+        let state = state_with_cache(vec![
+            snapshot("past-a", vec![progress_line(Some(iso_from_now(-120)))]),
+            snapshot("past-b", vec![progress_line(Some(iso_from_now(-15)))]),
+        ])
+        .await;
+
+        assert_eq!(state.time_until_next_reset(5).await, None);
+        assert!(state.has_past_resets(5).await);
+    }
 }

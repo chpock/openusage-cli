@@ -336,23 +336,67 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
         return Ok(());
     }
 
+    const RESET_CHECK_MARGIN_SECS: u64 = 5;
+    const RESET_RETRY_DELAY_SECS: u64 = 30;
+    const MAX_RETRY_AGE_SECS: u64 = 300; // Stop retrying after 5 minutes
+
     let refresh_task = if runtime.refresh_interval_secs > 0 {
         let refresh_state = daemon.clone();
         let refresh_every = Duration::from_secs(runtime.refresh_interval_secs);
         log::info!(
-            "background refresh enabled (every {}s)",
+            "background refresh enabled (every {}s, reset-aware)",
             runtime.refresh_interval_secs
         );
         Some(tokio::spawn(async move {
-            log::debug!("background refresh task started");
+            log::debug!("background refresh task started (reset-aware)");
+            let mut interval_timer = create_refresh_interval(refresh_every).await;
+
             loop {
-                tokio::time::sleep(refresh_every).await;
-                log::debug!("running background refresh");
+                // Track when we triggered refresh due to limit reset (for retry timeout)
+                let mut proactive_trigger_time: Option<tokio::time::Instant> = None;
+
+                // Calculate when the next limit reset occurs
+                let reset_delay = refresh_state
+                    .time_until_next_reset(RESET_CHECK_MARGIN_SECS)
+                    .await;
+
+                if let Some(delay) = reset_delay {
+                    log::debug!(
+                        "next limit reset in {:?} (margin {}s)",
+                        delay,
+                        RESET_CHECK_MARGIN_SECS
+                    );
+
+                    // Wait for either the interval or the reset, whichever comes first
+                    tokio::select! {
+                        _ = interval_timer.tick() => {
+                            log::debug!("running scheduled interval refresh");
+                        }
+                        _ = tokio::time::sleep(delay) => {
+                            log::info!("limit reset time reached (margin {}s), refreshing early", RESET_CHECK_MARGIN_SECS);
+                            proactive_trigger_time = Some(tokio::time::Instant::now());
+                        }
+                    }
+                } else {
+                    // No upcoming resets known, just wait for the interval
+                    interval_timer.tick().await;
+                    log::debug!("running scheduled interval refresh (no upcoming resets)");
+                }
+
                 if let Err(err) = refresh_state.refresh(None).await {
                     log::warn!("background refresh failed: {}", err);
                 } else {
                     log::debug!("background refresh completed");
                 }
+
+                let _ = run_past_reset_retry_loop(
+                    &refresh_state,
+                    proactive_trigger_time,
+                    RESET_CHECK_MARGIN_SECS,
+                    Duration::from_secs(RESET_RETRY_DELAY_SECS),
+                    Duration::from_secs(MAX_RETRY_AGE_SECS),
+                )
+                .await;
             }
         }))
     } else {
@@ -777,6 +821,52 @@ fn executable_dir() -> Result<PathBuf> {
         .map(Path::to_path_buf)
         .context("executable has no parent directory")?;
     Ok(dir)
+}
+
+async fn create_refresh_interval(refresh_every: Duration) -> tokio::time::Interval {
+    let mut interval_timer = tokio::time::interval(refresh_every);
+    interval_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval_timer.tick().await;
+    interval_timer
+}
+
+async fn run_past_reset_retry_loop(
+    refresh_state: &DaemonState,
+    proactive_trigger_time: Option<tokio::time::Instant>,
+    reset_check_margin_secs: u64,
+    reset_retry_delay: Duration,
+    max_retry_age: Duration,
+) -> usize {
+    let mut retry_attempts = 0usize;
+
+    while refresh_state.has_past_resets(reset_check_margin_secs).await {
+        let should_retry = proactive_trigger_time
+            .is_some_and(|trigger_time| trigger_time.elapsed() < max_retry_age);
+
+        if !should_retry {
+            log::info!(
+                "retry window expired (>{}s), returning to normal interval",
+                max_retry_age.as_secs()
+            );
+            break;
+        }
+
+        log::info!(
+            "provider data still shows past reset times, retrying in {}s",
+            reset_retry_delay.as_secs()
+        );
+        tokio::time::sleep(reset_retry_delay).await;
+
+        if let Err(err) = refresh_state.refresh(None).await {
+            log::warn!("retry refresh failed: {}", err);
+        } else {
+            log::debug!("retry refresh completed");
+        }
+
+        retry_attempts += 1;
+    }
+
+    retry_attempts
 }
 
 fn should_spawn_daemon_parent(runtime: &RuntimeCli) -> bool {
@@ -1606,6 +1696,122 @@ mod tests {
                 PathBuf::from("/opt/openusage-cli/share/openusage-cli/plugin-overrides"),
                 PathBuf::from(SYSTEM_PLUGIN_OVERRIDES_DIR),
             ]
+        );
+    }
+
+    fn stale_reset_plugin() -> manifest::LoadedPlugin {
+        manifest::LoadedPlugin {
+            manifest: manifest::PluginManifest {
+                schema_version: 1,
+                id: "stale-reset".to_string(),
+                name: "Stale Reset".to_string(),
+                version: "0.0.0-test".to_string(),
+                entry: "plugin.js".to_string(),
+                icon: "icon.svg".to_string(),
+                brand_color: None,
+                lines: Vec::new(),
+                links: Vec::new(),
+            },
+            plugin_dir: PathBuf::from("."),
+            entry_script: r#"
+                globalThis.__openusage_plugin = {
+                    probe() {
+                        return {
+                            lines: [{
+                                type: "progress",
+                                label: "Limit",
+                                used: 10,
+                                limit: 100,
+                                format: { kind: "percent" },
+                                resetsAt: "2000-01-01T00:00:00Z"
+                            }]
+                        };
+                    }
+                };
+            "#
+            .to_string(),
+            icon_data_url: "data:image/svg+xml;base64,".to_string(),
+        }
+    }
+
+    fn daemon_with_stale_reset_plugin() -> DaemonState {
+        DaemonState::new(
+            vec![stale_reset_plugin()],
+            PathBuf::from("."),
+            "0.0.0-test".to_string(),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn run_past_reset_retry_loop_stops_after_retry_window() {
+        let daemon = daemon_with_stale_reset_plugin();
+        daemon
+            .refresh(None)
+            .await
+            .expect("initial refresh should seed stale reset data");
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(700),
+            run_past_reset_retry_loop(
+                &daemon,
+                Some(tokio::time::Instant::now()),
+                0,
+                Duration::from_millis(20),
+                Duration::from_millis(120),
+            ),
+        )
+        .await;
+
+        let attempts = result.expect("retry loop should stop when window expires");
+        assert!(
+            attempts > 0,
+            "expected at least one retry attempt before window expiry"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_past_reset_retry_loop_does_not_retry_without_proactive_trigger() {
+        let daemon = daemon_with_stale_reset_plugin();
+        daemon
+            .refresh(None)
+            .await
+            .expect("initial refresh should seed stale reset data");
+
+        let attempts = run_past_reset_retry_loop(
+            &daemon,
+            None,
+            0,
+            Duration::from_millis(20),
+            Duration::from_millis(120),
+        )
+        .await;
+
+        assert_eq!(
+            attempts, 0,
+            "without proactive trigger, retries must be disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_refresh_interval_does_not_tick_immediately_after_priming() {
+        let mut interval = create_refresh_interval(Duration::from_secs(1)).await;
+
+        let immediate_tick = tokio::time::timeout(Duration::from_millis(10), interval.tick()).await;
+        assert!(
+            immediate_tick.is_err(),
+            "next interval tick should not happen immediately"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_refresh_interval_ticks_after_interval_elapsed() {
+        let mut interval = create_refresh_interval(Duration::from_millis(25)).await;
+
+        let delayed_tick = tokio::time::timeout(Duration::from_millis(250), interval.tick()).await;
+        assert!(
+            delayed_tick.is_ok(),
+            "expected interval tick within timeout"
         );
     }
 }
