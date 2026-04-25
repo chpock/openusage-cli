@@ -1,4 +1,4 @@
-.PHONY: help build test ci-compact query run-daemon deb rpm packages release-tag clean
+.PHONY: help build test ci-compact query run-daemon deb rpm packages release-tag aur clean
 
 CARGO ?= cargo
 HOST ?= 127.0.0.1
@@ -31,7 +31,8 @@ help:
 	@printf "  make deb          Build .deb package (cargo-deb)\n"
 	@printf "  make rpm          Build .rpm package (cargo-generate-rpm)\n"
 	@printf "  make packages     Build both .deb and .rpm\n"
-	@printf "  make release-tag VERSION=X.Y.Z  Create release tag\n"
+		@printf "  make release-tag VERSION=X.Y.Z  Create release tag\n"
+	@printf "  make aur VERSION=X.Y.Z  Generate AUR package files\n\n"
 	@printf "  make clean        Remove build artifacts\n"
 	@printf "\nRun variables (optional):\n"
 	@printf "  HOST=127.0.0.1 PORT=0 REFRESH_INTERVAL_SECS=300\n"
@@ -98,6 +99,14 @@ release-tag:
 	@git tag "v$(VERSION)"
 	@printf "Created tag v%s\n" "$(VERSION)"
 	@printf "Push it with: git push origin v%s\n" "$(VERSION)"
+
+aur:
+	@if [ -z "$(VERSION)" ]; then \
+		printf "VERSION is required (example: make aur VERSION=0.2.0)\n" >&2; \
+		exit 1; \
+	fi
+	@./dist/scripts/generate-aur-packages.sh "$(VERSION)"
+	@printf "\nAUR package files generated in target/aur/\n"
 
 clean:
 	$(CARGO) clean
