@@ -264,7 +264,7 @@ jobs:
           ./dist/scripts/generate-aur-packages.sh "$app_version"
 
       - name: Deploy openusage-cli to AUR
-        uses: KSXGitHub/github-actions-deploy-aur@v3
+        uses: KSXGitHub/github-actions-deploy-aur@v4.1.3
         with:
           pkgname: openusage-cli
           pkgbuild: target/aur/openusage-cli/PKGBUILD
@@ -276,7 +276,7 @@ jobs:
           test: true
 
       - name: Deploy openusage-cli-git to AUR
-        uses: KSXGitHub/github-actions-deploy-aur@v3
+        uses: KSXGitHub/github-actions-deploy-aur@v4.1.3
         with:
           pkgname: openusage-cli-git
           pkgbuild: dist/aur/openusage-cli-git/PKGBUILD
