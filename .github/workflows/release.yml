@@ -99,14 +99,24 @@ jobs:
       - name: Generate release notes from tags and commits
         run: |
           current_tag="$GITHUB_REF_NAME"
-          previous_tag="$(git describe --tags --abbrev=0 --match 'v*.*.*' "${current_tag}^" 2>/dev/null || true)"
 
-          if [ -n "$previous_tag" ]; then
+          # Get the last published GitHub release tag, not the last git tag
+          # This handles cases where a previous tag failed to release
+          previous_tag="$(gh release list --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null || true)"
+
+          if [ -n "$previous_tag" ] && [ "$previous_tag" != "$current_tag" ]; then
             commit_range="$previous_tag..$current_tag"
             range_label="$previous_tag -> $current_tag"
           else
-            commit_range="$current_tag"
-            range_label="initial release"
+            # No previous GitHub release or same tag (edge case)
+            previous_git_tag="$(git describe --tags --abbrev=0 --match 'v*.*.*' "${current_tag}^" 2>/dev/null || true)"
+            if [ -n "$previous_git_tag" ]; then
+              commit_range="$previous_git_tag..$current_tag"
+              range_label="$previous_git_tag -> $current_tag"
+            else
+              commit_range="$current_tag"
+              range_label="initial release"
+            fi
           fi
 
           tmp_dir="$(mktemp -d)"
@@ -194,7 +204,6 @@ jobs:
               echo "- No commits found in this range"
             fi
             echo
-            echo
             echo "### Checksums (SHA256)"
             echo '```text'
             for file in dist/*; do
@@ -204,6 +213,8 @@ jobs:
             done
             echo '```'
           } > RELEASE_NOTES.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Show generated release notes
         run: cat RELEASE_NOTES.md
@@ -222,3 +233,55 @@ jobs:
         with:
           files: dist/*
           body_path: RELEASE_NOTES.md
+
+      - name: Generate AUR package files
+        run: |
+          app_version="${GITHUB_REF_NAME#v}"
+
+          # Use the generation script (downloads tarball and computes SHA256)
+          ./dist/scripts/generate-aur-packages.sh "$app_version"
+
+          echo "Generated AUR package files for version ${app_version}"
+
+      - name: Upload AUR artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: aur-packages
+          path: target/aur/*
+          if-no-files-found: error
+
+  deploy-aur:
+    needs: publish-release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate AUR package files
+        run: |
+          app_version="${GITHUB_REF_NAME#v}"
+          ./dist/scripts/generate-aur-packages.sh "$app_version"
+
+      - name: Deploy openusage-cli to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v3
+        with:
+          pkgname: openusage-cli
+          pkgbuild: target/aur/openusage-cli/PKGBUILD
+          commit_username: ${{ secrets.AUR_USERNAME }}
+          commit_email: ${{ secrets.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "Update to ${{ github.ref_name }}"
+          updpkgsums: true
+          test: true
+
+      - name: Deploy openusage-cli-git to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v3
+        with:
+          pkgname: openusage-cli-git
+          pkgbuild: dist/aur/openusage-cli-git/PKGBUILD
+          commit_username: ${{ secrets.AUR_USERNAME }}
+          commit_email: ${{ secrets.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "Update PKGBUILD for ${{ github.ref_name }}"
+          test: true
