@@ -35,13 +35,16 @@ This allows using upstream plugins with minimal or zero changes.
 ## Run
 
 ```bash
-openusage-cli --host 127.0.0.1 --port 6737
+openusage-cli --host 127.0.0.1 --port 0
 ```
+
+Default bind port is `0` (random free port assigned by OS).
 
 CLI options:
 
 - `--plugins-dir <path>` (or `OPENUSAGE_PLUGINS_DIR`)
 - `--enabled-plugins <csv-globs>` (or `OPENUSAGE_ENABLED_PLUGINS`, default: `*`)
+- `--port <port>` (default: `0` = random free port)
 - `--app-data-dir <path>` (or `OPENUSAGE_APP_DATA_DIR`)
 - `--plugin-overrides-dir <path>` (or `OPENUSAGE_PLUGIN_OVERRIDES_DIR`)
 - `--refresh-interval-secs <seconds>` (default: `300`)

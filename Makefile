@@ -2,7 +2,7 @@
 
 CARGO ?= cargo
 HOST ?= 127.0.0.1
-PORT ?= 6737
+PORT ?= 0
 REFRESH_INTERVAL_SECS ?= 300
 VERBOSE ?= 0
 CI_LOG_DIR ?= .ci-logs
@@ -33,7 +33,7 @@ help:
 	@printf "  make release-tag VERSION=X.Y.Z  Create release tag\n"
 	@printf "  make clean        Remove build artifacts\n"
 	@printf "\nRun variables (optional):\n"
-	@printf "  HOST=127.0.0.1 PORT=6737 REFRESH_INTERVAL_SECS=300\n"
+	@printf "  HOST=127.0.0.1 PORT=0 REFRESH_INTERVAL_SECS=300\n"
 	@printf "  LOG_LEVEL=debug VERBOSE=1 CI_LOG_DIR=.ci-logs\n"
 	@printf "  PLUGINS_DIR=/path/to/plugins APP_DATA_DIR=/path/to/data\n"
 	@printf "  PLUGIN_OVERRIDES_DIR=/path/to/plugin-overrides\n"

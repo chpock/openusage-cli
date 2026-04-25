@@ -20,7 +20,7 @@
   - `cargo test --test http_smoke`
   - `cargo test --test plugin_compatibility`
   - `cargo test --test codex_override`
-- Run daemon from source: `cargo run -- --host 127.0.0.1 --port 6737`.
+- Run daemon from source: `cargo run -- --host 127.0.0.1 --port 0` (0 = random port).
 - Make shortcuts: `make ci-compact`, `make run`, `make run-daemon`, `make test`, `make build`.
 
 ## Runtime wiring
@@ -42,7 +42,7 @@
   5) tests for defaults and CLI-over-config precedence.
 - Keep `default_config_template()` valid YAML and synchronized with `AppConfig`.
 - Do not introduce config-only knobs for behavior already controlled by runtime CLI/env.
-- Practical defaults: host `127.0.0.1`, port `6737`, refresh interval `300s`.
+- Practical defaults: host `127.0.0.1`, port `0` (random), refresh interval `300s`.
 - `--daemon` spawns background child (`--daemon-child`) and exits parent; preserve this flow when changing startup.
 - If no plugins are discovered/enabled, startup must fail early with explicit error.
 

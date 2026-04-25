@@ -9,7 +9,7 @@ pub const CONFIG_FILE_NAME: &str = "config.yaml";
 pub const RUNTIME_DIR_NAME: &str = "runtime";
 pub const DAEMON_ENDPOINT_FILE_NAME: &str = "daemon-endpoint";
 pub const DEFAULT_HOST: &str = "127.0.0.1";
-pub const DEFAULT_PORT: u16 = 6737;
+pub const DEFAULT_PORT: u16 = 0;
 pub const DEFAULT_REFRESH_INTERVAL_SECS: u64 = 300;
 pub const DEFAULT_ENABLED_PLUGINS: &str = "*";
 pub const DEFAULT_LOG_LEVEL: &str = "error";
@@ -129,8 +129,8 @@ pub fn default_config_template() -> &'static str {
 # HTTP bind host.
 host: 127.0.0.1
 
-# HTTP bind port.
-port: 6737
+# HTTP bind port (0 = random port assigned by OS).
+port: 0
 
 # Directory with plugin JS files. null = auto-discovery.
 # plugins_dir: /path/to/plugins
