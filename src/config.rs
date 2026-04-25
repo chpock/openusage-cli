@@ -36,6 +36,7 @@ pub struct AppConfig {
     pub plugin_overrides_dir: Option<PathBuf>,
     pub refresh_interval_secs: Option<u64>,
     pub daemon: Option<bool>,
+    pub existing_instance: Option<String>,
     pub log_level: Option<String>,
     pub proxy: Option<ProxyConfig>,
 }
@@ -155,6 +156,10 @@ refresh_interval_secs: 300
 # Run as background daemon process.
 daemon: false
 
+# Behavior when a running daemon instance is already discovered.
+# Values: error | ignore | replace
+existing_instance: error
+
 # Log level: error, warn, info, debug, trace.
 log_level: error
 
@@ -220,6 +225,7 @@ mod tests {
             Some(DEFAULT_REFRESH_INTERVAL_SECS)
         );
         assert_eq!(parsed.daemon, Some(false));
+        assert_eq!(parsed.existing_instance.as_deref(), Some("error"));
         assert_eq!(parsed.log_level.as_deref(), Some(DEFAULT_LOG_LEVEL));
         let proxy = parsed.proxy.expect("proxy section must exist");
         assert!(!proxy.enabled);

@@ -28,6 +28,8 @@ pub struct RuntimeConfig {
     pub app_version: String,
     pub host: String,
     pub port: u16,
+    pub service_mode: String,
+    pub existing_instance_policy: String,
     pub plugins_dir: Option<PathBuf>,
     pub enabled_plugins: String,
     pub app_data_dir: Option<PathBuf>,

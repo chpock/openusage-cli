@@ -13,6 +13,7 @@ APP_DATA_DIR ?=
 PLUGIN_OVERRIDES_DIR ?=
 
 LOG_LEVEL ?= debug
+RUN_EXISTING_INSTANCE_POLICY ?= ignore
 RUN_ARGS = --host $(HOST) --port $(PORT) --refresh-interval-secs $(REFRESH_INTERVAL_SECS) --log-level $(LOG_LEVEL)
 RUN_ARGS += $(if $(PLUGINS_DIR),--plugins-dir $(PLUGINS_DIR),)
 RUN_ARGS += $(if $(APP_DATA_DIR),--app-data-dir $(APP_DATA_DIR),)
@@ -35,6 +36,7 @@ help:
 	@printf "\nRun variables (optional):\n"
 	@printf "  HOST=127.0.0.1 PORT=0 REFRESH_INTERVAL_SECS=300\n"
 	@printf "  LOG_LEVEL=debug VERBOSE=1 CI_LOG_DIR=.ci-logs\n"
+	@printf "  RUN_EXISTING_INSTANCE_POLICY=ignore\n"
 	@printf "  PLUGINS_DIR=/path/to/plugins APP_DATA_DIR=/path/to/data\n"
 	@printf "  PLUGIN_OVERRIDES_DIR=/path/to/plugin-overrides\n"
 
@@ -66,10 +68,10 @@ ci-compact:
 	run_step test $(CARGO) test --locked $(CI_VERBOSE_FLAG)
 
 run:
-	$(CARGO) run -- $(RUN_ARGS)
+	$(CARGO) run -- $(RUN_ARGS) --existing-instance=$(RUN_EXISTING_INSTANCE_POLICY)
 
 run-daemon:
-	$(CARGO) run -- $(RUN_ARGS) --daemon
+	$(CARGO) run -- $(RUN_ARGS) --daemon --existing-instance=$(RUN_EXISTING_INSTANCE_POLICY)
 
 deb:
 	$(CARGO) deb

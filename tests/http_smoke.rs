@@ -40,6 +40,8 @@ async fn http_api_smoke_for_plugins_and_usage_refresh() {
         app_version: "0.1.0-test".to_string(),
         host: "127.0.0.1".to_string(),
         port: addr.port(),
+        service_mode: "standalone".to_string(),
+        existing_instance_policy: "error".to_string(),
         plugins_dir: Some(vendor_plugins_dir()),
         enabled_plugins: "mock".to_string(),
         app_data_dir: Some(tmp.path().to_path_buf()),
@@ -152,6 +154,8 @@ async fn http_api_smoke_for_plugins_and_usage_refresh() {
     assert_eq!(config_json["appVersion"], "0.1.0-test");
     assert_eq!(config_json["host"], "127.0.0.1");
     assert_eq!(config_json["port"], serde_json::json!(addr.port()));
+    assert_eq!(config_json["serviceMode"], "standalone");
+    assert_eq!(config_json["existingInstancePolicy"], "error");
     assert_eq!(config_json["enabledPlugins"], "mock");
     assert_eq!(config_json["logLevel"], "error");
     assert!(config_json["refreshIntervalSecs"].is_number());

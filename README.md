@@ -50,7 +50,9 @@ CLI options:
 - `--refresh-interval-secs <seconds>` (default: `300`)
 - `--default-config` (print default `config.yaml` template to stdout and exit)
 - `--daemon[=true|false]` (when enabled, spawn background process and exit parent; default value for bare flag is `true`)
-- `--install-systemd` (create `~/.config/systemd/user/openusage-cli.service` for current user with `ExecStart=... --daemon=false`)
+- `--existing-instance <error|ignore|replace>` (default: `error`; controls behavior when a running daemon is already discovered)
+- `--service-mode <standalone|systemd>` (default: `standalone`; mainly for service managers)
+- `--install-systemd` (create `~/.config/systemd/user/openusage-cli.service` for current user with `ExecStart=... --daemon=false --service-mode=systemd`)
 
 Default plugin auto-discovery order (when `--plugins-dir` is not set):
 
@@ -91,6 +93,7 @@ Lifecycle behavior:
 - File is written atomically after HTTP bind succeeds.
 - File is removed on graceful shutdown.
 - If daemon binds to `0.0.0.0` or `::`, published endpoint is normalized to localhost for client connections.
+- When `--existing-instance=ignore` is set, discovery file publication is disabled.
 
 Recommended client flow:
 

@@ -4,8 +4,9 @@ use directories::ProjectDirs;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use openusage_cli::config;
 use openusage_cli::daemon::{CachedPluginSnapshot, DaemonState};
-use openusage_cli::discovery::{PublishedDiscovery, discover_daemon_endpoint_with_override};
+use openusage_cli::discovery::PublishedDiscovery;
 use openusage_cli::http_api::{self, ApiState, RuntimeConfig};
+use openusage_cli::instance_control::{self, ExistingInstancePolicy, ServiceMode};
 use openusage_cli::plugin_engine::manifest;
 use openusage_cli::plugin_engine::runtime::MetricLine;
 use std::ffi::{OsStr, OsString};
@@ -19,6 +20,7 @@ use tokio::net::TcpListener;
 const SYSTEM_PLUGINS_DIR: &str = "/usr/share/openusage-cli/openusage-plugins";
 const SYSTEM_PLUGIN_OVERRIDES_DIR: &str = "/usr/share/openusage-cli/plugin-overrides";
 const USER_SYSTEMD_SERVICE_NAME: &str = "openusage-cli.service";
+const EXISTING_INSTANCE_SHUTDOWN_TIMEOUT_SECS: u64 = 15;
 const APP_VERSION: &str = match option_env!("OPENUSAGE_BUILD_VERSION") {
     Some(version) => version,
     None => env!("CARGO_PKG_VERSION"),
@@ -86,6 +88,12 @@ struct Cli {
         require_equals = true
     )]
     daemon: Option<bool>,
+
+    #[arg(long, value_enum)]
+    existing_instance: Option<ExistingInstancePolicy>,
+
+    #[arg(long, value_enum)]
+    service_mode: Option<ServiceMode>,
 
     #[arg(long, default_value_t = false)]
     install_systemd: bool,
@@ -173,11 +181,13 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
 
     log::info!("starting openusage-cli v{}", app_version);
     log::debug!(
-        "startup options: host={}, port={}, refresh_interval_secs={}, daemon={}, daemon_child={}, query={}, test_mode={}, plugins_dir={:?}, enabled_plugins='{}', app_data_dir={:?}, plugin_overrides_dir={:?}, log_level={}",
+        "startup options: host={}, port={}, refresh_interval_secs={}, daemon={}, existing_instance={}, service_mode={}, daemon_child={}, query={}, test_mode={}, plugins_dir={:?}, enabled_plugins='{}', app_data_dir={:?}, plugin_overrides_dir={:?}, log_level={}",
         runtime.host,
         runtime.port,
         runtime.refresh_interval_secs,
         runtime.daemon,
+        runtime.existing_instance_policy,
+        runtime.service_mode,
         runtime.daemon_child,
         runtime.query,
         runtime.test_mode,
@@ -195,24 +205,23 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
     // Resolve app_data_dir early - needed for daemon discovery in test mode
     let app_data_dir = resolve_app_data_dir(runtime.app_data_dir.clone(), runtime.test_mode)
         .context("failed to resolve app data directory")?;
+    let test_runtime_dir = runtime
+        .test_mode
+        .then(|| app_data_dir.join(config::RUNTIME_DIR_NAME));
 
     // Query mode: try to connect to an existing daemon first
     if runtime.query {
         log::debug!("query mode enabled; attempting to discover running daemon");
 
-        // In test mode, also check the test runtime directory for endpoint file
-        let test_runtime_dir = runtime
-            .test_mode
-            .then(|| app_data_dir.join(config::RUNTIME_DIR_NAME));
-
-        if let Some(daemon_url) =
-            discover_daemon_endpoint_with_override(test_runtime_dir.as_deref())
+        if let Some(running_instance) =
+            instance_control::discover_running_instance(test_runtime_dir.as_deref()).await
         {
             log::info!(
-                "discovered running daemon at {}; querying for data",
-                daemon_url
+                "discovered running daemon at {} (service_mode={}); querying for data",
+                running_instance.base_url,
+                running_instance.service_mode
             );
-            match query_daemon_via_http(&daemon_url).await {
+            match query_daemon_via_http(&running_instance.base_url).await {
                 Ok(json_output) => {
                     println!("{}", json_output);
                     return Ok(());
@@ -230,6 +239,63 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
     }
 
     if should_spawn_daemon_parent(&runtime) {
+        if let Some(running_instance) =
+            instance_control::discover_running_instance(test_runtime_dir.as_deref()).await
+        {
+            match runtime.existing_instance_policy {
+                ExistingInstancePolicy::Error => {
+                    anyhow::bail!(
+                        "a running daemon instance is already discovered at {} (service_mode={}). use --existing-instance=replace to replace it or --existing-instance=ignore to run without discovery registration",
+                        running_instance.base_url,
+                        running_instance.service_mode
+                    );
+                }
+                ExistingInstancePolicy::Ignore => {
+                    log::info!(
+                        "running daemon already discovered at {} (service_mode={}); ignoring because --existing-instance=ignore",
+                        running_instance.base_url,
+                        running_instance.service_mode
+                    );
+                }
+                ExistingInstancePolicy::Replace => match running_instance.service_mode {
+                    ServiceMode::Systemd => {
+                        log::info!(
+                            "requesting shutdown of existing systemd-managed instance at {}",
+                            running_instance.base_url
+                        );
+                        instance_control::request_shutdown(&running_instance.base_url)
+                            .await
+                            .context("failed to request shutdown for systemd-managed instance")?;
+                        println!(
+                            "Existing systemd-managed daemon at {} received shutdown request. The systemd unit should restart it automatically.",
+                            running_instance.base_url
+                        );
+                        return Ok(());
+                    }
+                    ServiceMode::Standalone => {
+                        log::info!(
+                            "replacing existing standalone instance at {}",
+                            running_instance.base_url
+                        );
+                        instance_control::request_shutdown(&running_instance.base_url)
+                            .await
+                            .context(
+                                "failed to request shutdown for existing standalone instance",
+                            )?;
+                        instance_control::wait_until_unreachable(
+                            &running_instance.base_url,
+                            Duration::from_secs(EXISTING_INSTANCE_SHUTDOWN_TIMEOUT_SECS),
+                        )
+                        .await
+                        .context("existing standalone instance did not stop in time")?;
+                        log::info!(
+                            "existing standalone instance stopped; continuing daemon startup"
+                        );
+                    }
+                },
+            }
+        }
+
         let child_pid =
             spawn_daemon_process(raw_args).context("failed to spawn background daemon process")?;
         log::info!("daemon mode enabled; spawned background process pid={child_pid}");
@@ -304,10 +370,6 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
     } else {
         log::info!("plugin overrides disabled (no overrides dir found)");
     }
-
-    let test_runtime_dir = runtime
-        .test_mode
-        .then(|| app_data_dir.join(config::RUNTIME_DIR_NAME));
 
     let daemon = Arc::new(DaemonState::new(
         plugins,
@@ -423,12 +485,18 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
         .context("failed to resolve bound HTTP listener address")?;
     log::debug!("HTTP listener successfully bound on {}", bound_addr);
 
-    let discovery = PublishedDiscovery::publish(bound_addr, test_runtime_dir.as_deref())
-        .context("failed to publish daemon endpoint")?;
-    log::info!(
-        "published daemon endpoint file: {}",
-        discovery.endpoint_file().display()
-    );
+    let discovery = if runtime.existing_instance_policy == ExistingInstancePolicy::Ignore {
+        log::info!("skipping daemon endpoint publication because --existing-instance=ignore");
+        None
+    } else {
+        let discovery = PublishedDiscovery::publish(bound_addr, test_runtime_dir.as_deref())
+            .context("failed to publish daemon endpoint")?;
+        log::info!(
+            "published daemon endpoint file: {}",
+            discovery.endpoint_file().display()
+        );
+        Some(discovery)
+    };
 
     // Create shutdown channel for graceful shutdown via HTTP API
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -438,6 +506,8 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
         app_version: app_version.clone(),
         host: runtime.host.clone(),
         port: bound_addr.port(),
+        service_mode: runtime.service_mode.to_string(),
+        existing_instance_policy: runtime.existing_instance_policy.to_string(),
         plugins_dir: Some(plugins_dir.clone()),
         enabled_plugins: runtime.enabled_plugins.clone(),
         app_data_dir: Some(app_data_dir.clone()),
@@ -454,7 +524,11 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
     });
     log::debug!("HTTP router initialized");
 
-    log::info!("openusage-cli daemon listening on {}", discovery.base_url());
+    if let Some(discovery) = &discovery {
+        log::info!("openusage-cli daemon listening on {}", discovery.base_url());
+    } else {
+        log::info!("openusage-cli daemon listening on http://{}", bound_addr);
+    }
     log::debug!("waiting for shutdown signal");
 
     let server_result = axum::serve(
@@ -499,6 +573,8 @@ struct RuntimeCli {
     plugin_overrides_dir: Option<PathBuf>,
     refresh_interval_secs: u64,
     daemon: bool,
+    existing_instance_policy: ExistingInstancePolicy,
+    service_mode: ServiceMode,
     daemon_child: bool,
     test_mode: bool,
     query: bool,
@@ -507,6 +583,7 @@ struct RuntimeCli {
 
 impl RuntimeCli {
     fn from_sources(cli: Cli, env: EnvOverrides, config: config::AppConfig) -> Result<Self> {
+        let config_existing_instance = config.existing_instance.clone();
         let host = cli
             .host
             .or(config.host)
@@ -517,6 +594,18 @@ impl RuntimeCli {
             .or(config.refresh_interval_secs)
             .unwrap_or(config::DEFAULT_REFRESH_INTERVAL_SECS);
         let daemon = cli.daemon.or(config.daemon).unwrap_or(false);
+        let config_existing_instance_policy = match config_existing_instance {
+            Some(value) => Some(
+                ExistingInstancePolicy::parse(&value)
+                    .with_context(|| format!("invalid existing_instance value '{}'", value))?,
+            ),
+            None => None,
+        };
+        let existing_instance_policy = cli
+            .existing_instance
+            .or(config_existing_instance_policy)
+            .unwrap_or(ExistingInstancePolicy::Error);
+        let service_mode = cli.service_mode.unwrap_or(ServiceMode::Standalone);
         let enabled_plugins = cli
             .enabled_plugins
             .or(env.enabled_plugins)
@@ -545,6 +634,8 @@ impl RuntimeCli {
                 .or(config.plugin_overrides_dir),
             refresh_interval_secs,
             daemon,
+            existing_instance_policy,
+            service_mode,
             daemon_child: cli.daemon_child,
             test_mode: cli.test_mode,
             query: cli.query,
@@ -1049,7 +1140,7 @@ fn install_user_systemd_unit(_raw_args: &[OsString]) -> Result<()> {
         let exec_start = systemd_exec_start(executable.as_os_str());
 
         let unit_content = format!(
-            "[Unit]\nDescription=OpenUsage CLI daemon\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={}\nRestart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n",
+            "[Unit]\nDescription=OpenUsage CLI daemon\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={}\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n",
             exec_start
         );
 
@@ -1089,6 +1180,7 @@ fn systemd_exec_start(executable: &OsStr) -> String {
     [
         quote_systemd_argument(executable),
         "--daemon=false".to_string(),
+        "--service-mode=systemd".to_string(),
         "--log-level=info".to_string(),
     ]
     .join(" ")
@@ -1271,6 +1363,8 @@ mod tests {
             log_level: None,
             default_config: false,
             daemon: None,
+            existing_instance: None,
+            service_mode: None,
             install_systemd: false,
             daemon_child: false,
             test_mode: false,
@@ -1314,6 +1408,20 @@ mod tests {
     }
 
     #[test]
+    fn cli_accepts_existing_instance_policy_flag() {
+        let cli = Cli::try_parse_from(["openusage-cli", "--existing-instance", "replace"])
+            .expect("--existing-instance should parse");
+        assert_eq!(cli.existing_instance, Some(ExistingInstancePolicy::Replace));
+    }
+
+    #[test]
+    fn cli_accepts_service_mode_flag() {
+        let cli = Cli::try_parse_from(["openusage-cli", "--service-mode", "systemd"])
+            .expect("--service-mode should parse");
+        assert_eq!(cli.service_mode, Some(ServiceMode::Systemd));
+    }
+
+    #[test]
     fn cli_accepts_hidden_test_mode_flag() {
         let cli = Cli::try_parse_from(["openusage-cli", "--test-mode"])
             .expect("--test-mode should parse");
@@ -1351,6 +1459,11 @@ mod tests {
         assert_eq!(runtime.enabled_plugins, config::DEFAULT_ENABLED_PLUGINS);
         assert_eq!(runtime.log_level, config::DEFAULT_LOG_LEVEL);
         assert!(!runtime.daemon);
+        assert_eq!(
+            runtime.existing_instance_policy,
+            ExistingInstancePolicy::Error
+        );
+        assert_eq!(runtime.service_mode, ServiceMode::Standalone);
         assert!(!runtime.query);
     }
 
@@ -1365,6 +1478,7 @@ mod tests {
             plugin_overrides_dir: Some(PathBuf::from("/tmp/overrides")),
             refresh_interval_secs: Some(42),
             daemon: Some(true),
+            existing_instance: Some("ignore".to_string()),
             log_level: Some("debug".to_string()),
             proxy: None,
         };
@@ -1383,6 +1497,10 @@ mod tests {
         assert_eq!(runtime.refresh_interval_secs, 42);
         assert_eq!(runtime.log_level, "debug");
         assert!(runtime.daemon);
+        assert_eq!(
+            runtime.existing_instance_policy,
+            ExistingInstancePolicy::Ignore
+        );
     }
 
     #[test]
@@ -1398,6 +1516,8 @@ mod tests {
             log_level: Some(LogLevel::Trace),
             default_config: false,
             daemon: Some(true),
+            existing_instance: Some(ExistingInstancePolicy::Replace),
+            service_mode: Some(ServiceMode::Systemd),
             install_systemd: false,
             daemon_child: false,
             test_mode: false,
@@ -1412,6 +1532,7 @@ mod tests {
             plugin_overrides_dir: Some(PathBuf::from("/cfg/overrides")),
             refresh_interval_secs: Some(60),
             daemon: Some(false),
+            existing_instance: Some("error".to_string()),
             log_level: Some("debug".to_string()),
             proxy: None,
         };
@@ -1431,6 +1552,11 @@ mod tests {
         assert_eq!(runtime.refresh_interval_secs, 7);
         assert_eq!(runtime.log_level, "trace");
         assert!(runtime.daemon);
+        assert_eq!(
+            runtime.existing_instance_policy,
+            ExistingInstancePolicy::Replace
+        );
+        assert_eq!(runtime.service_mode, ServiceMode::Systemd);
     }
 
     #[test]
@@ -1462,6 +1588,18 @@ mod tests {
                 .expect("runtime query value should resolve");
 
         assert!(runtime.query);
+    }
+
+    #[test]
+    fn runtime_cli_rejects_invalid_config_existing_instance_value() {
+        let app_config = config::AppConfig {
+            existing_instance: Some("invalid".to_string()),
+            ..config::AppConfig::default()
+        };
+
+        let err = RuntimeCli::from_sources(empty_cli(), EnvOverrides::default(), app_config)
+            .expect_err("invalid existing_instance value must be rejected");
+        assert!(err.to_string().contains("invalid existing_instance"));
     }
 
     #[test]
@@ -1631,7 +1769,7 @@ mod tests {
     fn systemd_exec_start_always_uses_daemon_false_and_log_level_info() {
         assert_eq!(
             systemd_exec_start(OsStr::new("/usr/bin/openusage-cli")),
-            "/usr/bin/openusage-cli --daemon=false --log-level=info"
+            "/usr/bin/openusage-cli --daemon=false --service-mode=systemd --log-level=info"
         );
     }
 

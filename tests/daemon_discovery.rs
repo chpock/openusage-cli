@@ -16,6 +16,37 @@ struct DaemonProcess {
 
 impl DaemonProcess {
     fn spawn(workspace_root: &Path, home_dir: &Path, app_data_dir: &Path) -> Self {
+        Self::spawn_with_options(
+            workspace_root,
+            home_dir,
+            app_data_dir,
+            "error",
+            "standalone",
+        )
+    }
+
+    fn spawn_with_existing_policy(
+        workspace_root: &Path,
+        home_dir: &Path,
+        app_data_dir: &Path,
+        existing_policy: &str,
+    ) -> Self {
+        Self::spawn_with_options(
+            workspace_root,
+            home_dir,
+            app_data_dir,
+            existing_policy,
+            "standalone",
+        )
+    }
+
+    fn spawn_with_options(
+        workspace_root: &Path,
+        home_dir: &Path,
+        app_data_dir: &Path,
+        existing_policy: &str,
+        service_mode: &str,
+    ) -> Self {
         let daemon_bin = PathBuf::from(env!("CARGO_BIN_EXE_openusage-cli"));
         let plugins_dir = workspace_root.join("vendor/openusage/plugins");
 
@@ -32,6 +63,10 @@ impl DaemonProcess {
             .arg(plugins_dir)
             .arg("--enabled-plugins")
             .arg("mock")
+            .arg("--existing-instance")
+            .arg(existing_policy)
+            .arg("--service-mode")
+            .arg(service_mode)
             .arg("--app-data-dir")
             .arg(app_data_dir)
             .env("HOME", home_dir)
@@ -190,6 +225,86 @@ fn assert_process_still_running(child: &mut Child) {
     if let Some(status) = child.try_wait().expect("poll daemon process status") {
         panic!("daemon process exited unexpectedly: {status}");
     }
+}
+
+fn wait_for_process_exit_success(child: &mut Child) {
+    let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().expect("poll daemon process exit") {
+            assert!(
+                status.success(),
+                "daemon process exited with status {status}"
+            );
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    panic!("timed out waiting for daemon process to exit");
+}
+
+fn wait_for_endpoint_file_without_process_check(endpoint_path: &Path) {
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    while Instant::now() < deadline {
+        if endpoint_path.exists() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "timed out waiting for daemon-endpoint at {}",
+        endpoint_path.display()
+    );
+}
+
+fn wait_for_health_ok_without_process_check(endpoint_url: &str) {
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(800))
+        .build()
+        .expect("build HTTP client");
+
+    while Instant::now() < deadline {
+        let health_url = format!("{endpoint_url}/health");
+        if let Ok(response) = client.get(&health_url).send()
+            && response.status().is_success()
+        {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    panic!("timed out waiting for healthy daemon at {endpoint_url}");
+}
+
+fn shutdown_daemon_via_http(endpoint_url: &str) {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .expect("build HTTP client");
+    let response = client
+        .post(format!("{endpoint_url}/v1/shutdown"))
+        .send()
+        .expect("send shutdown request");
+    assert!(
+        response.status().is_success(),
+        "shutdown request must succeed"
+    );
+}
+
+fn wait_for_endpoint_file_removal(endpoint_path: &Path) {
+    let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+    while Instant::now() < deadline {
+        if !endpoint_path.exists() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    panic!(
+        "timed out waiting for daemon-endpoint removal at {}",
+        endpoint_path.display()
+    );
 }
 
 #[test]
@@ -375,4 +490,199 @@ fn query_mode_falls_back_when_daemon_endpoint_file_exists_but_daemon_dead() {
         "should log fallback message. stderr: {}",
         stderr
     );
+}
+
+#[test]
+fn daemon_ignore_policy_does_not_publish_discovery_endpoint_file() {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home_dir = temp.path().join("home");
+    let app_data_dir = temp.path().join("app-data");
+
+    fs::create_dir_all(&home_dir).expect("create HOME dir");
+    fs::create_dir_all(&app_data_dir).expect("create app data dir");
+
+    let mut daemon = DaemonProcess::spawn_with_existing_policy(
+        &workspace_root,
+        &home_dir,
+        &app_data_dir,
+        "ignore",
+    );
+
+    thread::sleep(Duration::from_millis(500));
+    assert_process_still_running(daemon.child_mut());
+
+    let endpoint_path = app_data_dir
+        .join(RUNTIME_DIR_NAME)
+        .join(DAEMON_ENDPOINT_FILE_NAME);
+    assert!(
+        !endpoint_path.exists(),
+        "ignore policy must not publish daemon endpoint file"
+    );
+
+    daemon.terminate_gracefully();
+}
+
+#[test]
+fn daemon_mode_errors_when_existing_instance_is_already_running_by_default() {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home_dir = temp.path().join("home");
+    let app_data_dir = temp.path().join("app-data");
+
+    fs::create_dir_all(&home_dir).expect("create HOME dir");
+    fs::create_dir_all(&app_data_dir).expect("create app data dir");
+
+    let mut daemon = DaemonProcess::spawn(&workspace_root, &home_dir, &app_data_dir);
+    let endpoint_path = app_data_dir
+        .join(RUNTIME_DIR_NAME)
+        .join(DAEMON_ENDPOINT_FILE_NAME);
+    wait_for_endpoint_file(&endpoint_path, daemon.child_mut());
+    let endpoint_url = read_endpoint_url(&endpoint_path);
+    wait_for_health_ok(&endpoint_url, daemon.child_mut());
+
+    let daemon_bin = PathBuf::from(env!("CARGO_BIN_EXE_openusage-cli"));
+    let plugins_dir = workspace_root.join("vendor/openusage/plugins");
+    let output = Command::new(daemon_bin)
+        .arg("--daemon")
+        .arg("--test-mode")
+        .arg("--plugins-dir")
+        .arg(&plugins_dir)
+        .arg("--enabled-plugins")
+        .arg("mock")
+        .arg("--app-data-dir")
+        .arg(&app_data_dir)
+        .env("HOME", &home_dir)
+        .output()
+        .expect("run daemon mode with existing instance");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "daemon mode should fail when instance already exists. stderr: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("--existing-instance=replace"),
+        "stderr must suggest replace policy. stderr: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("--existing-instance=ignore"),
+        "stderr must suggest ignore policy. stderr: {}",
+        stderr
+    );
+
+    assert_process_still_running(daemon.child_mut());
+    daemon.terminate_gracefully();
+}
+
+#[test]
+fn daemon_replace_policy_replaces_running_standalone_instance() {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home_dir = temp.path().join("home");
+    let app_data_dir = temp.path().join("app-data");
+
+    fs::create_dir_all(&home_dir).expect("create HOME dir");
+    fs::create_dir_all(&app_data_dir).expect("create app data dir");
+
+    let mut old_daemon = DaemonProcess::spawn(&workspace_root, &home_dir, &app_data_dir);
+    let endpoint_path = app_data_dir
+        .join(RUNTIME_DIR_NAME)
+        .join(DAEMON_ENDPOINT_FILE_NAME);
+    wait_for_endpoint_file(&endpoint_path, old_daemon.child_mut());
+    let old_endpoint_url = read_endpoint_url(&endpoint_path);
+    wait_for_health_ok(&old_endpoint_url, old_daemon.child_mut());
+
+    let daemon_bin = PathBuf::from(env!("CARGO_BIN_EXE_openusage-cli"));
+    let plugins_dir = workspace_root.join("vendor/openusage/plugins");
+    let output = Command::new(daemon_bin)
+        .arg("--daemon")
+        .arg("--existing-instance")
+        .arg("replace")
+        .arg("--test-mode")
+        .arg("--plugins-dir")
+        .arg(&plugins_dir)
+        .arg("--enabled-plugins")
+        .arg("mock")
+        .arg("--app-data-dir")
+        .arg(&app_data_dir)
+        .env("HOME", &home_dir)
+        .output()
+        .expect("run daemon replacement mode");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "daemon replace mode should succeed. stderr: {}",
+        stderr
+    );
+
+    wait_for_process_exit_success(old_daemon.child_mut());
+
+    wait_for_endpoint_file_without_process_check(&endpoint_path);
+    let new_endpoint_url = read_endpoint_url(&endpoint_path);
+    wait_for_health_ok_without_process_check(&new_endpoint_url);
+
+    shutdown_daemon_via_http(&new_endpoint_url);
+    wait_for_endpoint_file_removal(&endpoint_path);
+}
+
+#[test]
+fn daemon_replace_policy_requests_restart_for_systemd_managed_instance() {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home_dir = temp.path().join("home");
+    let app_data_dir = temp.path().join("app-data");
+
+    fs::create_dir_all(&home_dir).expect("create HOME dir");
+    fs::create_dir_all(&app_data_dir).expect("create app data dir");
+
+    let mut old_daemon = DaemonProcess::spawn_with_options(
+        &workspace_root,
+        &home_dir,
+        &app_data_dir,
+        "error",
+        "systemd",
+    );
+    let endpoint_path = app_data_dir
+        .join(RUNTIME_DIR_NAME)
+        .join(DAEMON_ENDPOINT_FILE_NAME);
+    wait_for_endpoint_file(&endpoint_path, old_daemon.child_mut());
+    let endpoint_url = read_endpoint_url(&endpoint_path);
+    wait_for_health_ok(&endpoint_url, old_daemon.child_mut());
+
+    let daemon_bin = PathBuf::from(env!("CARGO_BIN_EXE_openusage-cli"));
+    let plugins_dir = workspace_root.join("vendor/openusage/plugins");
+    let output = Command::new(daemon_bin)
+        .arg("--daemon")
+        .arg("--existing-instance")
+        .arg("replace")
+        .arg("--test-mode")
+        .arg("--plugins-dir")
+        .arg(&plugins_dir)
+        .arg("--enabled-plugins")
+        .arg("mock")
+        .arg("--app-data-dir")
+        .arg(&app_data_dir)
+        .env("HOME", &home_dir)
+        .output()
+        .expect("run daemon replacement mode for systemd instance");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "daemon replace mode should succeed for systemd instance. stderr: {}",
+        stderr
+    );
+    assert!(
+        stdout.contains("systemd unit should restart"),
+        "stdout must mention systemd restart hint. stdout: {}",
+        stdout
+    );
+
+    wait_for_process_exit_success(old_daemon.child_mut());
+    wait_for_endpoint_file_removal(&endpoint_path);
 }
