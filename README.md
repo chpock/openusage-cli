@@ -32,6 +32,45 @@ To minimize divergence from upstream:
 
 This allows using upstream plugins with minimal or zero changes.
 
+## Installation
+
+### Arch Linux (AUR)
+
+Two AUR packages are available:
+
+- `openusage-cli` - stable release package
+- `openusage-cli-git` - latest `main` snapshot
+
+Install one of them with your AUR helper:
+
+```bash
+# stable
+yay -S openusage-cli
+
+# development (git)
+yay -S openusage-cli-git
+```
+
+### Debian-based distributions (`.deb`)
+
+Download the latest `.deb` from GitHub Releases, then install:
+
+```bash
+sudo apt install ./openusage-cli_<version>_<arch>.deb
+```
+
+### RPM-based distributions (`.rpm`)
+
+Download the latest `.rpm` from GitHub Releases, then install:
+
+```bash
+# Fedora / RHEL / Rocky / AlmaLinux
+sudo dnf install ./openusage-cli-<version>-1.<arch>.rpm
+
+# openSUSE
+sudo zypper install ./openusage-cli-<version>-1.<arch>.rpm
+```
+
 ## Run
 
 ```bash
