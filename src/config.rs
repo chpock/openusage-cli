@@ -35,7 +35,7 @@ pub struct AppConfig {
     pub app_data_dir: Option<PathBuf>,
     pub plugin_overrides_dir: Option<PathBuf>,
     pub refresh_interval_secs: Option<u64>,
-    pub daemon: Option<bool>,
+    pub foreground: Option<bool>,
     pub existing_instance: Option<String>,
     pub log_level: Option<String>,
     pub proxy: Option<ProxyConfig>,
@@ -124,7 +124,7 @@ fn write_default_config_to_path(path: &Path, overwrite: bool) -> Result<bool> {
 
 pub fn default_config_template() -> &'static str {
     r#"# openusage-cli configuration.
-# Print this template explicitly with: openusage-cli --default-config
+# Print this template explicitly with: openusage-cli show-default-config
 # CLI flags (and env vars for supported args) override this file.
 
 # HTTP bind host.
@@ -153,8 +153,9 @@ plugin_overrides_dir: null
 # Background refresh interval in seconds. 0 disables periodic refresh.
 refresh_interval_secs: 300
 
-# Run as background daemon process.
-daemon: false
+# Run daemon in foreground mode (run-daemon only).
+# false keeps default background startup behavior.
+foreground: false
 
 # Behavior when a running daemon instance is already discovered.
 # Values: error | ignore | replace
@@ -224,7 +225,7 @@ mod tests {
             parsed.refresh_interval_secs,
             Some(DEFAULT_REFRESH_INTERVAL_SECS)
         );
-        assert_eq!(parsed.daemon, Some(false));
+        assert_eq!(parsed.foreground, Some(false));
         assert_eq!(parsed.existing_instance.as_deref(), Some("error"));
         assert_eq!(parsed.log_level.as_deref(), Some(DEFAULT_LOG_LEVEL));
         let proxy = parsed.proxy.expect("proxy section must exist");

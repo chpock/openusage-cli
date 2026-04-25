@@ -5,6 +5,9 @@
 - `openusage/` is upstream reference source; `vendor/openusage/` is runtime compatibility mirror.
 - Do not edit `openusage/` or `vendor/*` during feature work; implement fixes in `src/`.
 
+## Language policy
+- Use English only for user-facing messages.
+
 ## Verification commands
 - Full CI parity command: `make ci-compact`.
 - Under the hood, parity order is: `cargo fmt --all -- --check` -> `cargo clippy --locked --all-targets -- -D warnings` -> `cargo build --locked` -> `cargo test --locked`.
@@ -20,8 +23,8 @@
   - `cargo test --test http_smoke`
   - `cargo test --test plugin_compatibility`
   - `cargo test --test codex_override`
-- Run daemon from source: `cargo run -- --host 127.0.0.1 --port 0` (0 = random port).
-- Make shortcuts: `make ci-compact`, `make run`, `make run-daemon`, `make test`, `make build`.
+- Run daemon from source: `cargo run -- run-daemon --foreground=true --host 127.0.0.1 --port 0` (0 = random port).
+- Make shortcuts: `make ci-compact`, `make query`, `make run-daemon`, `make test`, `make build`.
 
 ## Runtime wiring
 - Process entrypoint and source merge logic: `src/main.rs`.
@@ -32,7 +35,7 @@
 
 ## Config contract (keep in sync)
 - Config path resolution: `ProjectDirs::from("com", "openusage", "openusage-cli")/config.yaml`, fallback `./.openusage-cli/config.yaml`.
-- Missing config is valid at startup (no auto-create). Template generation is explicit via `--default-config`.
+- Missing config is valid at startup (no auto-create). Template generation is explicit via `show-default-config`.
 - Precedence is strict: CLI flags/env > `config.yaml` > built-in defaults.
 - For any new runtime setting, update together:
   1) `Cli` args in `src/main.rs`,
@@ -43,7 +46,7 @@
 - Keep `default_config_template()` valid YAML and synchronized with `AppConfig`.
 - Do not introduce config-only knobs for behavior already controlled by runtime CLI/env.
 - Practical defaults: host `127.0.0.1`, port `0` (random), refresh interval `300s`.
-- `--daemon` spawns background child (`--daemon-child`) and exits parent; preserve this flow when changing startup.
+- `run-daemon` spawns background child (`--daemon-child`) and exits parent; preserve this flow when changing startup.
 - If no plugins are discovered/enabled, startup must fail early with explicit error.
 
 ## Plugin and override resolution

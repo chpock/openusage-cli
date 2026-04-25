@@ -51,11 +51,12 @@ impl DaemonProcess {
         let plugins_dir = workspace_root.join("vendor/openusage/plugins");
 
         let child = Command::new(daemon_bin)
+            .arg("run-daemon")
+            .arg("--daemon-child")
             .arg("--host")
             .arg("127.0.0.1")
             .arg("--port")
             .arg("0")
-            .arg("--daemon=false")
             .arg("--refresh-interval-secs")
             .arg("0")
             .arg("--test-mode")
@@ -331,7 +332,7 @@ fn query_mode_connects_to_running_daemon() {
     // Now run query mode - it should connect to the daemon and return data
     let daemon_bin = PathBuf::from(env!("CARGO_BIN_EXE_openusage-cli"));
     let query_output = Command::new(daemon_bin)
-        .arg("--query")
+        .arg("query")
         .arg("--test-mode")
         .arg("--app-data-dir")
         .arg(&app_data_dir)
@@ -389,7 +390,7 @@ fn query_mode_falls_back_to_local_execution_when_no_daemon() {
     let plugins_dir = workspace_root.join("vendor/openusage/plugins");
 
     let query_output = Command::new(daemon_bin)
-        .arg("--query")
+        .arg("query")
         .arg("--test-mode")
         .arg("--plugins-dir")
         .arg(&plugins_dir)
@@ -447,7 +448,7 @@ fn query_mode_falls_back_when_daemon_endpoint_file_exists_but_daemon_dead() {
     let plugins_dir = workspace_root.join("vendor/openusage/plugins");
 
     let query_output = Command::new(daemon_bin)
-        .arg("--query")
+        .arg("query")
         .arg("--test-mode")
         .arg("--plugins-dir")
         .arg(&plugins_dir)
@@ -544,7 +545,7 @@ fn daemon_mode_errors_when_existing_instance_is_already_running_by_default() {
     let daemon_bin = PathBuf::from(env!("CARGO_BIN_EXE_openusage-cli"));
     let plugins_dir = workspace_root.join("vendor/openusage/plugins");
     let output = Command::new(daemon_bin)
-        .arg("--daemon")
+        .arg("run-daemon")
         .arg("--test-mode")
         .arg("--plugins-dir")
         .arg(&plugins_dir)
@@ -598,7 +599,7 @@ fn daemon_replace_policy_replaces_running_standalone_instance() {
     let daemon_bin = PathBuf::from(env!("CARGO_BIN_EXE_openusage-cli"));
     let plugins_dir = workspace_root.join("vendor/openusage/plugins");
     let output = Command::new(daemon_bin)
-        .arg("--daemon")
+        .arg("run-daemon")
         .arg("--existing-instance")
         .arg("replace")
         .arg("--test-mode")
@@ -656,7 +657,7 @@ fn daemon_replace_policy_requests_restart_for_systemd_managed_instance() {
     let daemon_bin = PathBuf::from(env!("CARGO_BIN_EXE_openusage-cli"));
     let plugins_dir = workspace_root.join("vendor/openusage/plugins");
     let output = Command::new(daemon_bin)
-        .arg("--daemon")
+        .arg("run-daemon")
         .arg("--existing-instance")
         .arg("replace")
         .arg("--test-mode")

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow};
-use clap::{Parser, ValueEnum};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use directories::ProjectDirs;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use openusage_cli::config;
@@ -21,6 +21,17 @@ const SYSTEM_PLUGINS_DIR: &str = "/usr/share/openusage-cli/openusage-plugins";
 const SYSTEM_PLUGIN_OVERRIDES_DIR: &str = "/usr/share/openusage-cli/plugin-overrides";
 const USER_SYSTEMD_SERVICE_NAME: &str = "openusage-cli.service";
 const EXISTING_INSTANCE_SHUTDOWN_TIMEOUT_SECS: u64 = 15;
+const CMD_RUN_DAEMON: &str = "run-daemon";
+const HELP_HEADING_MODE_OPTIONS: &str = "Mode options";
+const HELP_HEADING_GLOBAL_OPTIONS: &str = "Global options";
+const KNOWN_COMMANDS: &[&str] = &[
+    CMD_RUN_DAEMON,
+    "query",
+    "show-default-config",
+    "install-systemd-unit",
+    "version",
+    "help",
+];
 const APP_VERSION: &str = match option_env!("OPENUSAGE_BUILD_VERSION") {
     Some(version) => version,
     None => env!("CARGO_PKG_VERSION"),
@@ -49,63 +60,313 @@ impl LogLevel {
     }
 }
 
+// NOTE: When adding new value-taking arguments here, also update
+// `option_consumes_separate_value` to keep pre-parser positional detection in sync.
+#[derive(Debug, Clone, Default, Args)]
+#[command(next_help_heading = HELP_HEADING_MODE_OPTIONS)]
+struct QueryArgs {
+    /// HTTP host to bind to [default: 127.0.0.1]
+    #[arg(long)]
+    host: Option<String>,
+
+    /// HTTP port to bind to (0 = random free port) [default: 0]
+    #[arg(long)]
+    port: Option<u16>,
+
+    /// Directory containing plugin JS files [default: auto-discover]
+    #[arg(long)]
+    plugins_dir: Option<PathBuf>,
+
+    /// Comma-separated glob patterns for enabled plugin IDs [default: *]
+    #[arg(long)]
+    enabled_plugins: Option<String>,
+
+    /// Directory for application data and cache [default: platform default]
+    #[arg(long)]
+    app_data_dir: Option<PathBuf>,
+
+    /// Directory containing plugin override scripts [default: auto-discover]
+    #[arg(long)]
+    plugin_overrides_dir: Option<PathBuf>,
+
+    /// Background refresh interval in seconds (0 = disable) [default: 300]
+    #[arg(long)]
+    refresh_interval_secs: Option<u64>,
+}
+
+// NOTE: When adding new value-taking arguments here, also update
+// `option_consumes_separate_value` to keep pre-parser positional detection in sync.
+#[derive(Debug, Clone, Args)]
+#[command(next_help_heading = HELP_HEADING_MODE_OPTIONS)]
+struct RunDaemonArgs {
+    #[command(flatten)]
+    runtime: QueryArgs,
+
+    /// Run daemon in foreground mode (do not spawn background process) [default: false]
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    foreground: Option<bool>,
+
+    /// Behavior when a daemon instance is already running [default: error]
+    #[arg(long, value_enum)]
+    existing_instance: Option<ExistingInstancePolicy>,
+
+    /// Service manager mode for process lifecycle handling [default: standalone]
+    #[arg(long, value_enum)]
+    service_mode: Option<ServiceMode>,
+
+    /// Internal flag used when spawning the background daemon child process
+    #[arg(long, hide = true, default_value_t = false)]
+    daemon_child: bool,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum ModeCommand {
+    /// Start the HTTP daemon (background by default)
+    #[command(name = CMD_RUN_DAEMON)]
+    RunDaemon(RunDaemonArgs),
+
+    /// Query usage data (default mode; one-shot JSON output)
+    Query(QueryArgs),
+
+    /// Print the default configuration template to stdout
+    #[command(name = "show-default-config")]
+    ShowDefaultConfig,
+
+    /// Install a systemd user service unit for the daemon
+    #[command(name = "install-systemd-unit")]
+    InstallSystemdUnit,
+
+    /// Print version information
+    Version,
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "openusage-cli")]
 #[command(about = "HTTP daemon for AI usage limit plugins")]
 #[command(version = APP_VERSION)]
+#[command(propagate_version = true)]
+#[command(disable_help_flag = true)]
+#[command(disable_version_flag = true)]
 struct Cli {
-    #[arg(long)]
-    host: Option<String>,
-
-    #[arg(long)]
-    port: Option<u16>,
-
-    #[arg(long)]
-    plugins_dir: Option<PathBuf>,
-
-    #[arg(long)]
-    enabled_plugins: Option<String>,
-
-    #[arg(long)]
-    app_data_dir: Option<PathBuf>,
-
-    #[arg(long)]
-    plugin_overrides_dir: Option<PathBuf>,
-
-    #[arg(long)]
-    refresh_interval_secs: Option<u64>,
-
-    #[arg(long)]
+    /// Set the logging level [default: error]
+    #[arg(long, value_enum, global = true, help_heading = HELP_HEADING_GLOBAL_OPTIONS)]
     log_level: Option<LogLevel>,
 
-    #[arg(long, default_value_t = false)]
-    default_config: bool,
+    #[arg(
+        short = 'h',
+        long = "help",
+        action = ArgAction::Help,
+        global = true,
+        help_heading = HELP_HEADING_GLOBAL_OPTIONS
+    )]
+    _help: Option<bool>,
 
     #[arg(
-        long,
-        num_args = 0..=1,
-        default_missing_value = "true",
-        require_equals = true
+        short = 'V',
+        long = "version",
+        action = ArgAction::Version,
+        global = true,
+        help_heading = HELP_HEADING_GLOBAL_OPTIONS
     )]
-    daemon: Option<bool>,
+    _version: Option<bool>,
 
-    #[arg(long, value_enum)]
-    existing_instance: Option<ExistingInstancePolicy>,
-
-    #[arg(long, value_enum)]
-    service_mode: Option<ServiceMode>,
-
-    #[arg(long, default_value_t = false)]
-    install_systemd: bool,
-
-    #[arg(long, hide = true, default_value_t = false)]
-    daemon_child: bool,
-
-    #[arg(long, hide = true, default_value_t = false)]
+    #[arg(long, hide = true, default_value_t = false, global = true)]
     test_mode: bool,
 
-    #[arg(long, default_value_t = false)]
-    query: bool,
+    #[command(subcommand)]
+    command: Option<ModeCommand>,
+}
+
+fn parse_cli_with_default_mode(raw_args: &[OsString]) -> Cli {
+    if let Some(message) = unknown_command_error(raw_args) {
+        eprintln!("{message}");
+        std::process::exit(2);
+    }
+
+    Cli::parse_from(cli_args_with_default_mode(raw_args))
+}
+
+fn unknown_command_error(raw_args: &[OsString]) -> Option<String> {
+    if contains_global_help_or_version_flag(raw_args) {
+        return None;
+    }
+
+    let command = first_positional_token(raw_args)?;
+    if KNOWN_COMMANDS.contains(&command.as_str()) {
+        return None;
+    }
+
+    let known_commands = KNOWN_COMMANDS.join(", ");
+    let suggestion = find_similar_command(&command);
+
+    Some(match suggestion {
+        Some(similar) => {
+            format!(
+                "unknown command {command}. Did you mean {similar}? Known commands: {known_commands}"
+            )
+        }
+        None => {
+            format!("unknown command {command}. Use one of the known commands: {known_commands}")
+        }
+    })
+}
+
+fn first_positional_token(raw_args: &[OsString]) -> Option<String> {
+    let mut index = 0;
+    while index < raw_args.len() {
+        let token = raw_args[index].to_string_lossy();
+
+        if token == "--" {
+            return raw_args
+                .get(index + 1)
+                .map(|value| value.to_string_lossy().into_owned());
+        }
+
+        if !token.starts_with('-') {
+            return Some(token.into_owned());
+        }
+
+        if option_consumes_separate_value(&token) && !token.contains('=') {
+            index += 1;
+        }
+
+        index += 1;
+    }
+
+    None
+}
+
+fn find_similar_command(input: &str) -> Option<&'static str> {
+    let input_lower = input.to_ascii_lowercase();
+
+    KNOWN_COMMANDS
+        .iter()
+        .copied()
+        .map(|candidate| {
+            let distance = levenshtein_distance(&input_lower, candidate);
+            (candidate, distance)
+        })
+        .min_by_key(|(_, distance)| *distance)
+        .and_then(|(candidate, distance)| {
+            let max_len = input_lower.chars().count().max(candidate.chars().count());
+            let threshold = match max_len {
+                0..=4 => 1,
+                5..=8 => 2,
+                _ => 3,
+            };
+
+            if distance <= threshold {
+                Some(candidate)
+            } else {
+                None
+            }
+        })
+}
+
+fn levenshtein_distance(left: &str, right: &str) -> usize {
+    let left_chars: Vec<char> = left.chars().collect();
+    let right_chars: Vec<char> = right.chars().collect();
+
+    if left_chars.is_empty() {
+        return right_chars.len();
+    }
+    if right_chars.is_empty() {
+        return left_chars.len();
+    }
+
+    let mut previous_row: Vec<usize> = (0..=right_chars.len()).collect();
+    let mut current_row = vec![0; right_chars.len() + 1];
+
+    for (i, left_char) in left_chars.iter().enumerate() {
+        current_row[0] = i + 1;
+
+        for (j, right_char) in right_chars.iter().enumerate() {
+            let substitution_cost = if left_char == right_char { 0 } else { 1 };
+            let delete_cost = previous_row[j + 1] + 1;
+            let insert_cost = current_row[j] + 1;
+            let substitute_cost = previous_row[j] + substitution_cost;
+
+            current_row[j + 1] = delete_cost.min(insert_cost).min(substitute_cost);
+        }
+
+        std::mem::swap(&mut previous_row, &mut current_row);
+    }
+
+    previous_row[right_chars.len()]
+}
+
+fn cli_args_with_default_mode(raw_args: &[OsString]) -> Vec<OsString> {
+    let mut args = Vec::with_capacity(raw_args.len() + 2);
+    args.push(OsString::from("openusage-cli"));
+
+    if should_insert_default_query_mode(raw_args) {
+        args.push(OsString::from("query"));
+    }
+
+    args.extend(raw_args.iter().cloned());
+    args
+}
+
+fn should_insert_default_query_mode(raw_args: &[OsString]) -> bool {
+    if raw_args.is_empty() {
+        return true;
+    }
+
+    if contains_global_help_or_version_flag(raw_args) {
+        return false;
+    }
+
+    !raw_args_contains_positional(raw_args)
+}
+
+fn contains_global_help_or_version_flag(raw_args: &[OsString]) -> bool {
+    raw_args.iter().any(|arg| {
+        matches!(
+            arg.to_string_lossy().as_ref(),
+            "--help" | "-h" | "--version" | "-V"
+        )
+    })
+}
+
+fn raw_args_contains_positional(raw_args: &[OsString]) -> bool {
+    let mut index = 0;
+    while index < raw_args.len() {
+        let token = raw_args[index].to_string_lossy();
+
+        if token == "--" {
+            return raw_args.get(index + 1).is_some();
+        }
+
+        if !token.starts_with('-') {
+            return true;
+        }
+
+        if option_consumes_separate_value(&token) && !token.contains('=') {
+            index += 1;
+        }
+
+        index += 1;
+    }
+
+    false
+}
+
+fn option_consumes_separate_value(option: &str) -> bool {
+    let option_name = option.split('=').next().unwrap_or(option);
+    matches!(
+        option_name,
+        "--host"
+            | "--port"
+            | "--plugins-dir"
+            | "--enabled-plugins"
+            | "--app-data-dir"
+            | "--plugin-overrides-dir"
+            | "--refresh-interval-secs"
+            | "--foreground"
+            | "--existing-instance"
+            | "--service-mode"
+            | "--log-level"
+    )
 }
 
 #[tokio::main]
@@ -114,16 +375,21 @@ async fn main() -> Result<()> {
 
     // Parse CLI args first to handle early-exit commands and resolve log level
     let raw_args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    let cli = Cli::parse();
+    let cli = parse_cli_with_default_mode(&raw_args);
 
     // Handle early-exit commands before logger setup
-    if cli.default_config {
+    if matches!(&cli.command, Some(ModeCommand::ShowDefaultConfig)) {
         print!("{}", config::default_config_template());
         return Ok(());
     }
 
-    if cli.install_systemd {
-        install_user_systemd_unit(&raw_args)?;
+    if matches!(&cli.command, Some(ModeCommand::InstallSystemdUnit)) {
+        install_user_systemd_unit()?;
+        return Ok(());
+    }
+
+    if matches!(&cli.command, Some(ModeCommand::Version)) {
+        println!("{}", APP_VERSION);
         return Ok(());
     }
 
@@ -181,15 +447,15 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
 
     log::info!("starting openusage-cli v{}", app_version);
     log::debug!(
-        "startup options: host={}, port={}, refresh_interval_secs={}, daemon={}, existing_instance={}, service_mode={}, daemon_child={}, query={}, test_mode={}, plugins_dir={:?}, enabled_plugins='{}', app_data_dir={:?}, plugin_overrides_dir={:?}, log_level={}",
+        "startup options: mode={}, foreground={}, host={}, port={}, refresh_interval_secs={}, existing_instance={}, service_mode={}, daemon_child={}, test_mode={}, plugins_dir={:?}, enabled_plugins='{}', app_data_dir={:?}, plugin_overrides_dir={:?}, log_level={}",
+        runtime.mode.as_str(),
+        runtime.foreground,
         runtime.host,
         runtime.port,
         runtime.refresh_interval_secs,
-        runtime.daemon,
         runtime.existing_instance_policy,
         runtime.service_mode,
         runtime.daemon_child,
-        runtime.query,
         runtime.test_mode,
         runtime.plugins_dir,
         runtime.enabled_plugins,
@@ -197,10 +463,6 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
         runtime.plugin_overrides_dir,
         runtime.log_level
     );
-
-    if runtime.query && runtime.daemon && !runtime.daemon_child {
-        log::warn!("query mode enabled; daemon mode is ignored");
-    }
 
     // Resolve app_data_dir early - needed for daemon discovery in test mode
     let app_data_dir = resolve_app_data_dir(runtime.app_data_dir.clone(), runtime.test_mode)
@@ -210,7 +472,7 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
         .then(|| app_data_dir.join(config::RUNTIME_DIR_NAME));
 
     // Query mode: try to connect to an existing daemon first
-    if runtime.query {
+    if runtime.mode == RuntimeMode::Query {
         log::debug!("query mode enabled; attempting to discover running daemon");
 
         if let Some(running_instance) =
@@ -298,7 +560,7 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
 
         let child_pid =
             spawn_daemon_process(raw_args).context("failed to spawn background daemon process")?;
-        log::info!("daemon mode enabled; spawned background process pid={child_pid}");
+        log::info!("run-daemon enabled; spawned background process pid={child_pid}");
         return Ok(());
     }
     log::info!("using app data dir: {}", app_data_dir.display());
@@ -390,7 +652,7 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
         }
     }
 
-    if runtime.query {
+    if runtime.mode == RuntimeMode::Query {
         let snapshots = daemon.cached(None).await;
         let json_output =
             serde_json::to_string(&snapshots).context("failed to serialize query results")?;
@@ -563,8 +825,25 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeMode {
+    Query,
+    RunDaemon,
+}
+
+impl RuntimeMode {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Query => "query",
+            Self::RunDaemon => CMD_RUN_DAEMON,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RuntimeCli {
+    mode: RuntimeMode,
+    foreground: bool,
     host: String,
     port: u16,
     plugins_dir: Option<PathBuf>,
@@ -572,28 +851,44 @@ struct RuntimeCli {
     app_data_dir: Option<PathBuf>,
     plugin_overrides_dir: Option<PathBuf>,
     refresh_interval_secs: u64,
-    daemon: bool,
     existing_instance_policy: ExistingInstancePolicy,
     service_mode: ServiceMode,
     daemon_child: bool,
     test_mode: bool,
-    query: bool,
     log_level: String,
 }
 
 impl RuntimeCli {
     fn from_sources(cli: Cli, env: EnvOverrides, config: config::AppConfig) -> Result<Self> {
+        let Cli {
+            log_level: cli_log_level,
+            _help: _,
+            _version: _,
+            test_mode,
+            command,
+        } = cli;
+        let mode_selection = resolve_runtime_mode_and_args(command)?;
+        let RuntimeModeSelection {
+            mode,
+            runtime_args: mode_args,
+            foreground: mode_foreground,
+            existing_instance: mode_existing_instance,
+            service_mode: mode_service_mode,
+            daemon_child,
+        } = mode_selection;
         let config_existing_instance = config.existing_instance.clone();
-        let host = cli
+        let host = mode_args
             .host
             .or(config.host)
             .unwrap_or_else(|| config::DEFAULT_HOST.to_string());
-        let port = cli.port.or(config.port).unwrap_or(config::DEFAULT_PORT);
-        let refresh_interval_secs = cli
+        let port = mode_args
+            .port
+            .or(config.port)
+            .unwrap_or(config::DEFAULT_PORT);
+        let refresh_interval_secs = mode_args
             .refresh_interval_secs
             .or(config.refresh_interval_secs)
             .unwrap_or(config::DEFAULT_REFRESH_INTERVAL_SECS);
-        let daemon = cli.daemon.or(config.daemon).unwrap_or(false);
         let config_existing_instance_policy = match config_existing_instance {
             Some(value) => Some(
                 ExistingInstancePolicy::parse(&value)
@@ -601,18 +896,17 @@ impl RuntimeCli {
             ),
             None => None,
         };
-        let existing_instance_policy = cli
-            .existing_instance
+        let existing_instance_policy = mode_existing_instance
             .or(config_existing_instance_policy)
             .unwrap_or(ExistingInstancePolicy::Error);
-        let service_mode = cli.service_mode.unwrap_or(ServiceMode::Standalone);
-        let enabled_plugins = cli
+        let foreground = mode_foreground.or(config.foreground).unwrap_or(false);
+        let service_mode = mode_service_mode.unwrap_or(ServiceMode::Standalone);
+        let enabled_plugins = mode_args
             .enabled_plugins
             .or(env.enabled_plugins)
             .or_else(|| config.enabled_plugins.map(|masks| masks.join(",")))
             .unwrap_or_else(|| config::DEFAULT_ENABLED_PLUGINS.to_string());
-        let raw_log_level = cli
-            .log_level
+        let raw_log_level = cli_log_level
             .map(|level| level.as_str().to_string())
             .or(env.log_level)
             .or(config.log_level)
@@ -620,27 +914,72 @@ impl RuntimeCli {
         let log_level = normalize_log_level(raw_log_level)?;
 
         Ok(Self {
+            mode,
+            foreground,
             host,
             port,
-            plugins_dir: cli.plugins_dir.or(env.plugins_dir).or(config.plugins_dir),
+            plugins_dir: mode_args
+                .plugins_dir
+                .or(env.plugins_dir)
+                .or(config.plugins_dir),
             enabled_plugins,
-            app_data_dir: cli
+            app_data_dir: mode_args
                 .app_data_dir
                 .or(env.app_data_dir)
                 .or(config.app_data_dir),
-            plugin_overrides_dir: cli
+            plugin_overrides_dir: mode_args
                 .plugin_overrides_dir
                 .or(env.plugin_overrides_dir)
                 .or(config.plugin_overrides_dir),
             refresh_interval_secs,
-            daemon,
             existing_instance_policy,
             service_mode,
-            daemon_child: cli.daemon_child,
-            test_mode: cli.test_mode,
-            query: cli.query,
+            daemon_child,
+            test_mode,
             log_level,
         })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeModeSelection {
+    mode: RuntimeMode,
+    runtime_args: QueryArgs,
+    foreground: Option<bool>,
+    existing_instance: Option<ExistingInstancePolicy>,
+    service_mode: Option<ServiceMode>,
+    daemon_child: bool,
+}
+
+fn resolve_runtime_mode_and_args(command: Option<ModeCommand>) -> Result<RuntimeModeSelection> {
+    match command {
+        Some(ModeCommand::Query(args)) => Ok(RuntimeModeSelection {
+            mode: RuntimeMode::Query,
+            runtime_args: args,
+            foreground: None,
+            existing_instance: None,
+            service_mode: None,
+            daemon_child: false,
+        }),
+        Some(ModeCommand::RunDaemon(args)) => Ok(RuntimeModeSelection {
+            mode: RuntimeMode::RunDaemon,
+            runtime_args: args.runtime,
+            foreground: args.foreground,
+            existing_instance: args.existing_instance,
+            service_mode: args.service_mode,
+            daemon_child: args.daemon_child,
+        }),
+        None => Ok(RuntimeModeSelection {
+            mode: RuntimeMode::Query,
+            runtime_args: QueryArgs::default(),
+            foreground: None,
+            existing_instance: None,
+            service_mode: None,
+            daemon_child: false,
+        }),
+        Some(
+            ModeCommand::ShowDefaultConfig | ModeCommand::InstallSystemdUnit | ModeCommand::Version,
+        ) => anyhow::bail!("internal error: non-runtime command reached runtime option resolver"),
     }
 }
 
@@ -989,7 +1328,7 @@ async fn run_past_reset_retry_loop(
 }
 
 fn should_spawn_daemon_parent(runtime: &RuntimeCli) -> bool {
-    runtime.daemon && !runtime.daemon_child && !runtime.query
+    runtime.mode == RuntimeMode::RunDaemon && !runtime.daemon_child && !runtime.foreground
 }
 
 async fn shutdown_signal() {
@@ -1087,12 +1426,7 @@ fn strip_flags_for_daemon_child(raw_args: &[OsString]) -> Vec<OsString> {
         .iter()
         .filter_map(|arg| {
             let value = arg.to_string_lossy();
-            if value == "--daemon"
-                || value.starts_with("--daemon=")
-                || value == "--daemon-child"
-                || value == "--install-systemd"
-                || value.starts_with("--install-systemd=")
-            {
+            if value == "--daemon-child" {
                 None
             } else {
                 Some(arg.clone())
@@ -1101,10 +1435,10 @@ fn strip_flags_for_daemon_child(raw_args: &[OsString]) -> Vec<OsString> {
         .collect()
 }
 
-fn install_user_systemd_unit(_raw_args: &[OsString]) -> Result<()> {
+fn install_user_systemd_unit() -> Result<()> {
     #[cfg(not(target_os = "linux"))]
     {
-        anyhow::bail!("--install-systemd is supported only on Linux");
+        anyhow::bail!("'install-systemd-unit' command is supported only on Linux");
     }
 
     #[cfg(target_os = "linux")]
@@ -1179,7 +1513,8 @@ fn quote_systemd_argument(value: &OsStr) -> String {
 fn systemd_exec_start(executable: &OsStr) -> String {
     [
         quote_systemd_argument(executable),
-        "--daemon=false".to_string(),
+        CMD_RUN_DAEMON.to_string(),
+        "--foreground=true".to_string(),
         "--service-mode=systemd".to_string(),
         "--log-level=info".to_string(),
     ]
@@ -1353,98 +1688,456 @@ mod tests {
 
     fn empty_cli() -> Cli {
         Cli {
-            host: None,
-            port: None,
-            plugins_dir: None,
-            enabled_plugins: None,
-            app_data_dir: None,
-            plugin_overrides_dir: None,
-            refresh_interval_secs: None,
             log_level: None,
-            default_config: false,
-            daemon: None,
-            existing_instance: None,
-            service_mode: None,
-            install_systemd: false,
-            daemon_child: false,
+            _help: None,
+            _version: None,
             test_mode: false,
-            query: false,
+            command: Some(ModeCommand::Query(QueryArgs::default())),
         }
     }
 
+    fn cli_without_mode() -> Cli {
+        Cli {
+            command: None,
+            ..empty_cli()
+        }
+    }
+
+    fn parse_with_default_mode(args: &[&str]) -> std::result::Result<Cli, clap::Error> {
+        let raw_args: Vec<OsString> = args.iter().map(OsString::from).collect();
+        Cli::try_parse_from(cli_args_with_default_mode(&raw_args))
+    }
+
+    fn render_help_text(args: &[&str]) -> String {
+        let err = parse_with_default_mode(args).expect_err("help flag should trigger help output");
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+        err.to_string()
+    }
+
+    fn render_root_help() -> String {
+        render_help_text(&["--help"])
+    }
+
+    fn render_mode_help(mode: &str) -> String {
+        render_help_text(&[mode, "--help"])
+    }
+
     #[test]
-    fn cli_accepts_default_config_flag() {
-        let cli = Cli::try_parse_from(["openusage-cli", "--default-config"])
-            .expect("--default-config should parse");
-        assert!(cli.default_config);
+    fn cli_accepts_show_default_config_command() {
+        let cli = parse_with_default_mode(&["show-default-config"])
+            .expect("show-default-config should parse");
+        assert!(matches!(cli.command, Some(ModeCommand::ShowDefaultConfig)));
     }
 
     #[test]
     fn cli_rejects_legacy_init_config_flag() {
-        let err = Cli::try_parse_from(["openusage-cli", "--init-config"])
+        let err = parse_with_default_mode(&["--init-config"])
             .expect_err("--init-config must be rejected");
         assert!(err.to_string().contains("--init-config"));
     }
 
     #[test]
-    fn cli_accepts_install_systemd_flag() {
-        let cli = Cli::try_parse_from(["openusage-cli", "--install-systemd"])
-            .expect("--install-systemd should parse");
-        assert!(cli.install_systemd);
+    fn cli_accepts_install_systemd_unit_command() {
+        let cli = parse_with_default_mode(&["install-systemd-unit"])
+            .expect("install-systemd-unit should parse");
+        assert!(matches!(cli.command, Some(ModeCommand::InstallSystemdUnit)));
     }
 
     #[test]
-    fn cli_accepts_daemon_without_value_as_true() {
-        let cli =
-            Cli::try_parse_from(["openusage-cli", "--daemon"]).expect("--daemon should parse");
-        assert_eq!(cli.daemon, Some(true));
+    fn cli_accepts_run_daemon_command() {
+        let cli = parse_with_default_mode(&["run-daemon"]).expect("run-daemon should parse");
+        assert!(matches!(cli.command, Some(ModeCommand::RunDaemon(_))));
     }
 
     #[test]
-    fn cli_accepts_daemon_false_value() {
-        let cli = Cli::try_parse_from(["openusage-cli", "--daemon=false"])
-            .expect("--daemon=false should parse");
-        assert_eq!(cli.daemon, Some(false));
+    fn cli_accepts_run_daemon_foreground_flag_without_value() {
+        let cli = parse_with_default_mode(&["run-daemon", "--foreground"])
+            .expect("run-daemon --foreground should parse");
+        let run_args = match cli.command {
+            Some(ModeCommand::RunDaemon(args)) => args,
+            _ => panic!("expected run-daemon command"),
+        };
+        assert_eq!(run_args.foreground, Some(true));
     }
 
     #[test]
-    fn cli_accepts_existing_instance_policy_flag() {
-        let cli = Cli::try_parse_from(["openusage-cli", "--existing-instance", "replace"])
-            .expect("--existing-instance should parse");
-        assert_eq!(cli.existing_instance, Some(ExistingInstancePolicy::Replace));
+    fn cli_accepts_run_daemon_foreground_flag_with_explicit_value() {
+        let cli = parse_with_default_mode(&["run-daemon", "--foreground", "false"])
+            .expect("run-daemon --foreground false should parse");
+        let run_args = match cli.command {
+            Some(ModeCommand::RunDaemon(args)) => args,
+            _ => panic!("expected run-daemon command"),
+        };
+        assert_eq!(run_args.foreground, Some(false));
+
+        let cli = parse_with_default_mode(&["run-daemon", "--foreground=true"])
+            .expect("run-daemon --foreground=true should parse");
+        let run_args = match cli.command {
+            Some(ModeCommand::RunDaemon(args)) => args,
+            _ => panic!("expected run-daemon command"),
+        };
+        assert_eq!(run_args.foreground, Some(true));
     }
 
     #[test]
-    fn cli_accepts_service_mode_flag() {
-        let cli = Cli::try_parse_from(["openusage-cli", "--service-mode", "systemd"])
-            .expect("--service-mode should parse");
-        assert_eq!(cli.service_mode, Some(ServiceMode::Systemd));
+    fn cli_rejects_run_deamon_alias() {
+        let err = parse_with_default_mode(&["run-deamon"])
+            .expect_err("run-deamon alias should not be supported");
+        assert!(err.to_string().contains("run-deamon"));
+    }
+
+    #[test]
+    fn cli_defaults_to_query_mode_when_mode_is_not_specified() {
+        let cli = parse_with_default_mode(&["--host", "127.0.0.2", "--port", "7001"])
+            .expect("flags without mode should parse as query mode");
+
+        let query_args = match cli.command {
+            Some(ModeCommand::Query(args)) => args,
+            _ => panic!("expected query mode by default"),
+        };
+        assert_eq!(query_args.host.as_deref(), Some("127.0.0.2"));
+        assert_eq!(query_args.port, Some(7001));
+    }
+
+    #[test]
+    fn cli_accepts_query_command() {
+        let cli = parse_with_default_mode(&["query", "--host", "127.0.0.1"])
+            .expect("query command should parse");
+        let query_args = match cli.command {
+            Some(ModeCommand::Query(args)) => args,
+            _ => panic!("expected query command"),
+        };
+        assert_eq!(query_args.host.as_deref(), Some("127.0.0.1"));
+    }
+
+    #[test]
+    fn cli_accepts_query_value_options_with_equals_syntax() {
+        let cli = parse_with_default_mode(&[
+            "query",
+            "--host=127.0.0.1",
+            "--port=7001",
+            "--plugins-dir=/tmp/plugins-eq",
+            "--enabled-plugins=mock,codex",
+            "--app-data-dir=/tmp/data-eq",
+            "--plugin-overrides-dir=/tmp/overrides-eq",
+            "--refresh-interval-secs=11",
+            "--log-level=debug",
+        ])
+        .expect("query options with equals syntax should parse");
+        let log_level = cli.log_level;
+
+        let query_args = match cli.command {
+            Some(ModeCommand::Query(args)) => args,
+            _ => panic!("expected query command"),
+        };
+
+        assert_eq!(query_args.host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(query_args.port, Some(7001));
+        assert_eq!(
+            query_args.plugins_dir,
+            Some(PathBuf::from("/tmp/plugins-eq"))
+        );
+        assert_eq!(query_args.enabled_plugins.as_deref(), Some("mock,codex"));
+        assert_eq!(query_args.app_data_dir, Some(PathBuf::from("/tmp/data-eq")));
+        assert_eq!(
+            query_args.plugin_overrides_dir,
+            Some(PathBuf::from("/tmp/overrides-eq"))
+        );
+        assert_eq!(query_args.refresh_interval_secs, Some(11));
+        assert!(matches!(log_level, Some(LogLevel::Debug)));
+    }
+
+    #[test]
+    fn cli_accepts_query_value_options_with_space_syntax() {
+        let cli = parse_with_default_mode(&[
+            "query",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "7001",
+            "--plugins-dir",
+            "/tmp/plugins-space",
+            "--enabled-plugins",
+            "mock,codex",
+            "--app-data-dir",
+            "/tmp/data-space",
+            "--plugin-overrides-dir",
+            "/tmp/overrides-space",
+            "--refresh-interval-secs",
+            "11",
+            "--log-level",
+            "debug",
+        ])
+        .expect("query options with space syntax should parse");
+        let log_level = cli.log_level;
+
+        let query_args = match cli.command {
+            Some(ModeCommand::Query(args)) => args,
+            _ => panic!("expected query command"),
+        };
+
+        assert_eq!(query_args.host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(query_args.port, Some(7001));
+        assert_eq!(
+            query_args.plugins_dir,
+            Some(PathBuf::from("/tmp/plugins-space"))
+        );
+        assert_eq!(query_args.enabled_plugins.as_deref(), Some("mock,codex"));
+        assert_eq!(
+            query_args.app_data_dir,
+            Some(PathBuf::from("/tmp/data-space"))
+        );
+        assert_eq!(
+            query_args.plugin_overrides_dir,
+            Some(PathBuf::from("/tmp/overrides-space"))
+        );
+        assert_eq!(query_args.refresh_interval_secs, Some(11));
+        assert!(matches!(log_level, Some(LogLevel::Debug)));
+    }
+
+    #[test]
+    fn cli_accepts_run_daemon_value_options_with_equals_syntax() {
+        let cli = parse_with_default_mode(&[
+            "run-daemon",
+            "--host=127.0.0.1",
+            "--port=7001",
+            "--plugins-dir=/tmp/plugins-daemon-eq",
+            "--enabled-plugins=mock",
+            "--app-data-dir=/tmp/data-daemon-eq",
+            "--plugin-overrides-dir=/tmp/overrides-daemon-eq",
+            "--refresh-interval-secs=17",
+            "--foreground=false",
+            "--existing-instance=replace",
+            "--service-mode=systemd",
+            "--log-level=trace",
+        ])
+        .expect("run-daemon options with equals syntax should parse");
+        let log_level = cli.log_level;
+
+        let run_args = match cli.command {
+            Some(ModeCommand::RunDaemon(args)) => args,
+            _ => panic!("expected run-daemon command"),
+        };
+
+        assert_eq!(run_args.runtime.host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(run_args.runtime.port, Some(7001));
+        assert_eq!(
+            run_args.runtime.plugins_dir,
+            Some(PathBuf::from("/tmp/plugins-daemon-eq"))
+        );
+        assert_eq!(run_args.runtime.enabled_plugins.as_deref(), Some("mock"));
+        assert_eq!(
+            run_args.runtime.app_data_dir,
+            Some(PathBuf::from("/tmp/data-daemon-eq"))
+        );
+        assert_eq!(
+            run_args.runtime.plugin_overrides_dir,
+            Some(PathBuf::from("/tmp/overrides-daemon-eq"))
+        );
+        assert_eq!(run_args.runtime.refresh_interval_secs, Some(17));
+        assert_eq!(run_args.foreground, Some(false));
+        assert!(matches!(
+            run_args.existing_instance,
+            Some(ExistingInstancePolicy::Replace)
+        ));
+        assert!(matches!(run_args.service_mode, Some(ServiceMode::Systemd)));
+        assert!(matches!(log_level, Some(LogLevel::Trace)));
+    }
+
+    #[test]
+    fn cli_accepts_run_daemon_value_options_with_space_syntax() {
+        let cli = parse_with_default_mode(&[
+            "run-daemon",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "7001",
+            "--plugins-dir",
+            "/tmp/plugins-daemon-space",
+            "--enabled-plugins",
+            "mock",
+            "--app-data-dir",
+            "/tmp/data-daemon-space",
+            "--plugin-overrides-dir",
+            "/tmp/overrides-daemon-space",
+            "--refresh-interval-secs",
+            "17",
+            "--foreground",
+            "false",
+            "--existing-instance",
+            "replace",
+            "--service-mode",
+            "systemd",
+            "--log-level",
+            "trace",
+        ])
+        .expect("run-daemon options with space syntax should parse");
+        let log_level = cli.log_level;
+
+        let run_args = match cli.command {
+            Some(ModeCommand::RunDaemon(args)) => args,
+            _ => panic!("expected run-daemon command"),
+        };
+
+        assert_eq!(run_args.runtime.host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(run_args.runtime.port, Some(7001));
+        assert_eq!(
+            run_args.runtime.plugins_dir,
+            Some(PathBuf::from("/tmp/plugins-daemon-space"))
+        );
+        assert_eq!(run_args.runtime.enabled_plugins.as_deref(), Some("mock"));
+        assert_eq!(
+            run_args.runtime.app_data_dir,
+            Some(PathBuf::from("/tmp/data-daemon-space"))
+        );
+        assert_eq!(
+            run_args.runtime.plugin_overrides_dir,
+            Some(PathBuf::from("/tmp/overrides-daemon-space"))
+        );
+        assert_eq!(run_args.runtime.refresh_interval_secs, Some(17));
+        assert_eq!(run_args.foreground, Some(false));
+        assert!(matches!(
+            run_args.existing_instance,
+            Some(ExistingInstancePolicy::Replace)
+        ));
+        assert!(matches!(run_args.service_mode, Some(ServiceMode::Systemd)));
+        assert!(matches!(log_level, Some(LogLevel::Trace)));
+    }
+
+    #[test]
+    fn unknown_command_error_suggests_similar_command() {
+        let raw_args = vec![OsString::from("run-damon")];
+        let error = unknown_command_error(&raw_args).expect("must return unknown command error");
+
+        assert!(error.contains("Did you mean run-daemon?"));
+        assert!(error.contains("run-daemon"));
+        assert!(error.contains("query"));
+    }
+
+    #[test]
+    fn unknown_command_error_without_suggestion_lists_known_commands() {
+        let raw_args = vec![OsString::from("abracadabra")];
+        let error = unknown_command_error(&raw_args).expect("must return unknown command error");
+
+        assert!(error.contains("unknown command abracadabra"));
+        assert!(error.contains("run-daemon"));
+        assert!(error.contains("install-systemd-unit"));
+    }
+
+    #[test]
+    fn unknown_command_error_ignores_known_commands() {
+        let raw_args = vec![OsString::from("query")];
+        assert!(unknown_command_error(&raw_args).is_none());
+    }
+
+    #[test]
+    fn unknown_command_error_ignores_flag_only_inputs() {
+        let raw_args = vec![OsString::from("--host"), OsString::from("127.0.0.1")];
+        assert!(unknown_command_error(&raw_args).is_none());
+    }
+
+    #[test]
+    fn unknown_command_error_ignores_inputs_with_help_flag() {
+        let raw_args = vec![OsString::from("--help"), OsString::from("abracadabra")];
+        assert!(unknown_command_error(&raw_args).is_none());
+    }
+
+    #[test]
+    fn unknown_command_error_ignores_inputs_with_version_flag() {
+        let raw_args = vec![OsString::from("--version"), OsString::from("abracadabra")];
+        assert!(unknown_command_error(&raw_args).is_none());
     }
 
     #[test]
     fn cli_accepts_hidden_test_mode_flag() {
-        let cli = Cli::try_parse_from(["openusage-cli", "--test-mode"])
-            .expect("--test-mode should parse");
+        let cli =
+            parse_with_default_mode(&["query", "--test-mode"]).expect("--test-mode should parse");
         assert!(cli.test_mode);
     }
 
     #[test]
-    fn cli_accepts_query_flag() {
-        let cli = Cli::try_parse_from(["openusage-cli", "--query"]).expect("--query should parse");
-        assert!(cli.query);
+    fn cli_rejects_run_daemon_only_flags_in_query_mode() {
+        let err = parse_with_default_mode(&["query", "--existing-instance", "replace"])
+            .expect_err("query mode must reject run-daemon-only flags");
+        assert!(err.to_string().contains("--existing-instance"));
+    }
+
+    #[test]
+    fn cli_rejects_query_runtime_flags_for_install_command() {
+        let err = parse_with_default_mode(&["install-systemd-unit", "--host", "127.0.0.1"])
+            .expect_err("install-systemd-unit must reject query flags");
+        assert!(err.to_string().contains("--host"));
     }
 
     #[test]
     fn cli_rejects_invalid_log_level_value() {
-        let err = Cli::try_parse_from(["openusage-cli", "--log-level", "inof"])
+        let err = parse_with_default_mode(&["query", "--log-level", "inof"])
             .expect_err("invalid log level must be rejected");
         assert!(err.to_string().contains("--log-level"));
     }
 
     #[test]
+    fn cli_accepts_version_command() {
+        let cli = parse_with_default_mode(&["version"]).expect("version command should parse");
+        assert!(matches!(cli.command, Some(ModeCommand::Version)));
+    }
+
+    #[test]
+    fn query_help_shows_mode_options_before_global_options() {
+        let help = render_mode_help("query");
+        let mode_block = help
+            .find("Mode options:")
+            .expect("query help must include mode options block");
+        let global_block = help
+            .find("Global options:")
+            .expect("query help must include global options block");
+
+        assert!(mode_block < global_block);
+        assert!(help.contains("--host <HOST>"));
+        assert!(help.contains("--port <PORT>"));
+        assert!(help.contains("--log-level <LOG_LEVEL>"));
+        assert!(help.contains("-h, --help"));
+        assert!(help.contains("-V, --version"));
+        assert!(!help.contains("--existing-instance"));
+    }
+
+    #[test]
+    fn run_daemon_help_shows_mode_options_before_global_options() {
+        let help = render_mode_help(CMD_RUN_DAEMON);
+        let mode_block = help
+            .find("Mode options:")
+            .expect("run-daemon help must include mode options block");
+        let global_block = help
+            .find("Global options:")
+            .expect("run-daemon help must include global options block");
+
+        assert!(mode_block < global_block);
+        assert!(help.contains("--foreground"));
+        assert!(help.contains("--existing-instance <EXISTING_INSTANCE>"));
+        assert!(help.contains("--service-mode <SERVICE_MODE>"));
+        assert!(help.contains("--log-level <LOG_LEVEL>"));
+        assert!(help.contains("-h, --help"));
+        assert!(help.contains("-V, --version"));
+    }
+
+    #[test]
+    fn global_options_block_is_consistent_for_root_and_modes() {
+        let root_help = render_root_help();
+        let query_help = render_mode_help("query");
+        let daemon_help = render_mode_help(CMD_RUN_DAEMON);
+
+        for help in [root_help, query_help, daemon_help] {
+            assert!(help.contains("Global options:"));
+            assert!(help.contains("--log-level <LOG_LEVEL>"));
+            assert!(help.contains("-h, --help"));
+            assert!(help.contains("-V, --version"));
+        }
+    }
+
+    #[test]
     fn runtime_cli_uses_defaults_when_no_input_values() {
         let runtime = RuntimeCli::from_sources(
-            empty_cli(),
+            cli_without_mode(),
             EnvOverrides::default(),
             config::AppConfig::default(),
         )
@@ -1458,13 +2151,13 @@ mod tests {
         );
         assert_eq!(runtime.enabled_plugins, config::DEFAULT_ENABLED_PLUGINS);
         assert_eq!(runtime.log_level, config::DEFAULT_LOG_LEVEL);
-        assert!(!runtime.daemon);
+        assert_eq!(runtime.mode, RuntimeMode::Query);
+        assert!(!runtime.foreground);
         assert_eq!(
             runtime.existing_instance_policy,
             ExistingInstancePolicy::Error
         );
         assert_eq!(runtime.service_mode, ServiceMode::Standalone);
-        assert!(!runtime.query);
     }
 
     #[test]
@@ -1477,7 +2170,7 @@ mod tests {
             app_data_dir: Some(PathBuf::from("/tmp/data")),
             plugin_overrides_dir: Some(PathBuf::from("/tmp/overrides")),
             refresh_interval_secs: Some(42),
-            daemon: Some(true),
+            foreground: Some(true),
             existing_instance: Some("ignore".to_string()),
             log_level: Some("debug".to_string()),
             proxy: None,
@@ -1496,7 +2189,8 @@ mod tests {
         );
         assert_eq!(runtime.refresh_interval_secs, 42);
         assert_eq!(runtime.log_level, "debug");
-        assert!(runtime.daemon);
+        assert_eq!(runtime.mode, RuntimeMode::Query);
+        assert!(runtime.foreground);
         assert_eq!(
             runtime.existing_instance_policy,
             ExistingInstancePolicy::Ignore
@@ -1506,22 +2200,25 @@ mod tests {
     #[test]
     fn runtime_cli_prioritizes_cli_values_over_config() {
         let cli = Cli {
-            host: Some("127.0.0.2".to_string()),
-            port: Some(7001),
-            plugins_dir: Some(PathBuf::from("/cli/plugins")),
-            enabled_plugins: Some("mock".to_string()),
-            app_data_dir: Some(PathBuf::from("/cli/data")),
-            plugin_overrides_dir: Some(PathBuf::from("/cli/overrides")),
-            refresh_interval_secs: Some(7),
             log_level: Some(LogLevel::Trace),
-            default_config: false,
-            daemon: Some(true),
-            existing_instance: Some(ExistingInstancePolicy::Replace),
-            service_mode: Some(ServiceMode::Systemd),
-            install_systemd: false,
-            daemon_child: false,
+            _help: None,
+            _version: None,
             test_mode: false,
-            query: false,
+            command: Some(ModeCommand::RunDaemon(RunDaemonArgs {
+                runtime: QueryArgs {
+                    host: Some("127.0.0.2".to_string()),
+                    port: Some(7001),
+                    plugins_dir: Some(PathBuf::from("/cli/plugins")),
+                    enabled_plugins: Some("mock".to_string()),
+                    app_data_dir: Some(PathBuf::from("/cli/data")),
+                    plugin_overrides_dir: Some(PathBuf::from("/cli/overrides")),
+                    refresh_interval_secs: Some(7),
+                },
+                foreground: Some(true),
+                existing_instance: Some(ExistingInstancePolicy::Replace),
+                service_mode: Some(ServiceMode::Systemd),
+                daemon_child: false,
+            })),
         };
         let app_config = config::AppConfig {
             host: Some("0.0.0.0".to_string()),
@@ -1531,7 +2228,7 @@ mod tests {
             app_data_dir: Some(PathBuf::from("/cfg/data")),
             plugin_overrides_dir: Some(PathBuf::from("/cfg/overrides")),
             refresh_interval_secs: Some(60),
-            daemon: Some(false),
+            foreground: Some(false),
             existing_instance: Some("error".to_string()),
             log_level: Some("debug".to_string()),
             proxy: None,
@@ -1551,7 +2248,8 @@ mod tests {
         );
         assert_eq!(runtime.refresh_interval_secs, 7);
         assert_eq!(runtime.log_level, "trace");
-        assert!(runtime.daemon);
+        assert_eq!(runtime.mode, RuntimeMode::RunDaemon);
+        assert!(runtime.foreground);
         assert_eq!(
             runtime.existing_instance_policy,
             ExistingInstancePolicy::Replace
@@ -1560,34 +2258,37 @@ mod tests {
     }
 
     #[test]
-    fn runtime_cli_daemon_false_overrides_config_true() {
-        let cli = Cli {
-            daemon: Some(false),
-            ..empty_cli()
-        };
-        let app_config = config::AppConfig {
-            daemon: Some(true),
-            ..config::AppConfig::default()
-        };
+    fn runtime_cli_defaults_to_query_mode_without_explicit_command() {
+        let runtime = RuntimeCli::from_sources(
+            cli_without_mode(),
+            EnvOverrides::default(),
+            config::AppConfig::default(),
+        )
+        .expect("runtime mode should resolve");
 
-        let runtime = RuntimeCli::from_sources(cli, EnvOverrides::default(), app_config)
-            .expect("runtime daemon value should resolve");
-
-        assert!(!runtime.daemon);
+        assert_eq!(runtime.mode, RuntimeMode::Query);
     }
 
     #[test]
-    fn runtime_cli_preserves_query_flag() {
+    fn runtime_cli_uses_run_daemon_mode_when_selected() {
         let cli = Cli {
-            query: true,
+            _help: None,
+            _version: None,
+            command: Some(ModeCommand::RunDaemon(RunDaemonArgs {
+                runtime: QueryArgs::default(),
+                foreground: None,
+                existing_instance: None,
+                service_mode: None,
+                daemon_child: false,
+            })),
             ..empty_cli()
         };
 
         let runtime =
             RuntimeCli::from_sources(cli, EnvOverrides::default(), config::AppConfig::default())
-                .expect("runtime query value should resolve");
+                .expect("runtime mode should resolve");
 
-        assert!(runtime.query);
+        assert_eq!(runtime.mode, RuntimeMode::RunDaemon);
     }
 
     #[test]
@@ -1603,7 +2304,7 @@ mod tests {
     }
 
     #[test]
-    fn should_spawn_daemon_parent_respects_query_mode() {
+    fn should_spawn_daemon_parent_respects_mode_and_foreground() {
         let mut runtime = RuntimeCli::from_sources(
             empty_cli(),
             EnvOverrides::default(),
@@ -1611,15 +2312,19 @@ mod tests {
         )
         .expect("runtime values should resolve");
 
-        runtime.daemon = true;
+        runtime.mode = RuntimeMode::RunDaemon;
         runtime.daemon_child = false;
-        runtime.query = false;
+        runtime.foreground = false;
         assert!(should_spawn_daemon_parent(&runtime));
 
-        runtime.query = true;
+        runtime.foreground = true;
+        assert!(!should_spawn_daemon_parent(&runtime));
+        runtime.foreground = false;
+
+        runtime.mode = RuntimeMode::Query;
         assert!(!should_spawn_daemon_parent(&runtime));
 
-        runtime.query = false;
+        runtime.mode = RuntimeMode::RunDaemon;
         runtime.daemon_child = true;
         assert!(!should_spawn_daemon_parent(&runtime));
     }
@@ -1747,17 +2452,17 @@ mod tests {
     #[test]
     fn strip_flags_for_daemon_child_removes_internal_flags() {
         let args = vec![
+            OsString::from(CMD_RUN_DAEMON),
             OsString::from("--host"),
             OsString::from("127.0.0.1"),
-            OsString::from("--daemon"),
             OsString::from("--daemon-child"),
-            OsString::from("--install-systemd"),
             OsString::from("--port=6737"),
         ];
 
         assert_eq!(
             strip_flags_for_daemon_child(&args),
             vec![
+                OsString::from(CMD_RUN_DAEMON),
                 OsString::from("--host"),
                 OsString::from("127.0.0.1"),
                 OsString::from("--port=6737"),
@@ -1766,10 +2471,10 @@ mod tests {
     }
 
     #[test]
-    fn systemd_exec_start_always_uses_daemon_false_and_log_level_info() {
+    fn systemd_exec_start_always_uses_foreground_mode_and_log_level_info() {
         assert_eq!(
             systemd_exec_start(OsStr::new("/usr/bin/openusage-cli")),
-            "/usr/bin/openusage-cli --daemon=false --service-mode=systemd --log-level=info"
+            "/usr/bin/openusage-cli run-daemon --foreground=true --service-mode=systemd --log-level=info"
         );
     }
 

@@ -35,12 +35,31 @@ This allows using upstream plugins with minimal or zero changes.
 ## Run
 
 ```bash
+openusage-cli query --host 127.0.0.1 --port 0
+```
+
+If mode is omitted, `query` is used by default, so this is equivalent:
+
+```bash
 openusage-cli --host 127.0.0.1 --port 0
 ```
 
 Default bind port is `0` (random free port assigned by OS).
 
-CLI options:
+Commands:
+
+- `query` (default mode; one-shot JSON output, tries running daemon first)
+- `run-daemon` (start daemon mode; defaults to background process + parent exit)
+- `show-default-config` (print default `config.yaml` template to stdout)
+- `install-systemd-unit` (create `~/.config/systemd/user/openusage-cli.service`)
+- `version` (print version)
+- `help` (print help)
+
+Global flags (work with any command):
+
+- `--log-level <error|warn|info|debug|trace>`
+
+Runtime flags (`query`, `run-daemon`):
 
 - `--plugins-dir <path>` (or `OPENUSAGE_PLUGINS_DIR`)
 - `--enabled-plugins <csv-globs>` (or `OPENUSAGE_ENABLED_PLUGINS`, default: `*`)
@@ -48,11 +67,13 @@ CLI options:
 - `--app-data-dir <path>` (or `OPENUSAGE_APP_DATA_DIR`)
 - `--plugin-overrides-dir <path>` (or `OPENUSAGE_PLUGIN_OVERRIDES_DIR`)
 - `--refresh-interval-secs <seconds>` (default: `300`)
-- `--default-config` (print default `config.yaml` template to stdout and exit)
-- `--daemon[=true|false]` (when enabled, spawn background process and exit parent; default value for bare flag is `true`)
+
+`run-daemon`-only flags:
+
 - `--existing-instance <error|ignore|replace>` (default: `error`; controls behavior when a running daemon is already discovered)
 - `--service-mode <standalone|systemd>` (default: `standalone`; mainly for service managers)
-- `--install-systemd` (create `~/.config/systemd/user/openusage-cli.service` for current user with `ExecStart=... --daemon=false --service-mode=systemd`)
+- `--foreground[=true|false]` (optional value; `--foreground` means `true`; default: `false`)
+- `--daemon-child` (internal hidden flag used by process managers)
 
 Default plugin auto-discovery order (when `--plugins-dir` is not set):
 
@@ -70,7 +91,7 @@ When running as an installed binary (Linux/FHS layout):
 1. `<prefix>/share/openusage-cli/openusage-plugins` (derived from executable path, e.g. `/usr/bin` -> `/usr/share`)
 2. `/usr/share/openusage-cli/openusage-plugins`
 
-By default, the app runs in console mode and logs to stdout/stderr. Stop it with `Ctrl+C`.
+`run-daemon --foreground` keeps the daemon in foreground (useful for service managers or local debugging).
 
 ## Daemon Discovery File
 
@@ -108,7 +129,7 @@ Recommended client flow:
 - To print a full default config template with comments, run:
 
 ```bash
-openusage-cli --default-config
+openusage-cli show-default-config
 ```
 
 ## Plugin Overrides (without editing `vendor/*`)

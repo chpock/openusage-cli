@@ -1,4 +1,4 @@
-.PHONY: help build test ci-compact run run-daemon deb rpm packages release-tag clean
+.PHONY: help build test ci-compact query run-daemon deb rpm packages release-tag clean
 
 CARGO ?= cargo
 HOST ?= 127.0.0.1
@@ -26,7 +26,7 @@ help:
 	@printf "  make build        Build binary (debug)\n"
 	@printf "  make test         Run full test suite\n"
 	@printf "  make ci-compact   Run CI parity with compact output\n"
-	@printf "  make run          Run daemon locally\n"
+	@printf "  make query        Run one-shot query mode\n"
 	@printf "  make run-daemon   Run daemon in background\n"
 	@printf "  make deb          Build .deb package (cargo-deb)\n"
 	@printf "  make rpm          Build .rpm package (cargo-generate-rpm)\n"
@@ -67,11 +67,11 @@ ci-compact:
 	run_step build $(CARGO) build --locked $(CI_VERBOSE_FLAG); \
 	run_step test $(CARGO) test --locked $(CI_VERBOSE_FLAG)
 
-run:
-	$(CARGO) run -- $(RUN_ARGS) --existing-instance=$(RUN_EXISTING_INSTANCE_POLICY)
+query:
+	$(CARGO) run -- query $(RUN_ARGS)
 
 run-daemon:
-	$(CARGO) run -- $(RUN_ARGS) --daemon --existing-instance=$(RUN_EXISTING_INSTANCE_POLICY)
+	$(CARGO) run -- run-daemon $(RUN_ARGS) --existing-instance=$(RUN_EXISTING_INSTANCE_POLICY)
 
 deb:
 	$(CARGO) deb
