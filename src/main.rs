@@ -5,7 +5,7 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use openusage_cli::config;
 use openusage_cli::daemon::{CachedPluginSnapshot, DaemonState};
 use openusage_cli::discovery::{PublishedDiscovery, discover_daemon_endpoint_with_override};
-use openusage_cli::http_api::{self, ApiState};
+use openusage_cli::http_api::{self, ApiState, RuntimeConfig};
 use openusage_cli::plugin_engine::manifest;
 use openusage_cli::plugin_engine::runtime::MetricLine;
 use std::ffi::{OsStr, OsString};
@@ -244,7 +244,7 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
     })?;
     log::debug!("ensured app data directory exists");
 
-    let plugins_dir = resolve_plugins_dir(runtime.plugins_dir, runtime.test_mode)
+    let plugins_dir = resolve_plugins_dir(runtime.plugins_dir.clone(), runtime.test_mode)
         .context("failed to resolve plugins directory")?;
     log::info!("using plugins dir: {}", plugins_dir.display());
     let loaded_plugins = manifest::load_plugins_from_dir(&plugins_dir);
@@ -297,7 +297,7 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
     log::debug!("enabled plugin ids: {:?}", plugin_ids);
 
     let plugin_overrides_dir =
-        resolve_plugin_overrides_dir(runtime.plugin_overrides_dir, runtime.test_mode)
+        resolve_plugin_overrides_dir(runtime.plugin_overrides_dir.clone(), runtime.test_mode)
             .context("failed to resolve plugin overrides directory")?;
     if let Some(path) = &plugin_overrides_dir {
         log::info!("using plugin overrides dir: {}", path.display());
@@ -311,9 +311,9 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
 
     let daemon = Arc::new(DaemonState::new(
         plugins,
-        app_data_dir,
+        app_data_dir.clone(),
         app_version.clone(),
-        plugin_overrides_dir,
+        plugin_overrides_dir.clone(),
     ));
 
     log::info!("running initial plugin refresh");
@@ -430,19 +430,47 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
         discovery.endpoint_file().display()
     );
 
+    // Create shutdown channel for graceful shutdown via HTTP API
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let shutdown_tx = Arc::new(tokio::sync::Mutex::new(Some(shutdown_tx)));
+
+    let runtime_config = RuntimeConfig {
+        app_version: app_version.clone(),
+        host: runtime.host.clone(),
+        port: bound_addr.port(),
+        plugins_dir: Some(plugins_dir.clone()),
+        enabled_plugins: runtime.enabled_plugins.clone(),
+        app_data_dir: Some(app_data_dir.clone()),
+        plugin_overrides_dir: plugin_overrides_dir.clone(),
+        refresh_interval_secs: runtime.refresh_interval_secs,
+        log_level: runtime.log_level.clone(),
+    };
+
     let app = http_api::router(ApiState {
         daemon,
         app_version,
+        config: runtime_config,
+        shutdown_tx: Some(shutdown_tx),
     });
     log::debug!("HTTP router initialized");
 
     log::info!("openusage-cli daemon listening on {}", discovery.base_url());
     log::debug!("waiting for shutdown signal");
 
-    let server_result = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("http server failed");
+    let server_result = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        tokio::select! {
+            _ = shutdown_signal() => {},
+            _ = shutdown_rx => {
+                log::info!("shutdown triggered via HTTP API");
+            }
+        }
+    })
+    .await
+    .context("http server failed");
 
     if let Some(task) = refresh_task {
         task.abort();

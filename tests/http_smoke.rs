@@ -1,7 +1,8 @@
 use openusage_cli::daemon::DaemonState;
-use openusage_cli::http_api::{self, ApiState};
+use openusage_cli::http_api::{self, ApiState, RuntimeConfig};
 use openusage_cli::plugin_engine::manifest;
 use serde_json::Value;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,21 +33,40 @@ async fn http_api_smoke_for_plugins_and_usage_refresh() {
         None,
     ));
 
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+
+    let runtime_config = RuntimeConfig {
+        app_version: "0.1.0-test".to_string(),
+        host: "127.0.0.1".to_string(),
+        port: addr.port(),
+        plugins_dir: Some(vendor_plugins_dir()),
+        enabled_plugins: "mock".to_string(),
+        app_data_dir: Some(tmp.path().to_path_buf()),
+        plugin_overrides_dir: None,
+        refresh_interval_secs: 300,
+        log_level: "error".to_string(),
+    };
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let shutdown_tx = Arc::new(tokio::sync::Mutex::new(Some(shutdown_tx)));
+
     let app = http_api::router(ApiState {
         daemon,
         app_version: "0.1.0-test".to_string(),
+        config: runtime_config,
+        shutdown_tx: Some(shutdown_tx),
     });
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("local addr");
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-
     let server = tokio::spawn(async move {
-        let _ = axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                let _ = shutdown_rx.await;
-            })
-            .await;
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async {
+            let _ = shutdown_rx.await;
+        })
+        .await;
     });
 
     let client = reqwest::Client::new();
@@ -121,6 +141,52 @@ async fn http_api_smoke_for_plugins_and_usage_refresh() {
     let missing_json: Value = missing_resp.json().await.expect("missing json");
     assert_eq!(missing_json["error"], "provider_not_found");
 
-    let _ = shutdown_tx.send(());
+    // Test config endpoint
+    let config_resp = client
+        .get(format!("{}/v1/config", base))
+        .send()
+        .await
+        .expect("config response");
+    assert_eq!(config_resp.status(), reqwest::StatusCode::OK);
+    let config_json: Value = config_resp.json().await.expect("config json");
+    assert_eq!(config_json["appVersion"], "0.1.0-test");
+    assert_eq!(config_json["host"], "127.0.0.1");
+    assert_eq!(config_json["port"], serde_json::json!(addr.port()));
+    assert_eq!(config_json["enabledPlugins"], "mock");
+    assert_eq!(config_json["logLevel"], "error");
+    assert!(config_json["refreshIntervalSecs"].is_number());
+
+    let shutdown_with_foreign_origin_resp = client
+        .post(format!("{}/v1/shutdown", base))
+        .header("Origin", "https://evil.example")
+        .send()
+        .await
+        .expect("shutdown with foreign origin response");
+    assert_eq!(
+        shutdown_with_foreign_origin_resp.status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    let shutdown_with_foreign_origin_json: Value = shutdown_with_foreign_origin_resp
+        .json()
+        .await
+        .expect("shutdown with foreign origin json");
+    assert_eq!(
+        shutdown_with_foreign_origin_json["error"],
+        "shutdown_forbidden_origin"
+    );
+
+    // Test shutdown endpoint
+    let shutdown_resp = client
+        .post(format!("{}/v1/shutdown", base))
+        .send()
+        .await
+        .expect("shutdown response");
+    assert_eq!(shutdown_resp.status(), reqwest::StatusCode::OK);
+    let shutdown_json: Value = shutdown_resp.json().await.expect("shutdown json");
+    assert_eq!(shutdown_json["status"], "shutting_down");
+
+    // Give the server time to start shutting down
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
     let _ = server.await;
 }

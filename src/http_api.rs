@@ -1,19 +1,39 @@
 use crate::daemon::{DaemonState, PluginMeta};
-use axum::extract::{Path, Query, Request, State};
-use axum::http::StatusCode;
+use axum::extract::{ConnectInfo, Path, Query, Request, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::oneshot;
 use tower_http::cors::{Any, CorsLayer};
 
 #[derive(Clone)]
 pub struct ApiState {
     pub daemon: Arc<DaemonState>,
     pub app_version: String,
+    pub config: RuntimeConfig,
+    pub shutdown_tx: Option<Arc<tokio::sync::Mutex<Option<oneshot::Sender<()>>>>>,
+}
+
+/// Configuration information exposed via HTTP API
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeConfig {
+    pub app_version: String,
+    pub host: String,
+    pub port: u16,
+    pub plugins_dir: Option<PathBuf>,
+    pub enabled_plugins: String,
+    pub app_data_dir: Option<PathBuf>,
+    pub plugin_overrides_dir: Option<PathBuf>,
+    pub refresh_interval_secs: u64,
+    pub log_level: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -61,6 +81,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/usage", get(get_usage_collection))
         .route("/v1/usage/{provider}", get(get_usage_single))
         .route("/v1/probe", post(post_probe))
+        .route("/v1/config", get(get_config))
+        .route("/v1/shutdown", post(post_shutdown))
         .layer(middleware::from_fn(log_http_request))
         .with_state(Arc::new(state))
         .layer(
@@ -154,6 +176,96 @@ async fn post_probe(
         Ok(result) => Json(result).into_response(),
         Err(err) => internal_error(err),
     }
+}
+
+async fn get_config(State(state): State<Arc<ApiState>>) -> Json<RuntimeConfig> {
+    log::debug!("HTTP GET /v1/config");
+    Json(state.config.clone())
+}
+
+async fn post_shutdown(
+    State(state): State<Arc<ApiState>>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    if !remote_addr.ip().is_loopback() {
+        log::warn!(
+            "rejecting shutdown request from non-loopback address {}",
+            remote_addr
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "shutdown_forbidden_remote".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    if !is_shutdown_origin_allowed(&headers) {
+        let origin = headers
+            .get(axum::http::header::ORIGIN)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("<invalid>");
+        log::warn!(
+            "rejecting shutdown request with non-local origin '{}'",
+            origin
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "shutdown_forbidden_origin".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    log::info!("HTTP POST /v1/shutdown - initiating graceful shutdown");
+
+    if let Some(tx_mutex) = &state.shutdown_tx {
+        let mut tx_opt = tx_mutex.lock().await;
+        if let Some(tx) = tx_opt.take() {
+            let _ = tx.send(());
+            return Json(serde_json::json!({"status": "shutting_down" })).into_response();
+        }
+    }
+
+    log::warn!("shutdown already triggered or not available");
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorResponse {
+            error: "shutdown_already_triggered".to_string(),
+        }),
+    )
+        .into_response()
+}
+
+fn is_shutdown_origin_allowed(headers: &HeaderMap) -> bool {
+    let Some(origin_header) = headers.get(axum::http::header::ORIGIN) else {
+        return true;
+    };
+    let Ok(origin) = origin_header.to_str() else {
+        return false;
+    };
+    if origin.eq_ignore_ascii_case("null") {
+        return false;
+    }
+
+    let Ok(uri) = origin.parse::<axum::http::Uri>() else {
+        return false;
+    };
+    let Some(host) = uri.host() else {
+        return false;
+    };
+
+    is_loopback_host(host)
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 fn parse_plugin_ids(raw: Option<String>) -> Option<Vec<String>> {
