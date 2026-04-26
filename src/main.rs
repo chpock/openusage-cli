@@ -5,7 +5,7 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use indoc::formatdoc;
 use openusage_cli::config;
 use openusage_cli::daemon::{CachedPluginSnapshot, DaemonState};
-use openusage_cli::discovery::PublishedDiscovery;
+use openusage_cli::discovery::{PublishedDiscovery, discover_daemon_endpoint_with_override};
 use openusage_cli::http_api::{self, ApiState, LifecycleCommand, RuntimeConfig};
 use openusage_cli::instance_control::{self, ExistingInstancePolicy, ServiceMode};
 use openusage_cli::plugin_engine::manifest;
@@ -24,6 +24,7 @@ const SYSTEM_PLUGINS_DIR: &str = "/usr/share/openusage-cli/openusage-plugins";
 const SYSTEM_PLUGIN_OVERRIDES_DIR: &str = "/usr/share/openusage-cli/plugin-overrides";
 const USER_SYSTEMD_SERVICE_NAME: &str = "openusage-cli.service";
 const EXISTING_INSTANCE_SHUTDOWN_TIMEOUT_SECS: u64 = 15;
+const QUERY_DAEMON_HTTP_TIMEOUT_SECS: u64 = 5;
 const SYSTEMD_RESTART_EXIT_CODE: i32 = 75;
 const SYSTEMD_WATCHDOG_SEC: u64 = 30;
 const SYSTEMD_TIMEOUT_START_SECS: u64 = 120;
@@ -727,16 +728,15 @@ async fn run_query_mode(runtime: QueryRuntimeCli, app_version: &str) -> Result<R
     let dirs = resolve_runtime_directories(&runtime.shared)?;
     log::debug!("query mode enabled; attempting to discover running daemon");
 
-    if let Some(running_instance) =
-        instance_control::discover_running_instance(dirs.test_runtime_dir.as_deref()).await
+    if let Some(daemon_base_url) =
+        discover_daemon_endpoint_with_override(dirs.test_runtime_dir.as_deref())
     {
         log::info!(
-            "discovered running daemon at {} (service_mode={}); querying for {}",
-            running_instance.base_url,
-            running_instance.service_mode,
+            "discovered daemon endpoint at {}; querying for {}",
+            daemon_base_url,
             runtime.query_type.as_str()
         );
-        match query_daemon_via_http(&running_instance.base_url, runtime.query_type).await {
+        match query_daemon_via_http(&daemon_base_url, runtime.query_type).await {
             Ok(json_output) => {
                 println!("{}", json_output);
                 return Ok(RunOutcome::Completed);
@@ -2182,7 +2182,7 @@ async fn query_daemon_via_http(base_url: &str, query_type: QueryType) -> Result<
     log::debug!("querying daemon at {}", url);
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(QUERY_DAEMON_HTTP_TIMEOUT_SECS))
         .build()
         .context("failed to create HTTP client")?;
 
