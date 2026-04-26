@@ -14,6 +14,9 @@ The project is implemented in Rust with `tokio` + `rquickjs`, and is designed fo
   - `GET /v1/usage`
   - `GET /v1/usage/{provider}`
   - `POST /v1/probe`
+  - `GET /v1/config`
+  - `POST /v1/shutdown`
+  - `POST /v1/restart`
 - Keeps an in-memory snapshot cache with periodic background refresh
 - Publishes per-user daemon discovery files for local client auto-connect
 

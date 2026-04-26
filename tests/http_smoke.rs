@@ -1,5 +1,5 @@
 use openusage_cli::daemon::DaemonState;
-use openusage_cli::http_api::{self, ApiState, RuntimeConfig};
+use openusage_cli::http_api::{self, ApiState, LifecycleCommand, RuntimeConfig};
 use openusage_cli::plugin_engine::manifest;
 use serde_json::Value;
 use std::net::SocketAddr;
@@ -50,14 +50,14 @@ async fn http_api_smoke_for_plugins_and_usage_refresh() {
         log_level: "error".to_string(),
     };
 
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let shutdown_tx = Arc::new(tokio::sync::Mutex::new(Some(shutdown_tx)));
+    let (lifecycle_tx, lifecycle_rx) = oneshot::channel::<LifecycleCommand>();
+    let lifecycle_tx = Arc::new(tokio::sync::Mutex::new(Some(lifecycle_tx)));
 
     let app = http_api::router(ApiState {
         daemon,
         app_version: "0.1.0-test".to_string(),
         config: runtime_config,
-        shutdown_tx: Some(shutdown_tx),
+        lifecycle_tx: Some(lifecycle_tx),
     });
 
     let server = tokio::spawn(async move {
@@ -66,7 +66,7 @@ async fn http_api_smoke_for_plugins_and_usage_refresh() {
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
         .with_graceful_shutdown(async {
-            let _ = shutdown_rx.await;
+            let _ = lifecycle_rx.await;
         })
         .await;
     });
@@ -177,6 +177,25 @@ async fn http_api_smoke_for_plugins_and_usage_refresh() {
     assert_eq!(
         shutdown_with_foreign_origin_json["error"],
         "shutdown_forbidden_origin"
+    );
+
+    let restart_with_foreign_origin_resp = client
+        .post(format!("{}/v1/restart", base))
+        .header("Origin", "https://evil.example")
+        .send()
+        .await
+        .expect("restart with foreign origin response");
+    assert_eq!(
+        restart_with_foreign_origin_resp.status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    let restart_with_foreign_origin_json: Value = restart_with_foreign_origin_resp
+        .json()
+        .await
+        .expect("restart with foreign origin json");
+    assert_eq!(
+        restart_with_foreign_origin_json["error"],
+        "restart_forbidden_origin"
     );
 
     // Test shutdown endpoint

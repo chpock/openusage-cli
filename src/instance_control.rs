@@ -148,29 +148,60 @@ async fn fetch_running_instance(base_url: &str) -> Result<RunningInstance> {
 }
 
 pub async fn request_shutdown(base_url: &str) -> Result<()> {
-    let client = reqwest::Client::builder()
+    let client = build_http_client()?;
+    let shutdown_url = control_url(base_url, "shutdown");
+    let response = send_control_request(&client, &shutdown_url, "shutdown").await?;
+    ensure_control_success("shutdown", &shutdown_url, response).await
+}
+
+pub async fn request_restart(base_url: &str) -> Result<()> {
+    let client = build_http_client()?;
+    let restart_url = control_url(base_url, "restart");
+    let restart_response = send_control_request(&client, &restart_url, "restart").await?;
+    ensure_control_success("restart", &restart_url, restart_response).await
+}
+
+fn build_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
         .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
         .build()
-        .context("failed to create HTTP client")?;
-    let shutdown_url = format!("{}/v1/shutdown", base_url);
+        .context("failed to create HTTP client")
+}
 
-    let response = client
-        .post(&shutdown_url)
+fn control_url(base_url: &str, action: &str) -> String {
+    format!("{}/v1/{}", base_url, action)
+}
+
+async fn send_control_request(
+    client: &reqwest::Client,
+    action_url: &str,
+    action: &str,
+) -> Result<reqwest::Response> {
+    client
+        .post(action_url)
         .send()
         .await
-        .with_context(|| format!("failed to request shutdown via {}", shutdown_url))?;
+        .with_context(|| format!("failed to request {} via {}", action, action_url))
+}
+
+async fn ensure_control_success(
+    action: &str,
+    action_url: &str,
+    response: reqwest::Response,
+) -> Result<()> {
     let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!(
-            "shutdown endpoint {} returned status {}: {}",
-            shutdown_url,
-            status,
-            body
-        );
+    if status.is_success() {
+        return Ok(());
     }
 
-    Ok(())
+    let body = response.text().await.unwrap_or_default();
+    anyhow::bail!(
+        "{} endpoint {} returned status {}: {}",
+        action,
+        action_url,
+        status,
+        body
+    );
 }
 
 pub async fn wait_until_unreachable(base_url: &str, timeout: Duration) -> Result<()> {

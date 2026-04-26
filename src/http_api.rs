@@ -13,12 +13,18 @@ use std::time::Instant;
 use tokio::sync::oneshot;
 use tower_http::cors::{Any, CorsLayer};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleCommand {
+    Shutdown,
+    Restart,
+}
+
 #[derive(Clone)]
 pub struct ApiState {
     pub daemon: Arc<DaemonState>,
     pub app_version: String,
     pub config: RuntimeConfig,
-    pub shutdown_tx: Option<Arc<tokio::sync::Mutex<Option<oneshot::Sender<()>>>>>,
+    pub lifecycle_tx: Option<Arc<tokio::sync::Mutex<Option<oneshot::Sender<LifecycleCommand>>>>>,
 }
 
 /// Configuration information exposed via HTTP API
@@ -85,6 +91,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/probe", post(post_probe))
         .route("/v1/config", get(get_config))
         .route("/v1/shutdown", post(post_shutdown))
+        .route("/v1/restart", post(post_restart))
         .layer(middleware::from_fn(log_http_request))
         .with_state(Arc::new(state))
         .layer(
@@ -190,59 +197,127 @@ async fn post_shutdown(
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    if !remote_addr.ip().is_loopback() {
-        log::warn!(
-            "rejecting shutdown request from non-loopback address {}",
-            remote_addr
-        );
-        return (
-            StatusCode::FORBIDDEN,
-            Json(ErrorResponse {
-                error: "shutdown_forbidden_remote".to_string(),
-            }),
-        )
-            .into_response();
+    if let Some(response) = validate_control_request(
+        &remote_addr,
+        &headers,
+        "shutdown",
+        "shutdown_forbidden_remote",
+        "shutdown_forbidden_origin",
+    ) {
+        return response;
     }
 
-    if !is_shutdown_origin_allowed(&headers) {
+    trigger_lifecycle_command(
+        &state,
+        LifecycleCommand::Shutdown,
+        "shutdown",
+        "shutting_down",
+        "shutdown_already_triggered",
+    )
+    .await
+}
+
+async fn post_restart(
+    State(state): State<Arc<ApiState>>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(response) = validate_control_request(
+        &remote_addr,
+        &headers,
+        "restart",
+        "restart_forbidden_remote",
+        "restart_forbidden_origin",
+    ) {
+        return response;
+    }
+
+    trigger_lifecycle_command(
+        &state,
+        LifecycleCommand::Restart,
+        "restart",
+        "restarting",
+        "restart_already_triggered",
+    )
+    .await
+}
+
+fn validate_control_request(
+    remote_addr: &SocketAddr,
+    headers: &HeaderMap,
+    action: &str,
+    remote_error: &str,
+    origin_error: &str,
+) -> Option<Response> {
+    if !remote_addr.ip().is_loopback() {
+        log::warn!(
+            "rejecting {} request from non-loopback address {}",
+            action,
+            remote_addr
+        );
+        return Some(
+            (
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse {
+                    error: remote_error.to_string(),
+                }),
+            )
+                .into_response(),
+        );
+    }
+
+    if !is_control_origin_allowed(headers) {
         let origin = headers
             .get(axum::http::header::ORIGIN)
             .and_then(|value| value.to_str().ok())
             .unwrap_or("<invalid>");
         log::warn!(
-            "rejecting shutdown request with non-local origin '{}'",
+            "rejecting {} request with non-local origin '{}'",
+            action,
             origin
         );
-        return (
-            StatusCode::FORBIDDEN,
-            Json(ErrorResponse {
-                error: "shutdown_forbidden_origin".to_string(),
-            }),
-        )
-            .into_response();
+        return Some(
+            (
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse {
+                    error: origin_error.to_string(),
+                }),
+            )
+                .into_response(),
+        );
     }
 
-    log::info!("HTTP POST /v1/shutdown - initiating graceful shutdown");
+    None
+}
 
-    if let Some(tx_mutex) = &state.shutdown_tx {
+async fn trigger_lifecycle_command(
+    state: &ApiState,
+    command: LifecycleCommand,
+    action: &str,
+    status: &str,
+    already_triggered_error: &str,
+) -> Response {
+    log::info!("HTTP POST /v1/{action} - initiating lifecycle action");
+
+    if let Some(tx_mutex) = &state.lifecycle_tx {
         let mut tx_opt = tx_mutex.lock().await;
         if let Some(tx) = tx_opt.take() {
-            let _ = tx.send(());
-            return Json(serde_json::json!({"status": "shutting_down" })).into_response();
+            let _ = tx.send(command);
+            return Json(serde_json::json!({"status": status })).into_response();
         }
     }
 
-    log::warn!("shutdown already triggered or not available");
+    log::warn!("{} already triggered or not available", action);
     (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(ErrorResponse {
-            error: "shutdown_already_triggered".to_string(),
+            error: already_triggered_error.to_string(),
         }),
     )
         .into_response()
 }
 
-fn is_shutdown_origin_allowed(headers: &HeaderMap) -> bool {
+fn is_control_origin_allowed(headers: &HeaderMap) -> bool {
     let Some(origin_header) = headers.get(axum::http::header::ORIGIN) else {
         return true;
     };

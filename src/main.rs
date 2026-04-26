@@ -2,10 +2,11 @@ use anyhow::{Context, Result, anyhow};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use directories::ProjectDirs;
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use indoc::formatdoc;
 use openusage_cli::config;
 use openusage_cli::daemon::{CachedPluginSnapshot, DaemonState};
 use openusage_cli::discovery::PublishedDiscovery;
-use openusage_cli::http_api::{self, ApiState, RuntimeConfig};
+use openusage_cli::http_api::{self, ApiState, LifecycleCommand, RuntimeConfig};
 use openusage_cli::instance_control::{self, ExistingInstancePolicy, ServiceMode};
 use openusage_cli::plugin_engine::manifest;
 use openusage_cli::plugin_engine::runtime::MetricLine;
@@ -14,6 +15,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 use tokio::net::TcpListener;
 
@@ -21,6 +23,7 @@ const SYSTEM_PLUGINS_DIR: &str = "/usr/share/openusage-cli/openusage-plugins";
 const SYSTEM_PLUGIN_OVERRIDES_DIR: &str = "/usr/share/openusage-cli/plugin-overrides";
 const USER_SYSTEMD_SERVICE_NAME: &str = "openusage-cli.service";
 const EXISTING_INSTANCE_SHUTDOWN_TIMEOUT_SECS: u64 = 15;
+const SYSTEMD_RESTART_EXIT_CODE: i32 = 75;
 const CMD_RUN_DAEMON: &str = "run-daemon";
 const HELP_HEADING_MODE_OPTIONS: &str = "Mode options";
 const HELP_HEADING_GLOBAL_OPTIONS: &str = "Global options";
@@ -408,15 +411,23 @@ async fn main() -> Result<()> {
         .init();
 
     let result = run(cli, env_overrides, &raw_args).await;
-    match &result {
-        Ok(_) => log::info!("openusage-cli shutdown complete"),
-        Err(err) => log::error!("openusage-cli exiting with error: {err:#}"),
+    match result {
+        Ok(RunOutcome::Completed) => {
+            log::info!("openusage-cli shutdown complete");
+            Ok(())
+        }
+        Ok(RunOutcome::ExitWithCode(exit_code)) => {
+            log::info!("openusage-cli exiting with requested code {}", exit_code);
+            std::process::exit(exit_code);
+        }
+        Err(err) => {
+            log::error!("openusage-cli exiting with error: {err:#}");
+            Err(err)
+        }
     }
-
-    result
 }
 
-async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Result<()> {
+async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Result<RunOutcome> {
     let loaded_config = if cli.test_mode {
         log::info!(
             "test mode enabled; ignoring config file and OPENUSAGE_* runtime environment overrides"
@@ -486,7 +497,7 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
             match query_daemon_via_http(&running_instance.base_url).await {
                 Ok(json_output) => {
                     println!("{}", json_output);
-                    return Ok(());
+                    return Ok(RunOutcome::Completed);
                 }
                 Err(err) => {
                     log::warn!(
@@ -522,17 +533,17 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
                 ExistingInstancePolicy::Replace => match running_instance.service_mode {
                     ServiceMode::Systemd => {
                         log::info!(
-                            "requesting shutdown of existing systemd-managed instance at {}",
+                            "requesting restart of existing systemd-managed instance at {}",
                             running_instance.base_url
                         );
-                        instance_control::request_shutdown(&running_instance.base_url)
+                        instance_control::request_restart(&running_instance.base_url)
                             .await
-                            .context("failed to request shutdown for systemd-managed instance")?;
+                            .context("failed to request restart for systemd-managed instance")?;
                         println!(
-                            "Existing systemd-managed daemon at {} received shutdown request. The systemd unit should restart it automatically.",
+                            "Existing systemd-managed daemon at {} received restart request. The systemd unit should restart it automatically.",
                             running_instance.base_url
                         );
-                        return Ok(());
+                        return Ok(RunOutcome::Completed);
                     }
                     ServiceMode::Standalone => {
                         log::info!(
@@ -561,7 +572,7 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
         let child_pid =
             spawn_daemon_process(raw_args).context("failed to spawn background daemon process")?;
         log::info!("run-daemon enabled; spawned background process pid={child_pid}");
-        return Ok(());
+        return Ok(RunOutcome::Completed);
     }
     log::info!("using app data dir: {}", app_data_dir.display());
     std::fs::create_dir_all(&app_data_dir).with_context(|| {
@@ -657,7 +668,7 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
         let json_output =
             serde_json::to_string(&snapshots).context("failed to serialize query results")?;
         println!("{}", json_output);
-        return Ok(());
+        return Ok(RunOutcome::Completed);
     }
 
     const RESET_CHECK_MARGIN_SECS: u64 = 5;
@@ -760,9 +771,13 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
         Some(discovery)
     };
 
-    // Create shutdown channel for graceful shutdown via HTTP API
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let shutdown_tx = Arc::new(tokio::sync::Mutex::new(Some(shutdown_tx)));
+    const LIFECYCLE_NONE: u8 = 0;
+    const LIFECYCLE_SHUTDOWN: u8 = 1;
+    const LIFECYCLE_RESTART: u8 = 2;
+
+    let (lifecycle_tx, lifecycle_rx) = tokio::sync::oneshot::channel::<LifecycleCommand>();
+    let lifecycle_tx = Arc::new(tokio::sync::Mutex::new(Some(lifecycle_tx)));
+    let lifecycle_reason = Arc::new(AtomicU8::new(LIFECYCLE_NONE));
 
     let runtime_config = RuntimeConfig {
         app_version: app_version.clone(),
@@ -782,7 +797,7 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
         daemon,
         app_version,
         config: runtime_config,
-        shutdown_tx: Some(shutdown_tx),
+        lifecycle_tx: Some(lifecycle_tx),
     });
     log::debug!("HTTP router initialized");
 
@@ -797,13 +812,28 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(async move {
+    .with_graceful_shutdown({
+        let lifecycle_reason = Arc::clone(&lifecycle_reason);
+        async move {
         tokio::select! {
             _ = shutdown_signal() => {},
-            _ = shutdown_rx => {
-                log::info!("shutdown triggered via HTTP API");
+            command = lifecycle_rx => {
+                match command {
+                    Ok(LifecycleCommand::Shutdown) => {
+                        lifecycle_reason.store(LIFECYCLE_SHUTDOWN, Ordering::Relaxed);
+                        log::info!("shutdown triggered via HTTP API");
+                    }
+                    Ok(LifecycleCommand::Restart) => {
+                        lifecycle_reason.store(LIFECYCLE_RESTART, Ordering::Relaxed);
+                        log::info!("restart triggered via HTTP API");
+                    }
+                    Err(_) => {
+                        log::warn!("lifecycle control channel closed before command was received");
+                    }
+                }
             }
         }
+    }
     })
     .await
     .context("http server failed");
@@ -822,13 +852,33 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
     server_result?;
 
     log::info!("HTTP server stopped");
-    Ok(())
+    if lifecycle_reason.load(Ordering::Relaxed) == LIFECYCLE_RESTART {
+        if runtime.service_mode == ServiceMode::Systemd {
+            log::info!(
+                "service_mode=systemd and restart requested; exiting with code {}",
+                SYSTEMD_RESTART_EXIT_CODE
+            );
+            return Ok(RunOutcome::ExitWithCode(SYSTEMD_RESTART_EXIT_CODE));
+        }
+        log::warn!(
+            "restart requested but service_mode={} does not support manager-driven restart; exiting normally",
+            runtime.service_mode
+        );
+    }
+
+    Ok(RunOutcome::Completed)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeMode {
     Query,
     RunDaemon,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunOutcome {
+    Completed,
+    ExitWithCode(i32),
 }
 
 impl RuntimeMode {
@@ -1472,11 +1522,7 @@ fn install_user_systemd_unit() -> Result<()> {
             .join(USER_SYSTEMD_SERVICE_NAME);
         let executable = std::env::current_exe().context("cannot resolve current executable")?;
         let exec_start = systemd_exec_start(executable.as_os_str());
-
-        let unit_content = format!(
-            "[Unit]\nDescription=OpenUsage CLI daemon\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={}\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n",
-            exec_start
-        );
+        let unit_content = build_systemd_unit(&exec_start);
 
         std::fs::write(&unit_path, unit_content)
             .with_context(|| format!("failed to write unit file {}", unit_path.display()))?;
@@ -1496,6 +1542,25 @@ fn install_user_systemd_unit() -> Result<()> {
 
         Ok(())
     }
+}
+
+fn build_systemd_unit(exec_start: &str) -> String {
+    formatdoc! {"
+        [Unit]
+        Description=OpenUsage CLI daemon
+        After=network.target
+
+        [Service]
+        Type=simple
+        ExecStart={exec_start}
+        Restart=on-failure
+        RestartSec=2s
+        SuccessExitStatus={SYSTEMD_RESTART_EXIT_CODE}
+        RestartForceExitStatus={SYSTEMD_RESTART_EXIT_CODE}
+
+        [Install]
+        WantedBy=default.target
+    "}
 }
 
 fn quote_systemd_argument(value: &OsStr) -> String {
@@ -2476,6 +2541,16 @@ mod tests {
             systemd_exec_start(OsStr::new("/usr/bin/openusage-cli")),
             "/usr/bin/openusage-cli run-daemon --foreground=true --service-mode=systemd --log-level=info"
         );
+    }
+
+    #[test]
+    fn build_systemd_unit_uses_expected_restart_policy() {
+        let unit = build_systemd_unit("/usr/bin/openusage-cli run-daemon --foreground=true");
+
+        assert!(unit.contains("Restart=on-failure"));
+        assert!(unit.contains("RestartSec=2s"));
+        assert!(unit.contains("SuccessExitStatus=75"));
+        assert!(unit.contains("RestartForceExitStatus=75"));
     }
 
     #[test]
