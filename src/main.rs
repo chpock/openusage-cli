@@ -11,7 +11,7 @@ use openusage_cli::instance_control::{self, ExistingInstancePolicy, ServiceMode}
 use openusage_cli::plugin_engine::manifest;
 use openusage_cli::plugin_engine::runtime::MetricLine;
 use std::ffi::{OsStr, OsString};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -24,6 +24,10 @@ const SYSTEM_PLUGIN_OVERRIDES_DIR: &str = "/usr/share/openusage-cli/plugin-overr
 const USER_SYSTEMD_SERVICE_NAME: &str = "openusage-cli.service";
 const EXISTING_INSTANCE_SHUTDOWN_TIMEOUT_SECS: u64 = 15;
 const SYSTEMD_RESTART_EXIT_CODE: i32 = 75;
+const SYSTEMD_WATCHDOG_SEC: u64 = 30;
+const SYSTEMD_TIMEOUT_START_SECS: u64 = 120;
+const STARTUP_READINESS_TIMEOUT_SECS: u64 = 10;
+const STARTUP_READINESS_POLL_INTERVAL_MS: u64 = 50;
 const CMD_RUN_DAEMON: &str = "run-daemon";
 const HELP_HEADING_MODE_OPTIONS: &str = "Mode options";
 const HELP_HEADING_GLOBAL_OPTIONS: &str = "Global options";
@@ -751,6 +755,10 @@ async fn run_daemon_mode(
         return Ok(RunOutcome::Completed);
     }
 
+    notify_systemd_status(
+        runtime.service_mode,
+        "initializing runtime context (plugins and cache)",
+    );
     let initialized =
         initialize_runtime_context(&runtime.shared, app_version, dirs.app_data_dir.clone()).await?;
     let daemon = initialized.daemon.clone();
@@ -821,6 +829,7 @@ async fn run_daemon_mode(
     let addr: SocketAddr = format!("{}:{}", runtime.host, runtime.port)
         .parse()
         .context("invalid bind address")?;
+    notify_systemd_status(runtime.service_mode, "binding HTTP listener");
     log::info!("attempting to bind HTTP listener on {}", addr);
     let listener = match TcpListener::bind(addr).await {
         Ok(listener) => listener,
@@ -836,6 +845,10 @@ async fn run_daemon_mode(
         .local_addr()
         .context("failed to resolve bound HTTP listener address")?;
     log::debug!("HTTP listener successfully bound on {}", bound_addr);
+    notify_systemd_status(
+        runtime.service_mode,
+        &format!("HTTP listener bound on {}; publishing endpoint", bound_addr),
+    );
 
     let discovery = if runtime.existing_instance_policy == ExistingInstancePolicy::Ignore {
         log::info!("skipping daemon endpoint publication because --existing-instance=ignore");
@@ -885,37 +898,57 @@ async fn run_daemon_mode(
     } else {
         log::info!("openusage-cli daemon listening on http://{}", bound_addr);
     }
-    log::debug!("waiting for shutdown signal");
-
-    let server_result = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown({
-        let lifecycle_reason = Arc::clone(&lifecycle_reason);
-        async move {
-            tokio::select! {
-                _ = shutdown_signal() => {},
-                command = lifecycle_rx => {
-                    match command {
-                        Ok(LifecycleCommand::Shutdown) => {
-                            lifecycle_reason.store(LIFECYCLE_SHUTDOWN, Ordering::Relaxed);
-                            log::info!("shutdown triggered via HTTP API");
-                        }
-                        Ok(LifecycleCommand::Restart) => {
-                            lifecycle_reason.store(LIFECYCLE_RESTART, Ordering::Relaxed);
-                            log::info!("restart triggered via HTTP API");
-                        }
-                        Err(_) => {
-                            log::warn!("lifecycle control channel closed before command was received");
+    notify_systemd_status(runtime.service_mode, "starting HTTP server");
+    let lifecycle_reason_for_server = Arc::clone(&lifecycle_reason);
+    let server_task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown({
+            let lifecycle_reason = Arc::clone(&lifecycle_reason_for_server);
+            async move {
+                tokio::select! {
+                    _ = shutdown_signal() => {},
+                    command = lifecycle_rx => {
+                        match command {
+                            Ok(LifecycleCommand::Shutdown) => {
+                                lifecycle_reason.store(LIFECYCLE_SHUTDOWN, Ordering::Relaxed);
+                                log::info!("shutdown triggered via HTTP API");
+                            }
+                            Ok(LifecycleCommand::Restart) => {
+                                lifecycle_reason.store(LIFECYCLE_RESTART, Ordering::Relaxed);
+                                log::info!("restart triggered via HTTP API");
+                            }
+                            Err(_) => {
+                                log::warn!("lifecycle control channel closed before command was received");
+                            }
                         }
                     }
                 }
             }
-        }
-    })
-    .await
-    .context("http server failed");
+        })
+        .await
+        .context("http server failed")
+    });
+
+    if let Err(err) = wait_for_http_server_readiness(bound_addr).await {
+        server_task.abort();
+        let _ = server_task.await;
+        return Err(err).context("HTTP server did not become ready in time");
+    }
+    notify_systemd_status(
+        runtime.service_mode,
+        &format!("ready to serve requests on http://{}", bound_addr),
+    );
+    notify_systemd_ready(runtime.service_mode)
+        .context("failed to notify systemd that daemon startup completed")?;
+    let watchdog_task = spawn_systemd_watchdog_task(runtime.service_mode);
+    log::debug!("waiting for shutdown signal");
+
+    let server_result = server_task
+        .await
+        .context("http server task failed to join")?;
 
     if let Some(task) = refresh_task {
         task.abort();
@@ -928,9 +961,22 @@ async fn run_daemon_mode(
         }
     }
 
+    if let Some(task) = watchdog_task {
+        task.abort();
+        match task.await {
+            Ok(()) => log::debug!("systemd watchdog task exited"),
+            Err(err) if err.is_cancelled() => {
+                log::debug!("systemd watchdog task cancelled during shutdown")
+            }
+            Err(err) => log::warn!("systemd watchdog task ended with error: {}", err),
+        }
+    }
+
     server_result?;
 
+    notify_systemd_status(runtime.service_mode, "stopping daemon");
     log::info!("HTTP server stopped");
+    notify_systemd_stopping(runtime.service_mode);
     if lifecycle_reason.load(Ordering::Relaxed) == LIFECYCLE_RESTART {
         if runtime.service_mode == ServiceMode::Systemd {
             log::info!(
@@ -1624,7 +1670,10 @@ fn build_systemd_unit(exec_start: &str) -> String {
         After=network.target
 
         [Service]
-        Type=simple
+        Type=notify
+        NotifyAccess=main
+        WatchdogSec={SYSTEMD_WATCHDOG_SEC}s
+        TimeoutStartSec={SYSTEMD_TIMEOUT_START_SECS}s
         ExecStart={exec_start}
         Restart=on-failure
         RestartSec=2s
@@ -1657,6 +1706,193 @@ fn systemd_exec_start(executable: &OsStr) -> String {
         "--log-level=info".to_string(),
     ]
     .join(" ")
+}
+
+fn notify_systemd_status(service_mode: ServiceMode, status: &str) {
+    if service_mode != ServiceMode::Systemd {
+        return;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let has_notify_socket = std::env::var_os("NOTIFY_SOCKET").is_some();
+        match sd_notify::notify(false, &[sd_notify::NotifyState::Status(status)]) {
+            Ok(()) if has_notify_socket => log::debug!("sent systemd status: {}", status),
+            Ok(()) => log::debug!(
+                "service_mode=systemd but NOTIFY_SOCKET is unset; skipping STATUS update: {}",
+                status
+            ),
+            Err(err) => log::warn!("failed to send STATUS via sd_notify ({}): {}", status, err),
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        log::warn!(
+            "service_mode=systemd requested on a non-Linux platform; status update skipped: {}",
+            status
+        );
+    }
+}
+
+async fn wait_for_http_server_readiness(bound_addr: SocketAddr) -> Result<()> {
+    let readiness_addr = http_readiness_probe_addr(bound_addr);
+    let readiness_url = format!("http://{}/health", readiness_addr);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(800))
+        .build()
+        .context("failed to create readiness probe HTTP client")?;
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_secs(STARTUP_READINESS_TIMEOUT_SECS);
+
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "timeout waiting for health endpoint {} during daemon startup",
+                readiness_url
+            );
+        }
+
+        if let Ok(response) = client.get(&readiness_url).send().await
+            && response.status().is_success()
+        {
+            return Ok(());
+        }
+
+        tokio::time::sleep(Duration::from_millis(STARTUP_READINESS_POLL_INTERVAL_MS)).await;
+    }
+}
+
+fn http_readiness_probe_addr(bound_addr: SocketAddr) -> SocketAddr {
+    let ip = match bound_addr.ip() {
+        IpAddr::V4(ipv4) if ipv4.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ipv6) if ipv6.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+
+    SocketAddr::new(ip, bound_addr.port())
+}
+
+fn notify_systemd_ready(service_mode: ServiceMode) -> Result<()> {
+    if service_mode != ServiceMode::Systemd {
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let has_notify_socket = std::env::var_os("NOTIFY_SOCKET").is_some();
+        sd_notify::notify(false, &[sd_notify::NotifyState::Ready])
+            .context("failed to send READY=1 via sd_notify")?;
+        if has_notify_socket {
+            log::info!("sent READY=1 to systemd");
+        } else {
+            log::debug!(
+                "service_mode=systemd but NOTIFY_SOCKET is unset; skipping READY=1 notification"
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        log::warn!(
+            "service_mode=systemd requested on a non-Linux platform; readiness notification skipped"
+        );
+    }
+
+    Ok(())
+}
+
+fn notify_systemd_stopping(service_mode: ServiceMode) {
+    if service_mode != ServiceMode::Systemd {
+        return;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let has_notify_socket = std::env::var_os("NOTIFY_SOCKET").is_some();
+        match sd_notify::notify(false, &[sd_notify::NotifyState::Stopping]) {
+            Ok(()) if has_notify_socket => log::info!("sent STOPPING=1 to systemd"),
+            Ok(()) => log::debug!(
+                "service_mode=systemd but NOTIFY_SOCKET is unset; skipping STOPPING=1 notification"
+            ),
+            Err(err) => {
+                log::warn!("failed to send STOPPING=1 via sd_notify: {}", err)
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        log::warn!(
+            "service_mode=systemd requested on a non-Linux platform; stop notification skipped"
+        );
+    }
+}
+
+fn spawn_systemd_watchdog_task(service_mode: ServiceMode) -> Option<tokio::task::JoinHandle<()>> {
+    let ping_interval = systemd_watchdog_ping_interval(service_mode)?;
+    log::info!(
+        "systemd watchdog enabled; sending WATCHDOG=1 every {:?}",
+        ping_interval
+    );
+
+    Some(tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(ping_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        // Prime interval so the first heartbeat is sent after one full period.
+        ticker.tick().await;
+
+        loop {
+            ticker.tick().await;
+
+            #[cfg(target_os = "linux")]
+            {
+                if let Err(err) = sd_notify::notify(false, &[sd_notify::NotifyState::Watchdog]) {
+                    log::warn!("failed to send WATCHDOG=1 via sd_notify: {}", err);
+                } else {
+                    log::debug!("sent WATCHDOG=1 to systemd");
+                }
+            }
+        }
+    }))
+}
+
+fn systemd_watchdog_ping_interval(service_mode: ServiceMode) -> Option<Duration> {
+    if service_mode != ServiceMode::Systemd {
+        return None;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let raw_value = std::env::var("WATCHDOG_USEC").ok()?;
+        let watchdog_usec: u64 = match raw_value.trim().parse() {
+            Ok(value) => value,
+            Err(err) => {
+                log::warn!(
+                    "service_mode=systemd but WATCHDOG_USEC='{}' is invalid: {}; watchdog disabled",
+                    raw_value,
+                    err
+                );
+                return None;
+            }
+        };
+
+        if watchdog_usec == 0 {
+            return None;
+        }
+
+        let ping_usec = (watchdog_usec / 2).max(1);
+        Some(Duration::from_micros(ping_usec))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        log::warn!(
+            "service_mode=systemd requested on a non-Linux platform; watchdog support skipped"
+        );
+        None
+    }
 }
 
 fn log_plugin_initialization_summary(snapshots: &[CachedPluginSnapshot]) {
@@ -2685,10 +2921,38 @@ mod tests {
     fn build_systemd_unit_uses_expected_restart_policy() {
         let unit = build_systemd_unit("/usr/bin/openusage-cli run-daemon --foreground=true");
 
+        assert!(unit.contains("Type=notify"));
+        assert!(unit.contains("NotifyAccess=main"));
+        assert!(unit.contains("WatchdogSec=30s"));
+        assert!(unit.contains("TimeoutStartSec=120s"));
         assert!(unit.contains("Restart=on-failure"));
         assert!(unit.contains("RestartSec=2s"));
         assert!(unit.contains("SuccessExitStatus=75"));
         assert!(unit.contains("RestartForceExitStatus=75"));
+    }
+
+    #[test]
+    fn http_readiness_probe_addr_uses_loopback_for_unspecified_ipv4() {
+        let bound = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 6737);
+        assert_eq!(
+            http_readiness_probe_addr(bound),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6737)
+        );
+    }
+
+    #[test]
+    fn http_readiness_probe_addr_uses_loopback_for_unspecified_ipv6() {
+        let bound = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 6737);
+        assert_eq!(
+            http_readiness_probe_addr(bound),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 6737)
+        );
+    }
+
+    #[test]
+    fn http_readiness_probe_addr_keeps_specific_bind_ip() {
+        let bound = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 20, 30, 40)), 6737);
+        assert_eq!(http_readiness_probe_addr(bound), bound);
     }
 
     #[test]
