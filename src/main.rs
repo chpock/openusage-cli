@@ -67,6 +67,42 @@ impl LogLevel {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+#[value(rename_all = "lower")]
+enum QueryType {
+    #[value(alias = "data")]
+    #[default]
+    Usage,
+    Plugins,
+}
+
+impl QueryType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Usage => "usage",
+            Self::Plugins => "plugins",
+        }
+    }
+
+    fn endpoint_path(self) -> &'static str {
+        match self {
+            Self::Usage => "v1/usage",
+            Self::Plugins => "v1/plugins",
+        }
+    }
+
+    fn requires_local_refresh(self) -> bool {
+        matches!(self, Self::Usage)
+    }
+
+    fn fallback_description(self) -> &'static str {
+        match self {
+            Self::Usage => "local plugin execution",
+            Self::Plugins => "local plugins response generation",
+        }
+    }
+}
+
 // NOTE: When adding new value-taking arguments here, also update
 // `option_consumes_separate_value` to keep pre-parser positional detection in sync.
 #[derive(Debug, Clone, Default, Args)]
@@ -93,6 +129,10 @@ struct SharedRuntimeArgs {
 struct QueryArgs {
     #[command(flatten)]
     shared: SharedRuntimeArgs,
+
+    /// Query payload type [default: usage]
+    #[arg(long = "type", value_enum, default_value_t = QueryType::Usage)]
+    query_type: QueryType,
 }
 
 #[derive(Debug, Clone, Default, Args)]
@@ -144,7 +184,7 @@ enum ModeCommand {
     #[command(name = CMD_RUN_DAEMON)]
     RunDaemon(RunDaemonArgs),
 
-    /// Query usage data (default mode; one-shot JSON output)
+    /// Query one-shot JSON payload (`--type=usage|plugins`; default: usage)
     Query(QueryArgs),
 
     /// Print the default configuration template to stdout
@@ -385,6 +425,7 @@ fn option_consumes_separate_value(option: &str) -> bool {
             | "--existing-instance"
             | "--service-mode"
             | "--log-level"
+            | "--type"
     )
 }
 
@@ -478,7 +519,8 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
     match &runtime {
         RuntimeCli::Query(query_runtime) => {
             log::debug!(
-                "startup options: mode=query, test_mode={}, plugins_dir={:?}, enabled_plugins='{}', app_data_dir={:?}, plugin_overrides_dir={:?}, log_level={}",
+                "startup options: mode=query, type={}, test_mode={}, plugins_dir={:?}, enabled_plugins='{}', app_data_dir={:?}, plugin_overrides_dir={:?}, log_level={}",
+                query_runtime.query_type.as_str(),
                 query_runtime.shared.test_mode,
                 query_runtime.shared.plugins_dir,
                 query_runtime.shared.enabled_plugins,
@@ -547,6 +589,7 @@ async fn initialize_runtime_context(
     shared: &SharedRuntimeCli,
     app_version: &str,
     app_data_dir: PathBuf,
+    perform_initial_refresh: bool,
 ) -> Result<InitializedRuntimeContext> {
     log::info!("using app data dir: {}", app_data_dir.display());
     std::fs::create_dir_all(&app_data_dir).with_context(|| {
@@ -626,16 +669,20 @@ async fn initialize_runtime_context(
         plugin_overrides_dir.clone(),
     ));
 
-    log::info!("running initial plugin refresh");
-    match daemon.refresh(None).await {
-        Ok(snapshots) => {
-            log::info!("initial plugin refresh completed");
-            log_plugin_initialization_summary(&snapshots);
+    if perform_initial_refresh {
+        log::info!("running initial plugin refresh");
+        match daemon.refresh(None).await {
+            Ok(snapshots) => {
+                log::info!("initial plugin refresh completed");
+                log_plugin_initialization_summary(&snapshots);
+            }
+            Err(err) => {
+                log::warn!("initial plugin refresh failed: {}", err);
+                log_plugin_initialization_failure_summary(&plugin_ids, &err.to_string());
+            }
         }
-        Err(err) => {
-            log::warn!("initial plugin refresh failed: {}", err);
-            log_plugin_initialization_failure_summary(&plugin_ids, &err.to_string());
-        }
+    } else {
+        log::debug!("initial plugin refresh skipped for query type without runtime probe");
     }
 
     Ok(InitializedRuntimeContext {
@@ -654,31 +701,41 @@ async fn run_query_mode(runtime: QueryRuntimeCli, app_version: &str) -> Result<R
         instance_control::discover_running_instance(dirs.test_runtime_dir.as_deref()).await
     {
         log::info!(
-            "discovered running daemon at {} (service_mode={}); querying for data",
+            "discovered running daemon at {} (service_mode={}); querying for {}",
             running_instance.base_url,
-            running_instance.service_mode
+            running_instance.service_mode,
+            runtime.query_type.as_str()
         );
-        match query_daemon_via_http(&running_instance.base_url).await {
+        match query_daemon_via_http(&running_instance.base_url, runtime.query_type).await {
             Ok(json_output) => {
                 println!("{}", json_output);
                 return Ok(RunOutcome::Completed);
             }
             Err(err) => {
                 log::warn!(
-                    "failed to query running daemon: {}; falling back to local plugin execution",
-                    err
+                    "failed to query running daemon: {}; falling back to {}",
+                    err,
+                    runtime.query_type.fallback_description()
                 );
             }
         }
     } else {
-        log::info!("no running daemon discovered; falling back to local plugin execution");
+        log::info!(
+            "no running daemon discovered; falling back to {}",
+            runtime.query_type.fallback_description()
+        );
     }
 
-    let initialized =
-        initialize_runtime_context(&runtime.shared, app_version, dirs.app_data_dir.clone()).await?;
-    let snapshots = initialized.daemon.cached(None).await;
-    let json_output =
-        serde_json::to_string(&snapshots).context("failed to serialize query results")?;
+    let initialized = initialize_runtime_context(
+        &runtime.shared,
+        app_version,
+        dirs.app_data_dir.clone(),
+        runtime.query_type.requires_local_refresh(),
+    )
+    .await?;
+    let json_output = build_local_query_output(initialized.daemon.as_ref(), runtime.query_type)
+        .await
+        .context("failed to build local query response")?;
     println!("{}", json_output);
 
     Ok(RunOutcome::Completed)
@@ -759,8 +816,13 @@ async fn run_daemon_mode(
         runtime.service_mode,
         "initializing runtime context (plugins and cache)",
     );
-    let initialized =
-        initialize_runtime_context(&runtime.shared, app_version, dirs.app_data_dir.clone()).await?;
+    let initialized = initialize_runtime_context(
+        &runtime.shared,
+        app_version,
+        dirs.app_data_dir.clone(),
+        true,
+    )
+    .await?;
     let daemon = initialized.daemon.clone();
 
     const RESET_CHECK_MARGIN_SECS: u64 = 5;
@@ -1013,6 +1075,7 @@ struct SharedRuntimeCli {
 #[derive(Debug, Clone)]
 struct QueryRuntimeCli {
     shared: SharedRuntimeCli,
+    query_type: QueryType,
 }
 
 #[derive(Debug, Clone)]
@@ -1052,6 +1115,7 @@ impl RuntimeCli {
         match command {
             Some(ModeCommand::Query(args)) => Ok(Self::Query(QueryRuntimeCli {
                 shared: resolve_shared_runtime(args.shared, test_mode, log_level, &env, &config),
+                query_type: args.query_type,
             })),
             Some(ModeCommand::RunDaemon(args)) => {
                 let runtime_args = args.runtime;
@@ -1100,15 +1164,19 @@ impl RuntimeCli {
                     daemon_child: args.daemon_child,
                 }))
             }
-            None => Ok(Self::Query(QueryRuntimeCli {
-                shared: resolve_shared_runtime(
-                    QueryArgs::default().shared,
-                    test_mode,
-                    log_level,
-                    &env,
-                    &config,
-                ),
-            })),
+            None => {
+                let default_query_args = QueryArgs::default();
+                Ok(Self::Query(QueryRuntimeCli {
+                    shared: resolve_shared_runtime(
+                        default_query_args.shared,
+                        test_mode,
+                        log_level,
+                        &env,
+                        &config,
+                    ),
+                    query_type: default_query_args.query_type,
+                }))
+            }
             Some(
                 ModeCommand::ShowDefaultConfig
                 | ModeCommand::InstallSystemdUnit
@@ -2013,9 +2081,26 @@ fn truncate_for_log(value: &str, max_chars: usize) -> String {
     }
 }
 
-/// Queries a running daemon via HTTP and returns validated usage JSON.
-async fn query_daemon_via_http(base_url: &str) -> Result<String> {
-    let url = format!("{}/v1/usage", base_url);
+async fn build_local_query_output(daemon: &DaemonState, query_type: QueryType) -> Result<String> {
+    match query_type {
+        QueryType::Usage => {
+            let snapshots = daemon.cached(None).await;
+            serde_json::to_string(&snapshots).context("failed to serialize local usage query")
+        }
+        QueryType::Plugins => {
+            let plugins = daemon.plugins_meta();
+            serde_json::to_string(&plugins).context("failed to serialize local plugins query")
+        }
+    }
+}
+
+/// Queries a running daemon via HTTP and returns validated JSON payload.
+async fn query_daemon_via_http(base_url: &str, query_type: QueryType) -> Result<String> {
+    let url = format!(
+        "{}/{}",
+        base_url.trim_end_matches('/'),
+        query_type.endpoint_path()
+    );
     log::debug!("querying daemon at {}", url);
 
     let client = reqwest::Client::builder()
@@ -2040,15 +2125,19 @@ async fn query_daemon_via_http(base_url: &str) -> Result<String> {
         .await
         .context("failed to read daemon response")?;
 
-    let payload: serde_json::Value =
-        serde_json::from_str(&body).context("daemon returned non-JSON usage payload")?;
+    let payload: serde_json::Value = serde_json::from_str(&body)
+        .with_context(|| format!("daemon returned non-JSON {} payload", query_type.as_str()))?;
 
-    let snapshots = payload
-        .as_array()
-        .context("daemon returned unexpected usage payload shape (expected JSON array)")?;
-    if !snapshots.iter().all(serde_json::Value::is_object) {
+    let entries = payload.as_array().with_context(|| {
+        format!(
+            "daemon returned unexpected {} payload shape (expected JSON array)",
+            query_type.as_str()
+        )
+    })?;
+    if !entries.iter().all(serde_json::Value::is_object) {
         anyhow::bail!(
-            "daemon returned unexpected usage payload shape (array entries must be objects)"
+            "daemon returned unexpected {} payload shape (array entries must be objects)",
+            query_type.as_str()
         );
     }
 
@@ -2235,6 +2324,39 @@ mod tests {
             query_args.shared.app_data_dir,
             Some(PathBuf::from("/tmp/query-data"))
         );
+    }
+
+    #[test]
+    fn cli_accepts_query_type_plugins() {
+        let cli = parse_with_default_mode(&["query", "--type", "plugins"])
+            .expect("query --type plugins should parse");
+        let query_args = match cli.command {
+            Some(ModeCommand::Query(args)) => args,
+            _ => panic!("expected query command"),
+        };
+        assert_eq!(query_args.query_type, QueryType::Plugins);
+    }
+
+    #[test]
+    fn cli_accepts_query_type_usage() {
+        let cli = parse_with_default_mode(&["query", "--type", "usage"])
+            .expect("query --type usage should parse");
+        let query_args = match cli.command {
+            Some(ModeCommand::Query(args)) => args,
+            _ => panic!("expected query command"),
+        };
+        assert_eq!(query_args.query_type, QueryType::Usage);
+    }
+
+    #[test]
+    fn cli_defaults_to_query_mode_with_type_option() {
+        let cli = parse_with_default_mode(&["--type", "plugins", "--enabled-plugins", "mock"])
+            .expect("flags without mode should parse as query mode");
+        let query_args = match cli.command {
+            Some(ModeCommand::Query(args)) => args,
+            _ => panic!("expected query mode by default"),
+        };
+        assert_eq!(query_args.query_type, QueryType::Plugins);
     }
 
     #[test]
@@ -2522,6 +2644,7 @@ mod tests {
 
         assert!(mode_block < global_block);
         assert!(help.contains("--plugins-dir <PLUGINS_DIR>"));
+        assert!(help.contains("--type <QUERY_TYPE>"));
         assert!(!help.contains("--host <HOST>"));
         assert!(!help.contains("--refresh-interval-secs <REFRESH_INTERVAL_SECS>"));
         assert!(help.contains("--log-level <LOG_LEVEL>"));
@@ -2581,7 +2704,26 @@ mod tests {
             runtime.shared.enabled_plugins,
             config::DEFAULT_ENABLED_PLUGINS
         );
+        assert_eq!(runtime.query_type, QueryType::Usage);
         assert_eq!(runtime.shared.log_level, config::DEFAULT_LOG_LEVEL);
+    }
+
+    #[test]
+    fn runtime_cli_query_mode_uses_selected_query_type() {
+        let cli = Cli {
+            command: Some(ModeCommand::Query(QueryArgs {
+                shared: SharedRuntimeArgs::default(),
+                query_type: QueryType::Plugins,
+            })),
+            ..empty_cli()
+        };
+
+        let runtime = expect_query_runtime(
+            RuntimeCli::from_sources(cli, EnvOverrides::default(), config::AppConfig::default())
+                .expect("query type should resolve"),
+        );
+
+        assert_eq!(runtime.query_type, QueryType::Plugins);
     }
 
     #[test]
