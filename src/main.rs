@@ -66,16 +66,7 @@ impl LogLevel {
 // NOTE: When adding new value-taking arguments here, also update
 // `option_consumes_separate_value` to keep pre-parser positional detection in sync.
 #[derive(Debug, Clone, Default, Args)]
-#[command(next_help_heading = HELP_HEADING_MODE_OPTIONS)]
-struct QueryArgs {
-    /// HTTP host to bind to [default: 127.0.0.1]
-    #[arg(long)]
-    host: Option<String>,
-
-    /// HTTP port to bind to (0 = random free port) [default: 0]
-    #[arg(long)]
-    port: Option<u16>,
-
+struct SharedRuntimeArgs {
     /// Directory containing plugin JS files [default: auto-discover]
     #[arg(long)]
     plugins_dir: Option<PathBuf>,
@@ -91,6 +82,27 @@ struct QueryArgs {
     /// Directory containing plugin override scripts [default: auto-discover]
     #[arg(long)]
     plugin_overrides_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, Args)]
+#[command(next_help_heading = HELP_HEADING_MODE_OPTIONS)]
+struct QueryArgs {
+    #[command(flatten)]
+    shared: SharedRuntimeArgs,
+}
+
+#[derive(Debug, Clone, Default, Args)]
+struct DaemonRuntimeArgs {
+    /// HTTP host to bind to [default: 127.0.0.1]
+    #[arg(long)]
+    host: Option<String>,
+
+    /// HTTP port to bind to (0 = random free port) [default: 0]
+    #[arg(long)]
+    port: Option<u16>,
+
+    #[command(flatten)]
+    shared: SharedRuntimeArgs,
 
     /// Background refresh interval in seconds (0 = disable) [default: 300]
     #[arg(long)]
@@ -103,7 +115,7 @@ struct QueryArgs {
 #[command(next_help_heading = HELP_HEADING_MODE_OPTIONS)]
 struct RunDaemonArgs {
     #[command(flatten)]
-    runtime: QueryArgs,
+    runtime: DaemonRuntimeArgs,
 
     /// Run daemon in foreground mode (do not spawn background process) [default: false]
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
@@ -428,7 +440,8 @@ async fn main() -> Result<()> {
 }
 
 async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Result<RunOutcome> {
-    let loaded_config = if cli.test_mode {
+    let test_mode = cli.test_mode;
+    let loaded_config = if test_mode {
         log::info!(
             "test mode enabled; ignoring config file and OPENUSAGE_* runtime environment overrides"
         );
@@ -436,6 +449,7 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
     } else {
         config::load_config_if_exists().context("failed to load config")?
     };
+
     let runtime = match loaded_config {
         Some(loaded) => {
             log::info!("using config file: {}", loaded.path.display());
@@ -443,7 +457,7 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
                 .context("failed to resolve runtime options")?
         }
         None => {
-            if !cli.test_mode {
+            if !test_mode {
                 let path = config::config_path().context("failed to resolve config path")?;
                 log::info!(
                     "config file not found at {}; using CLI/env/default values",
@@ -457,63 +471,225 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
     let app_version = APP_VERSION.to_string();
 
     log::info!("starting openusage-cli v{}", app_version);
-    log::debug!(
-        "startup options: mode={}, foreground={}, host={}, port={}, refresh_interval_secs={}, existing_instance={}, service_mode={}, daemon_child={}, test_mode={}, plugins_dir={:?}, enabled_plugins='{}', app_data_dir={:?}, plugin_overrides_dir={:?}, log_level={}",
-        runtime.mode.as_str(),
-        runtime.foreground,
-        runtime.host,
-        runtime.port,
-        runtime.refresh_interval_secs,
-        runtime.existing_instance_policy,
-        runtime.service_mode,
-        runtime.daemon_child,
-        runtime.test_mode,
-        runtime.plugins_dir,
-        runtime.enabled_plugins,
-        runtime.app_data_dir,
-        runtime.plugin_overrides_dir,
-        runtime.log_level
-    );
-
-    // Resolve app_data_dir early - needed for daemon discovery in test mode
-    let app_data_dir = resolve_app_data_dir(runtime.app_data_dir.clone(), runtime.test_mode)
-        .context("failed to resolve app data directory")?;
-    let test_runtime_dir = runtime
-        .test_mode
-        .then(|| app_data_dir.join(config::RUNTIME_DIR_NAME));
-
-    // Query mode: try to connect to an existing daemon first
-    if runtime.mode == RuntimeMode::Query {
-        log::debug!("query mode enabled; attempting to discover running daemon");
-
-        if let Some(running_instance) =
-            instance_control::discover_running_instance(test_runtime_dir.as_deref()).await
-        {
-            log::info!(
-                "discovered running daemon at {} (service_mode={}); querying for data",
-                running_instance.base_url,
-                running_instance.service_mode
+    match &runtime {
+        RuntimeCli::Query(query_runtime) => {
+            log::debug!(
+                "startup options: mode=query, test_mode={}, plugins_dir={:?}, enabled_plugins='{}', app_data_dir={:?}, plugin_overrides_dir={:?}, log_level={}",
+                query_runtime.shared.test_mode,
+                query_runtime.shared.plugins_dir,
+                query_runtime.shared.enabled_plugins,
+                query_runtime.shared.app_data_dir,
+                query_runtime.shared.plugin_overrides_dir,
+                query_runtime.shared.log_level
             );
-            match query_daemon_via_http(&running_instance.base_url).await {
-                Ok(json_output) => {
-                    println!("{}", json_output);
-                    return Ok(RunOutcome::Completed);
-                }
-                Err(err) => {
-                    log::warn!(
-                        "failed to query running daemon: {}; falling back to local plugin execution",
-                        err
-                    );
-                }
-            }
-        } else {
-            log::info!("no running daemon discovered; falling back to local plugin execution");
+        }
+        RuntimeCli::RunDaemon(daemon_runtime) => {
+            log::debug!(
+                "startup options: mode={}, foreground={}, host={}, port={}, refresh_interval_secs={}, existing_instance={}, service_mode={}, daemon_child={}, test_mode={}, plugins_dir={:?}, enabled_plugins='{}', app_data_dir={:?}, plugin_overrides_dir={:?}, log_level={}",
+                CMD_RUN_DAEMON,
+                daemon_runtime.foreground,
+                daemon_runtime.host,
+                daemon_runtime.port,
+                daemon_runtime.refresh_interval_secs,
+                daemon_runtime.existing_instance_policy,
+                daemon_runtime.service_mode,
+                daemon_runtime.daemon_child,
+                daemon_runtime.shared.test_mode,
+                daemon_runtime.shared.plugins_dir,
+                daemon_runtime.shared.enabled_plugins,
+                daemon_runtime.shared.app_data_dir,
+                daemon_runtime.shared.plugin_overrides_dir,
+                daemon_runtime.shared.log_level
+            );
         }
     }
 
+    match runtime {
+        RuntimeCli::Query(query_runtime) => run_query_mode(query_runtime, &app_version).await,
+        RuntimeCli::RunDaemon(daemon_runtime) => {
+            run_daemon_mode(daemon_runtime, &app_version, raw_args).await
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeDirectories {
+    app_data_dir: PathBuf,
+    test_runtime_dir: Option<PathBuf>,
+}
+
+#[derive(Clone)]
+struct InitializedRuntimeContext {
+    daemon: Arc<DaemonState>,
+    app_data_dir: PathBuf,
+    plugins_dir: PathBuf,
+    plugin_overrides_dir: Option<PathBuf>,
+}
+
+fn resolve_runtime_directories(shared: &SharedRuntimeCli) -> Result<RuntimeDirectories> {
+    let app_data_dir = resolve_app_data_dir(shared.app_data_dir.clone(), shared.test_mode)
+        .context("failed to resolve app data directory")?;
+    let test_runtime_dir = shared
+        .test_mode
+        .then(|| app_data_dir.join(config::RUNTIME_DIR_NAME));
+
+    Ok(RuntimeDirectories {
+        app_data_dir,
+        test_runtime_dir,
+    })
+}
+
+async fn initialize_runtime_context(
+    shared: &SharedRuntimeCli,
+    app_version: &str,
+    app_data_dir: PathBuf,
+) -> Result<InitializedRuntimeContext> {
+    log::info!("using app data dir: {}", app_data_dir.display());
+    std::fs::create_dir_all(&app_data_dir).with_context(|| {
+        format!(
+            "failed to create app data directory {}",
+            app_data_dir.display()
+        )
+    })?;
+    log::debug!("ensured app data directory exists");
+
+    let plugins_dir = resolve_plugins_dir(shared.plugins_dir.clone(), shared.test_mode)
+        .context("failed to resolve plugins directory")?;
+    log::info!("using plugins dir: {}", plugins_dir.display());
+
+    let loaded_plugins = manifest::load_plugins_from_dir(&plugins_dir);
+    if loaded_plugins.is_empty() {
+        anyhow::bail!(
+            "no plugins found in {} (set --plugins-dir or install plugin data under <prefix>/share/openusage-cli/openusage-plugins)",
+            plugins_dir.display()
+        );
+    }
+
+    let loaded_plugin_ids: Vec<String> = loaded_plugins
+        .iter()
+        .map(|p| p.manifest.id.clone())
+        .collect();
+    log::info!(
+        "loaded {} plugins from {}",
+        loaded_plugins.len(),
+        plugins_dir.display()
+    );
+    log::debug!("loaded plugin ids: {:?}", loaded_plugin_ids);
+
+    let enabled_plugins_matcher = EnabledPluginsMatcher::from_csv(&shared.enabled_plugins)
+        .with_context(|| {
+            format!(
+                "invalid enabled_plugins value '{}' (expected comma-separated glob masks)",
+                shared.enabled_plugins
+            )
+        })?;
+    let total_loaded_plugins = loaded_plugins.len();
+    let plugins: Vec<_> = loaded_plugins
+        .into_iter()
+        .filter(|plugin| enabled_plugins_matcher.is_enabled(&plugin.manifest.id))
+        .collect();
+
+    if plugins.is_empty() {
+        anyhow::bail!(
+            "no plugins enabled after applying enabled_plugins='{}'. loaded plugin ids: {:?}",
+            shared.enabled_plugins,
+            loaded_plugin_ids
+        );
+    }
+
+    let plugin_ids: Vec<String> = plugins.iter().map(|p| p.manifest.id.clone()).collect();
+    log::info!(
+        "enabled {} of {} plugins (enabled_plugins='{}')",
+        plugins.len(),
+        total_loaded_plugins,
+        shared.enabled_plugins
+    );
+    log::debug!("enabled plugin ids: {:?}", plugin_ids);
+
+    let plugin_overrides_dir =
+        resolve_plugin_overrides_dir(shared.plugin_overrides_dir.clone(), shared.test_mode)
+            .context("failed to resolve plugin overrides directory")?;
+    if let Some(path) = &plugin_overrides_dir {
+        log::info!("using plugin overrides dir: {}", path.display());
+    } else {
+        log::info!("plugin overrides disabled (no overrides dir found)");
+    }
+
+    let daemon = Arc::new(DaemonState::new(
+        plugins,
+        app_data_dir.clone(),
+        app_version.to_string(),
+        plugin_overrides_dir.clone(),
+    ));
+
+    log::info!("running initial plugin refresh");
+    match daemon.refresh(None).await {
+        Ok(snapshots) => {
+            log::info!("initial plugin refresh completed");
+            log_plugin_initialization_summary(&snapshots);
+        }
+        Err(err) => {
+            log::warn!("initial plugin refresh failed: {}", err);
+            log_plugin_initialization_failure_summary(&plugin_ids, &err.to_string());
+        }
+    }
+
+    Ok(InitializedRuntimeContext {
+        daemon,
+        app_data_dir,
+        plugins_dir,
+        plugin_overrides_dir,
+    })
+}
+
+async fn run_query_mode(runtime: QueryRuntimeCli, app_version: &str) -> Result<RunOutcome> {
+    let dirs = resolve_runtime_directories(&runtime.shared)?;
+    log::debug!("query mode enabled; attempting to discover running daemon");
+
+    if let Some(running_instance) =
+        instance_control::discover_running_instance(dirs.test_runtime_dir.as_deref()).await
+    {
+        log::info!(
+            "discovered running daemon at {} (service_mode={}); querying for data",
+            running_instance.base_url,
+            running_instance.service_mode
+        );
+        match query_daemon_via_http(&running_instance.base_url).await {
+            Ok(json_output) => {
+                println!("{}", json_output);
+                return Ok(RunOutcome::Completed);
+            }
+            Err(err) => {
+                log::warn!(
+                    "failed to query running daemon: {}; falling back to local plugin execution",
+                    err
+                );
+            }
+        }
+    } else {
+        log::info!("no running daemon discovered; falling back to local plugin execution");
+    }
+
+    let initialized =
+        initialize_runtime_context(&runtime.shared, app_version, dirs.app_data_dir.clone()).await?;
+    let snapshots = initialized.daemon.cached(None).await;
+    let json_output =
+        serde_json::to_string(&snapshots).context("failed to serialize query results")?;
+    println!("{}", json_output);
+
+    Ok(RunOutcome::Completed)
+}
+
+async fn run_daemon_mode(
+    runtime: DaemonRuntimeCli,
+    app_version: &str,
+    raw_args: &[OsString],
+) -> Result<RunOutcome> {
+    let dirs = resolve_runtime_directories(&runtime.shared)?;
+
     if should_spawn_daemon_parent(&runtime) {
         if let Some(running_instance) =
-            instance_control::discover_running_instance(test_runtime_dir.as_deref()).await
+            instance_control::discover_running_instance(dirs.test_runtime_dir.as_deref()).await
         {
             match runtime.existing_instance_policy {
                 ExistingInstancePolicy::Error => {
@@ -574,102 +750,10 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
         log::info!("run-daemon enabled; spawned background process pid={child_pid}");
         return Ok(RunOutcome::Completed);
     }
-    log::info!("using app data dir: {}", app_data_dir.display());
-    std::fs::create_dir_all(&app_data_dir).with_context(|| {
-        format!(
-            "failed to create app data directory {}",
-            app_data_dir.display()
-        )
-    })?;
-    log::debug!("ensured app data directory exists");
 
-    let plugins_dir = resolve_plugins_dir(runtime.plugins_dir.clone(), runtime.test_mode)
-        .context("failed to resolve plugins directory")?;
-    log::info!("using plugins dir: {}", plugins_dir.display());
-    let loaded_plugins = manifest::load_plugins_from_dir(&plugins_dir);
-    if loaded_plugins.is_empty() {
-        anyhow::bail!(
-            "no plugins found in {} (set --plugins-dir or install plugin data under <prefix>/share/openusage-cli/openusage-plugins)",
-            plugins_dir.display()
-        );
-    }
-
-    let loaded_plugin_ids: Vec<String> = loaded_plugins
-        .iter()
-        .map(|p| p.manifest.id.clone())
-        .collect();
-    log::info!(
-        "loaded {} plugins from {}",
-        loaded_plugins.len(),
-        plugins_dir.display()
-    );
-    log::debug!("loaded plugin ids: {:?}", loaded_plugin_ids);
-
-    let enabled_plugins_matcher = EnabledPluginsMatcher::from_csv(&runtime.enabled_plugins)
-        .with_context(|| {
-            format!(
-                "invalid enabled_plugins value '{}' (expected comma-separated glob masks)",
-                runtime.enabled_plugins
-            )
-        })?;
-    let total_loaded_plugins = loaded_plugins.len();
-    let plugins: Vec<_> = loaded_plugins
-        .into_iter()
-        .filter(|plugin| enabled_plugins_matcher.is_enabled(&plugin.manifest.id))
-        .collect();
-
-    if plugins.is_empty() {
-        anyhow::bail!(
-            "no plugins enabled after applying enabled_plugins='{}'. loaded plugin ids: {:?}",
-            runtime.enabled_plugins,
-            loaded_plugin_ids
-        );
-    }
-
-    let plugin_ids: Vec<String> = plugins.iter().map(|p| p.manifest.id.clone()).collect();
-    log::info!(
-        "enabled {} of {} plugins (enabled_plugins='{}')",
-        plugins.len(),
-        total_loaded_plugins,
-        runtime.enabled_plugins
-    );
-    log::debug!("enabled plugin ids: {:?}", plugin_ids);
-
-    let plugin_overrides_dir =
-        resolve_plugin_overrides_dir(runtime.plugin_overrides_dir.clone(), runtime.test_mode)
-            .context("failed to resolve plugin overrides directory")?;
-    if let Some(path) = &plugin_overrides_dir {
-        log::info!("using plugin overrides dir: {}", path.display());
-    } else {
-        log::info!("plugin overrides disabled (no overrides dir found)");
-    }
-
-    let daemon = Arc::new(DaemonState::new(
-        plugins,
-        app_data_dir.clone(),
-        app_version.clone(),
-        plugin_overrides_dir.clone(),
-    ));
-
-    log::info!("running initial plugin refresh");
-    match daemon.refresh(None).await {
-        Ok(snapshots) => {
-            log::info!("initial plugin refresh completed");
-            log_plugin_initialization_summary(&snapshots);
-        }
-        Err(err) => {
-            log::warn!("initial plugin refresh failed: {}", err);
-            log_plugin_initialization_failure_summary(&plugin_ids, &err.to_string());
-        }
-    }
-
-    if runtime.mode == RuntimeMode::Query {
-        let snapshots = daemon.cached(None).await;
-        let json_output =
-            serde_json::to_string(&snapshots).context("failed to serialize query results")?;
-        println!("{}", json_output);
-        return Ok(RunOutcome::Completed);
-    }
+    let initialized =
+        initialize_runtime_context(&runtime.shared, app_version, dirs.app_data_dir.clone()).await?;
+    let daemon = initialized.daemon.clone();
 
     const RESET_CHECK_MARGIN_SECS: u64 = 5;
     const RESET_RETRY_DELAY_SECS: u64 = 30;
@@ -687,10 +771,7 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
             let mut interval_timer = create_refresh_interval(refresh_every).await;
 
             loop {
-                // Track when we triggered refresh due to limit reset (for retry timeout)
                 let mut proactive_trigger_time: Option<tokio::time::Instant> = None;
-
-                // Calculate when the next limit reset occurs
                 let reset_delay = refresh_state
                     .time_until_next_reset(RESET_CHECK_MARGIN_SECS)
                     .await;
@@ -702,7 +783,6 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
                         RESET_CHECK_MARGIN_SECS
                     );
 
-                    // Wait for either the interval or the reset, whichever comes first
                     tokio::select! {
                         _ = interval_timer.tick() => {
                             log::debug!("running scheduled interval refresh");
@@ -713,7 +793,6 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
                         }
                     }
                 } else {
-                    // No upcoming resets known, just wait for the interval
                     interval_timer.tick().await;
                     log::debug!("running scheduled interval refresh (no upcoming resets)");
                 }
@@ -762,7 +841,7 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
         log::info!("skipping daemon endpoint publication because --existing-instance=ignore");
         None
     } else {
-        let discovery = PublishedDiscovery::publish(bound_addr, test_runtime_dir.as_deref())
+        let discovery = PublishedDiscovery::publish(bound_addr, dirs.test_runtime_dir.as_deref())
             .context("failed to publish daemon endpoint")?;
         log::info!(
             "published daemon endpoint file: {}",
@@ -780,22 +859,22 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
     let lifecycle_reason = Arc::new(AtomicU8::new(LIFECYCLE_NONE));
 
     let runtime_config = RuntimeConfig {
-        app_version: app_version.clone(),
+        app_version: app_version.to_string(),
         host: runtime.host.clone(),
         port: bound_addr.port(),
         service_mode: runtime.service_mode.to_string(),
         existing_instance_policy: runtime.existing_instance_policy.to_string(),
-        plugins_dir: Some(plugins_dir.clone()),
-        enabled_plugins: runtime.enabled_plugins.clone(),
-        app_data_dir: Some(app_data_dir.clone()),
-        plugin_overrides_dir: plugin_overrides_dir.clone(),
+        plugins_dir: Some(initialized.plugins_dir.clone()),
+        enabled_plugins: runtime.shared.enabled_plugins.clone(),
+        app_data_dir: Some(initialized.app_data_dir.clone()),
+        plugin_overrides_dir: initialized.plugin_overrides_dir.clone(),
         refresh_interval_secs: runtime.refresh_interval_secs,
-        log_level: runtime.log_level.clone(),
+        log_level: runtime.shared.log_level.clone(),
     };
 
     let app = http_api::router(ApiState {
         daemon,
-        app_version,
+        app_version: app_version.to_string(),
         config: runtime_config,
         lifecycle_tx: Some(lifecycle_tx),
     });
@@ -815,25 +894,25 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
     .with_graceful_shutdown({
         let lifecycle_reason = Arc::clone(&lifecycle_reason);
         async move {
-        tokio::select! {
-            _ = shutdown_signal() => {},
-            command = lifecycle_rx => {
-                match command {
-                    Ok(LifecycleCommand::Shutdown) => {
-                        lifecycle_reason.store(LIFECYCLE_SHUTDOWN, Ordering::Relaxed);
-                        log::info!("shutdown triggered via HTTP API");
-                    }
-                    Ok(LifecycleCommand::Restart) => {
-                        lifecycle_reason.store(LIFECYCLE_RESTART, Ordering::Relaxed);
-                        log::info!("restart triggered via HTTP API");
-                    }
-                    Err(_) => {
-                        log::warn!("lifecycle control channel closed before command was received");
+            tokio::select! {
+                _ = shutdown_signal() => {},
+                command = lifecycle_rx => {
+                    match command {
+                        Ok(LifecycleCommand::Shutdown) => {
+                            lifecycle_reason.store(LIFECYCLE_SHUTDOWN, Ordering::Relaxed);
+                            log::info!("shutdown triggered via HTTP API");
+                        }
+                        Ok(LifecycleCommand::Restart) => {
+                            lifecycle_reason.store(LIFECYCLE_RESTART, Ordering::Relaxed);
+                            log::info!("restart triggered via HTTP API");
+                        }
+                        Err(_) => {
+                            log::warn!("lifecycle control channel closed before command was received");
+                        }
                     }
                 }
             }
         }
-    }
     })
     .await
     .context("http server failed");
@@ -870,42 +949,42 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RuntimeMode {
-    Query,
-    RunDaemon,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunOutcome {
     Completed,
     ExitWithCode(i32),
 }
 
-impl RuntimeMode {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Query => "query",
-            Self::RunDaemon => CMD_RUN_DAEMON,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
-struct RuntimeCli {
-    mode: RuntimeMode,
-    foreground: bool,
-    host: String,
-    port: u16,
+struct SharedRuntimeCli {
     plugins_dir: Option<PathBuf>,
     enabled_plugins: String,
     app_data_dir: Option<PathBuf>,
     plugin_overrides_dir: Option<PathBuf>,
+    test_mode: bool,
+    log_level: String,
+}
+
+#[derive(Debug, Clone)]
+struct QueryRuntimeCli {
+    shared: SharedRuntimeCli,
+}
+
+#[derive(Debug, Clone)]
+struct DaemonRuntimeCli {
+    shared: SharedRuntimeCli,
+    foreground: bool,
+    host: String,
+    port: u16,
     refresh_interval_secs: u64,
     existing_instance_policy: ExistingInstancePolicy,
     service_mode: ServiceMode,
     daemon_child: bool,
-    test_mode: bool,
-    log_level: String,
+}
+
+#[derive(Debug, Clone)]
+enum RuntimeCli {
+    Query(QueryRuntimeCli),
+    RunDaemon(DaemonRuntimeCli),
 }
 
 impl RuntimeCli {
@@ -917,119 +996,113 @@ impl RuntimeCli {
             test_mode,
             command,
         } = cli;
-        let mode_selection = resolve_runtime_mode_and_args(command)?;
-        let RuntimeModeSelection {
-            mode,
-            runtime_args: mode_args,
-            foreground: mode_foreground,
-            existing_instance: mode_existing_instance,
-            service_mode: mode_service_mode,
-            daemon_child,
-        } = mode_selection;
-        let config_existing_instance = config.existing_instance.clone();
-        let host = mode_args
-            .host
-            .or(config.host)
-            .unwrap_or_else(|| config::DEFAULT_HOST.to_string());
-        let port = mode_args
-            .port
-            .or(config.port)
-            .unwrap_or(config::DEFAULT_PORT);
-        let refresh_interval_secs = mode_args
-            .refresh_interval_secs
-            .or(config.refresh_interval_secs)
-            .unwrap_or(config::DEFAULT_REFRESH_INTERVAL_SECS);
-        let config_existing_instance_policy = match config_existing_instance {
-            Some(value) => Some(
-                ExistingInstancePolicy::parse(&value)
-                    .with_context(|| format!("invalid existing_instance value '{}'", value))?,
-            ),
-            None => None,
-        };
-        let existing_instance_policy = mode_existing_instance
-            .or(config_existing_instance_policy)
-            .unwrap_or(ExistingInstancePolicy::Error);
-        let foreground = mode_foreground.or(config.foreground).unwrap_or(false);
-        let service_mode = mode_service_mode.unwrap_or(ServiceMode::Standalone);
-        let enabled_plugins = mode_args
-            .enabled_plugins
-            .or(env.enabled_plugins)
-            .or_else(|| config.enabled_plugins.map(|masks| masks.join(",")))
-            .unwrap_or_else(|| config::DEFAULT_ENABLED_PLUGINS.to_string());
         let raw_log_level = cli_log_level
             .map(|level| level.as_str().to_string())
-            .or(env.log_level)
-            .or(config.log_level)
+            .or(env.log_level.clone())
+            .or(config.log_level.clone())
             .unwrap_or_else(|| config::DEFAULT_LOG_LEVEL.to_string());
         let log_level = normalize_log_level(raw_log_level)?;
 
-        Ok(Self {
-            mode,
-            foreground,
-            host,
-            port,
-            plugins_dir: mode_args
-                .plugins_dir
-                .or(env.plugins_dir)
-                .or(config.plugins_dir),
-            enabled_plugins,
-            app_data_dir: mode_args
-                .app_data_dir
-                .or(env.app_data_dir)
-                .or(config.app_data_dir),
-            plugin_overrides_dir: mode_args
-                .plugin_overrides_dir
-                .or(env.plugin_overrides_dir)
-                .or(config.plugin_overrides_dir),
-            refresh_interval_secs,
-            existing_instance_policy,
-            service_mode,
-            daemon_child,
-            test_mode,
-            log_level,
-        })
+        match command {
+            Some(ModeCommand::Query(args)) => Ok(Self::Query(QueryRuntimeCli {
+                shared: resolve_shared_runtime(args.shared, test_mode, log_level, &env, &config),
+            })),
+            Some(ModeCommand::RunDaemon(args)) => {
+                let runtime_args = args.runtime;
+                let shared = resolve_shared_runtime(
+                    runtime_args.shared,
+                    test_mode,
+                    log_level,
+                    &env,
+                    &config,
+                );
+                let host = runtime_args
+                    .host
+                    .or(config.host)
+                    .unwrap_or_else(|| config::DEFAULT_HOST.to_string());
+                let port = runtime_args
+                    .port
+                    .or(config.port)
+                    .unwrap_or(config::DEFAULT_PORT);
+                let refresh_interval_secs = runtime_args
+                    .refresh_interval_secs
+                    .or(config.refresh_interval_secs)
+                    .unwrap_or(config::DEFAULT_REFRESH_INTERVAL_SECS);
+                let config_existing_instance_policy = match config.existing_instance {
+                    Some(value) => {
+                        Some(ExistingInstancePolicy::parse(&value).with_context(|| {
+                            format!("invalid existing_instance value '{}'", value)
+                        })?)
+                    }
+                    None => None,
+                };
+                let existing_instance_policy = args
+                    .existing_instance
+                    .or(config_existing_instance_policy)
+                    .unwrap_or(ExistingInstancePolicy::Error);
+                let foreground = args.foreground.or(config.foreground).unwrap_or(false);
+                let service_mode = args.service_mode.unwrap_or(ServiceMode::Standalone);
+
+                Ok(Self::RunDaemon(DaemonRuntimeCli {
+                    shared,
+                    foreground,
+                    host,
+                    port,
+                    refresh_interval_secs,
+                    existing_instance_policy,
+                    service_mode,
+                    daemon_child: args.daemon_child,
+                }))
+            }
+            None => Ok(Self::Query(QueryRuntimeCli {
+                shared: resolve_shared_runtime(
+                    QueryArgs::default().shared,
+                    test_mode,
+                    log_level,
+                    &env,
+                    &config,
+                ),
+            })),
+            Some(
+                ModeCommand::ShowDefaultConfig
+                | ModeCommand::InstallSystemdUnit
+                | ModeCommand::Version,
+            ) => {
+                anyhow::bail!("internal error: non-runtime command reached runtime option resolver")
+            }
+        }
     }
 }
 
-#[derive(Debug, Clone)]
-struct RuntimeModeSelection {
-    mode: RuntimeMode,
-    runtime_args: QueryArgs,
-    foreground: Option<bool>,
-    existing_instance: Option<ExistingInstancePolicy>,
-    service_mode: Option<ServiceMode>,
-    daemon_child: bool,
-}
+fn resolve_shared_runtime(
+    mode_args: SharedRuntimeArgs,
+    test_mode: bool,
+    log_level: String,
+    env: &EnvOverrides,
+    config: &config::AppConfig,
+) -> SharedRuntimeCli {
+    let enabled_plugins = mode_args
+        .enabled_plugins
+        .or(env.enabled_plugins.clone())
+        .or_else(|| config.enabled_plugins.clone().map(|masks| masks.join(",")))
+        .unwrap_or_else(|| config::DEFAULT_ENABLED_PLUGINS.to_string());
 
-fn resolve_runtime_mode_and_args(command: Option<ModeCommand>) -> Result<RuntimeModeSelection> {
-    match command {
-        Some(ModeCommand::Query(args)) => Ok(RuntimeModeSelection {
-            mode: RuntimeMode::Query,
-            runtime_args: args,
-            foreground: None,
-            existing_instance: None,
-            service_mode: None,
-            daemon_child: false,
-        }),
-        Some(ModeCommand::RunDaemon(args)) => Ok(RuntimeModeSelection {
-            mode: RuntimeMode::RunDaemon,
-            runtime_args: args.runtime,
-            foreground: args.foreground,
-            existing_instance: args.existing_instance,
-            service_mode: args.service_mode,
-            daemon_child: args.daemon_child,
-        }),
-        None => Ok(RuntimeModeSelection {
-            mode: RuntimeMode::Query,
-            runtime_args: QueryArgs::default(),
-            foreground: None,
-            existing_instance: None,
-            service_mode: None,
-            daemon_child: false,
-        }),
-        Some(
-            ModeCommand::ShowDefaultConfig | ModeCommand::InstallSystemdUnit | ModeCommand::Version,
-        ) => anyhow::bail!("internal error: non-runtime command reached runtime option resolver"),
+    SharedRuntimeCli {
+        plugins_dir: mode_args
+            .plugins_dir
+            .or(env.plugins_dir.clone())
+            .or(config.plugins_dir.clone()),
+        enabled_plugins,
+        app_data_dir: mode_args
+            .app_data_dir
+            .or(env.app_data_dir.clone())
+            .or(config.app_data_dir.clone()),
+        plugin_overrides_dir: mode_args
+            .plugin_overrides_dir
+            .or(env.plugin_overrides_dir.clone())
+            .or(config.plugin_overrides_dir.clone()),
+        test_mode,
+        log_level,
     }
 }
 
@@ -1377,8 +1450,8 @@ async fn run_past_reset_retry_loop(
     retry_attempts
 }
 
-fn should_spawn_daemon_parent(runtime: &RuntimeCli) -> bool {
-    runtime.mode == RuntimeMode::RunDaemon && !runtime.daemon_child && !runtime.foreground
+fn should_spawn_daemon_parent(runtime: &DaemonRuntimeCli) -> bool {
+    !runtime.daemon_child && !runtime.foreground
 }
 
 async fn shutdown_signal() {
@@ -1787,6 +1860,20 @@ mod tests {
         render_help_text(&[mode, "--help"])
     }
 
+    fn expect_query_runtime(runtime: RuntimeCli) -> QueryRuntimeCli {
+        match runtime {
+            RuntimeCli::Query(query_runtime) => query_runtime,
+            RuntimeCli::RunDaemon(_) => panic!("expected query runtime"),
+        }
+    }
+
+    fn expect_daemon_runtime(runtime: RuntimeCli) -> DaemonRuntimeCli {
+        match runtime {
+            RuntimeCli::RunDaemon(daemon_runtime) => daemon_runtime,
+            RuntimeCli::Query(_) => panic!("expected run-daemon runtime"),
+        }
+    }
+
     #[test]
     fn cli_accepts_show_default_config_command() {
         let cli = parse_with_default_mode(&["show-default-config"])
@@ -1853,39 +1940,47 @@ mod tests {
 
     #[test]
     fn cli_defaults_to_query_mode_when_mode_is_not_specified() {
-        let cli = parse_with_default_mode(&["--host", "127.0.0.2", "--port", "7001"])
-            .expect("flags without mode should parse as query mode");
+        let cli = parse_with_default_mode(&[
+            "--plugins-dir",
+            "/tmp/plugins-default",
+            "--enabled-plugins",
+            "mock",
+        ])
+        .expect("flags without mode should parse as query mode");
 
         let query_args = match cli.command {
             Some(ModeCommand::Query(args)) => args,
             _ => panic!("expected query mode by default"),
         };
-        assert_eq!(query_args.host.as_deref(), Some("127.0.0.2"));
-        assert_eq!(query_args.port, Some(7001));
+        assert_eq!(
+            query_args.shared.plugins_dir,
+            Some(PathBuf::from("/tmp/plugins-default"))
+        );
+        assert_eq!(query_args.shared.enabled_plugins.as_deref(), Some("mock"));
     }
 
     #[test]
     fn cli_accepts_query_command() {
-        let cli = parse_with_default_mode(&["query", "--host", "127.0.0.1"])
+        let cli = parse_with_default_mode(&["query", "--app-data-dir", "/tmp/query-data"])
             .expect("query command should parse");
         let query_args = match cli.command {
             Some(ModeCommand::Query(args)) => args,
             _ => panic!("expected query command"),
         };
-        assert_eq!(query_args.host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(
+            query_args.shared.app_data_dir,
+            Some(PathBuf::from("/tmp/query-data"))
+        );
     }
 
     #[test]
     fn cli_accepts_query_value_options_with_equals_syntax() {
         let cli = parse_with_default_mode(&[
             "query",
-            "--host=127.0.0.1",
-            "--port=7001",
             "--plugins-dir=/tmp/plugins-eq",
             "--enabled-plugins=mock,codex",
             "--app-data-dir=/tmp/data-eq",
             "--plugin-overrides-dir=/tmp/overrides-eq",
-            "--refresh-interval-secs=11",
             "--log-level=debug",
         ])
         .expect("query options with equals syntax should parse");
@@ -1896,19 +1991,22 @@ mod tests {
             _ => panic!("expected query command"),
         };
 
-        assert_eq!(query_args.host.as_deref(), Some("127.0.0.1"));
-        assert_eq!(query_args.port, Some(7001));
         assert_eq!(
-            query_args.plugins_dir,
+            query_args.shared.plugins_dir,
             Some(PathBuf::from("/tmp/plugins-eq"))
         );
-        assert_eq!(query_args.enabled_plugins.as_deref(), Some("mock,codex"));
-        assert_eq!(query_args.app_data_dir, Some(PathBuf::from("/tmp/data-eq")));
         assert_eq!(
-            query_args.plugin_overrides_dir,
+            query_args.shared.enabled_plugins.as_deref(),
+            Some("mock,codex")
+        );
+        assert_eq!(
+            query_args.shared.app_data_dir,
+            Some(PathBuf::from("/tmp/data-eq"))
+        );
+        assert_eq!(
+            query_args.shared.plugin_overrides_dir,
             Some(PathBuf::from("/tmp/overrides-eq"))
         );
-        assert_eq!(query_args.refresh_interval_secs, Some(11));
         assert!(matches!(log_level, Some(LogLevel::Debug)));
     }
 
@@ -1916,10 +2014,6 @@ mod tests {
     fn cli_accepts_query_value_options_with_space_syntax() {
         let cli = parse_with_default_mode(&[
             "query",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "7001",
             "--plugins-dir",
             "/tmp/plugins-space",
             "--enabled-plugins",
@@ -1928,8 +2022,6 @@ mod tests {
             "/tmp/data-space",
             "--plugin-overrides-dir",
             "/tmp/overrides-space",
-            "--refresh-interval-secs",
-            "11",
             "--log-level",
             "debug",
         ])
@@ -1941,22 +2033,22 @@ mod tests {
             _ => panic!("expected query command"),
         };
 
-        assert_eq!(query_args.host.as_deref(), Some("127.0.0.1"));
-        assert_eq!(query_args.port, Some(7001));
         assert_eq!(
-            query_args.plugins_dir,
+            query_args.shared.plugins_dir,
             Some(PathBuf::from("/tmp/plugins-space"))
         );
-        assert_eq!(query_args.enabled_plugins.as_deref(), Some("mock,codex"));
         assert_eq!(
-            query_args.app_data_dir,
+            query_args.shared.enabled_plugins.as_deref(),
+            Some("mock,codex")
+        );
+        assert_eq!(
+            query_args.shared.app_data_dir,
             Some(PathBuf::from("/tmp/data-space"))
         );
         assert_eq!(
-            query_args.plugin_overrides_dir,
+            query_args.shared.plugin_overrides_dir,
             Some(PathBuf::from("/tmp/overrides-space"))
         );
-        assert_eq!(query_args.refresh_interval_secs, Some(11));
         assert!(matches!(log_level, Some(LogLevel::Debug)));
     }
 
@@ -1987,16 +2079,19 @@ mod tests {
         assert_eq!(run_args.runtime.host.as_deref(), Some("127.0.0.1"));
         assert_eq!(run_args.runtime.port, Some(7001));
         assert_eq!(
-            run_args.runtime.plugins_dir,
+            run_args.runtime.shared.plugins_dir,
             Some(PathBuf::from("/tmp/plugins-daemon-eq"))
         );
-        assert_eq!(run_args.runtime.enabled_plugins.as_deref(), Some("mock"));
         assert_eq!(
-            run_args.runtime.app_data_dir,
+            run_args.runtime.shared.enabled_plugins.as_deref(),
+            Some("mock")
+        );
+        assert_eq!(
+            run_args.runtime.shared.app_data_dir,
             Some(PathBuf::from("/tmp/data-daemon-eq"))
         );
         assert_eq!(
-            run_args.runtime.plugin_overrides_dir,
+            run_args.runtime.shared.plugin_overrides_dir,
             Some(PathBuf::from("/tmp/overrides-daemon-eq"))
         );
         assert_eq!(run_args.runtime.refresh_interval_secs, Some(17));
@@ -2047,16 +2142,19 @@ mod tests {
         assert_eq!(run_args.runtime.host.as_deref(), Some("127.0.0.1"));
         assert_eq!(run_args.runtime.port, Some(7001));
         assert_eq!(
-            run_args.runtime.plugins_dir,
+            run_args.runtime.shared.plugins_dir,
             Some(PathBuf::from("/tmp/plugins-daemon-space"))
         );
-        assert_eq!(run_args.runtime.enabled_plugins.as_deref(), Some("mock"));
         assert_eq!(
-            run_args.runtime.app_data_dir,
+            run_args.runtime.shared.enabled_plugins.as_deref(),
+            Some("mock")
+        );
+        assert_eq!(
+            run_args.runtime.shared.app_data_dir,
             Some(PathBuf::from("/tmp/data-daemon-space"))
         );
         assert_eq!(
-            run_args.runtime.plugin_overrides_dir,
+            run_args.runtime.shared.plugin_overrides_dir,
             Some(PathBuf::from("/tmp/overrides-daemon-space"))
         );
         assert_eq!(run_args.runtime.refresh_interval_secs, Some(17));
@@ -2129,9 +2227,10 @@ mod tests {
 
     #[test]
     fn cli_rejects_query_runtime_flags_for_install_command() {
-        let err = parse_with_default_mode(&["install-systemd-unit", "--host", "127.0.0.1"])
-            .expect_err("install-systemd-unit must reject query flags");
-        assert!(err.to_string().contains("--host"));
+        let err =
+            parse_with_default_mode(&["install-systemd-unit", "--plugins-dir", "/tmp/plugins"])
+                .expect_err("install-systemd-unit must reject query flags");
+        assert!(err.to_string().contains("--plugins-dir"));
     }
 
     #[test]
@@ -2158,8 +2257,9 @@ mod tests {
             .expect("query help must include global options block");
 
         assert!(mode_block < global_block);
-        assert!(help.contains("--host <HOST>"));
-        assert!(help.contains("--port <PORT>"));
+        assert!(help.contains("--plugins-dir <PLUGINS_DIR>"));
+        assert!(!help.contains("--host <HOST>"));
+        assert!(!help.contains("--refresh-interval-secs <REFRESH_INTERVAL_SECS>"));
         assert!(help.contains("--log-level <LOG_LEVEL>"));
         assert!(help.contains("-h, --help"));
         assert!(help.contains("-V, --version"));
@@ -2201,28 +2301,23 @@ mod tests {
 
     #[test]
     fn runtime_cli_uses_defaults_when_no_input_values() {
-        let runtime = RuntimeCli::from_sources(
-            cli_without_mode(),
-            EnvOverrides::default(),
-            config::AppConfig::default(),
-        )
-        .expect("runtime defaults should resolve");
+        let runtime = expect_query_runtime(
+            RuntimeCli::from_sources(
+                cli_without_mode(),
+                EnvOverrides::default(),
+                config::AppConfig::default(),
+            )
+            .expect("runtime defaults should resolve"),
+        );
 
-        assert_eq!(runtime.host, config::DEFAULT_HOST);
-        assert_eq!(runtime.port, config::DEFAULT_PORT);
+        assert_eq!(runtime.shared.plugins_dir, None);
+        assert_eq!(runtime.shared.app_data_dir, None);
+        assert_eq!(runtime.shared.plugin_overrides_dir, None);
         assert_eq!(
-            runtime.refresh_interval_secs,
-            config::DEFAULT_REFRESH_INTERVAL_SECS
+            runtime.shared.enabled_plugins,
+            config::DEFAULT_ENABLED_PLUGINS
         );
-        assert_eq!(runtime.enabled_plugins, config::DEFAULT_ENABLED_PLUGINS);
-        assert_eq!(runtime.log_level, config::DEFAULT_LOG_LEVEL);
-        assert_eq!(runtime.mode, RuntimeMode::Query);
-        assert!(!runtime.foreground);
-        assert_eq!(
-            runtime.existing_instance_policy,
-            ExistingInstancePolicy::Error
-        );
-        assert_eq!(runtime.service_mode, ServiceMode::Standalone);
+        assert_eq!(runtime.shared.log_level, config::DEFAULT_LOG_LEVEL);
     }
 
     #[test]
@@ -2240,26 +2335,25 @@ mod tests {
             log_level: Some("debug".to_string()),
             proxy: None,
         };
-        let runtime = RuntimeCli::from_sources(empty_cli(), EnvOverrides::default(), app_config)
-            .expect("runtime config values should resolve");
+        let runtime = expect_query_runtime(
+            RuntimeCli::from_sources(empty_cli(), EnvOverrides::default(), app_config)
+                .expect("runtime config values should resolve"),
+        );
 
-        assert_eq!(runtime.host, "0.0.0.0");
-        assert_eq!(runtime.port, 9000);
-        assert_eq!(runtime.plugins_dir, Some(PathBuf::from("/tmp/plugins")));
-        assert_eq!(runtime.enabled_plugins, "codex,cur*");
-        assert_eq!(runtime.app_data_dir, Some(PathBuf::from("/tmp/data")));
         assert_eq!(
-            runtime.plugin_overrides_dir,
+            runtime.shared.plugins_dir,
+            Some(PathBuf::from("/tmp/plugins"))
+        );
+        assert_eq!(runtime.shared.enabled_plugins, "codex,cur*");
+        assert_eq!(
+            runtime.shared.app_data_dir,
+            Some(PathBuf::from("/tmp/data"))
+        );
+        assert_eq!(
+            runtime.shared.plugin_overrides_dir,
             Some(PathBuf::from("/tmp/overrides"))
         );
-        assert_eq!(runtime.refresh_interval_secs, 42);
-        assert_eq!(runtime.log_level, "debug");
-        assert_eq!(runtime.mode, RuntimeMode::Query);
-        assert!(runtime.foreground);
-        assert_eq!(
-            runtime.existing_instance_policy,
-            ExistingInstancePolicy::Ignore
-        );
+        assert_eq!(runtime.shared.log_level, "debug");
     }
 
     #[test]
@@ -2270,13 +2364,15 @@ mod tests {
             _version: None,
             test_mode: false,
             command: Some(ModeCommand::RunDaemon(RunDaemonArgs {
-                runtime: QueryArgs {
+                runtime: DaemonRuntimeArgs {
                     host: Some("127.0.0.2".to_string()),
                     port: Some(7001),
-                    plugins_dir: Some(PathBuf::from("/cli/plugins")),
-                    enabled_plugins: Some("mock".to_string()),
-                    app_data_dir: Some(PathBuf::from("/cli/data")),
-                    plugin_overrides_dir: Some(PathBuf::from("/cli/overrides")),
+                    shared: SharedRuntimeArgs {
+                        plugins_dir: Some(PathBuf::from("/cli/plugins")),
+                        enabled_plugins: Some("mock".to_string()),
+                        app_data_dir: Some(PathBuf::from("/cli/data")),
+                        plugin_overrides_dir: Some(PathBuf::from("/cli/overrides")),
+                    },
                     refresh_interval_secs: Some(7),
                 },
                 foreground: Some(true),
@@ -2299,21 +2395,28 @@ mod tests {
             proxy: None,
         };
 
-        let runtime = RuntimeCli::from_sources(cli, EnvOverrides::default(), app_config)
-            .expect("runtime CLI values should resolve");
+        let runtime = expect_daemon_runtime(
+            RuntimeCli::from_sources(cli, EnvOverrides::default(), app_config)
+                .expect("runtime CLI values should resolve"),
+        );
 
         assert_eq!(runtime.host, "127.0.0.2");
         assert_eq!(runtime.port, 7001);
-        assert_eq!(runtime.plugins_dir, Some(PathBuf::from("/cli/plugins")));
-        assert_eq!(runtime.enabled_plugins, "mock");
-        assert_eq!(runtime.app_data_dir, Some(PathBuf::from("/cli/data")));
         assert_eq!(
-            runtime.plugin_overrides_dir,
+            runtime.shared.plugins_dir,
+            Some(PathBuf::from("/cli/plugins"))
+        );
+        assert_eq!(runtime.shared.enabled_plugins, "mock");
+        assert_eq!(
+            runtime.shared.app_data_dir,
+            Some(PathBuf::from("/cli/data"))
+        );
+        assert_eq!(
+            runtime.shared.plugin_overrides_dir,
             Some(PathBuf::from("/cli/overrides"))
         );
         assert_eq!(runtime.refresh_interval_secs, 7);
-        assert_eq!(runtime.log_level, "trace");
-        assert_eq!(runtime.mode, RuntimeMode::RunDaemon);
+        assert_eq!(runtime.shared.log_level, "trace");
         assert!(runtime.foreground);
         assert_eq!(
             runtime.existing_instance_policy,
@@ -2331,7 +2434,7 @@ mod tests {
         )
         .expect("runtime mode should resolve");
 
-        assert_eq!(runtime.mode, RuntimeMode::Query);
+        assert!(matches!(runtime, RuntimeCli::Query(_)));
     }
 
     #[test]
@@ -2340,7 +2443,7 @@ mod tests {
             _help: None,
             _version: None,
             command: Some(ModeCommand::RunDaemon(RunDaemonArgs {
-                runtime: QueryArgs::default(),
+                runtime: DaemonRuntimeArgs::default(),
                 foreground: None,
                 existing_instance: None,
                 service_mode: None,
@@ -2353,43 +2456,70 @@ mod tests {
             RuntimeCli::from_sources(cli, EnvOverrides::default(), config::AppConfig::default())
                 .expect("runtime mode should resolve");
 
-        assert_eq!(runtime.mode, RuntimeMode::RunDaemon);
+        assert!(matches!(runtime, RuntimeCli::RunDaemon(_)));
     }
 
     #[test]
-    fn runtime_cli_rejects_invalid_config_existing_instance_value() {
+    fn runtime_cli_rejects_invalid_config_existing_instance_value_for_run_daemon() {
         let app_config = config::AppConfig {
             existing_instance: Some("invalid".to_string()),
             ..config::AppConfig::default()
         };
 
-        let err = RuntimeCli::from_sources(empty_cli(), EnvOverrides::default(), app_config)
-            .expect_err("invalid existing_instance value must be rejected");
+        let cli = Cli {
+            command: Some(ModeCommand::RunDaemon(RunDaemonArgs {
+                runtime: DaemonRuntimeArgs::default(),
+                foreground: None,
+                existing_instance: None,
+                service_mode: None,
+                daemon_child: false,
+            })),
+            ..empty_cli()
+        };
+
+        let err = RuntimeCli::from_sources(cli, EnvOverrides::default(), app_config)
+            .expect_err("invalid existing_instance value must be rejected in run-daemon mode");
         assert!(err.to_string().contains("invalid existing_instance"));
     }
 
     #[test]
-    fn should_spawn_daemon_parent_respects_mode_and_foreground() {
-        let mut runtime = RuntimeCli::from_sources(
-            empty_cli(),
-            EnvOverrides::default(),
-            config::AppConfig::default(),
-        )
-        .expect("runtime values should resolve");
+    fn runtime_cli_query_mode_ignores_existing_instance_config() {
+        let app_config = config::AppConfig {
+            existing_instance: Some("invalid".to_string()),
+            ..config::AppConfig::default()
+        };
 
-        runtime.mode = RuntimeMode::RunDaemon;
-        runtime.daemon_child = false;
-        runtime.foreground = false;
+        let runtime = RuntimeCli::from_sources(empty_cli(), EnvOverrides::default(), app_config)
+            .expect("query mode should ignore existing_instance config");
+        assert!(matches!(runtime, RuntimeCli::Query(_)));
+    }
+
+    #[test]
+    fn should_spawn_daemon_parent_respects_foreground_and_child() {
+        let shared = SharedRuntimeCli {
+            plugins_dir: None,
+            enabled_plugins: config::DEFAULT_ENABLED_PLUGINS.to_string(),
+            app_data_dir: None,
+            plugin_overrides_dir: None,
+            test_mode: false,
+            log_level: config::DEFAULT_LOG_LEVEL.to_string(),
+        };
+
+        let mut runtime = DaemonRuntimeCli {
+            shared,
+            foreground: false,
+            host: config::DEFAULT_HOST.to_string(),
+            port: config::DEFAULT_PORT,
+            refresh_interval_secs: config::DEFAULT_REFRESH_INTERVAL_SECS,
+            existing_instance_policy: ExistingInstancePolicy::Error,
+            service_mode: ServiceMode::Standalone,
+            daemon_child: false,
+        };
+
         assert!(should_spawn_daemon_parent(&runtime));
-
         runtime.foreground = true;
         assert!(!should_spawn_daemon_parent(&runtime));
         runtime.foreground = false;
-
-        runtime.mode = RuntimeMode::Query;
-        assert!(!should_spawn_daemon_parent(&runtime));
-
-        runtime.mode = RuntimeMode::RunDaemon;
         runtime.daemon_child = true;
         assert!(!should_spawn_daemon_parent(&runtime));
     }
@@ -2434,17 +2564,25 @@ mod tests {
             ..config::AppConfig::default()
         };
 
-        let runtime = RuntimeCli::from_sources(cli, env, app_config)
-            .expect("runtime env values should resolve");
+        let runtime = expect_query_runtime(
+            RuntimeCli::from_sources(cli, env, app_config)
+                .expect("runtime env values should resolve"),
+        );
 
-        assert_eq!(runtime.plugins_dir, Some(PathBuf::from("/env/plugins")));
-        assert_eq!(runtime.enabled_plugins, "mock");
-        assert_eq!(runtime.app_data_dir, Some(PathBuf::from("/env/data")));
         assert_eq!(
-            runtime.plugin_overrides_dir,
+            runtime.shared.plugins_dir,
+            Some(PathBuf::from("/env/plugins"))
+        );
+        assert_eq!(runtime.shared.enabled_plugins, "mock");
+        assert_eq!(
+            runtime.shared.app_data_dir,
+            Some(PathBuf::from("/env/data"))
+        );
+        assert_eq!(
+            runtime.shared.plugin_overrides_dir,
             Some(PathBuf::from("/env/overrides"))
         );
-        assert_eq!(runtime.log_level, "info");
+        assert_eq!(runtime.shared.log_level, "info");
     }
 
     #[test]

@@ -77,16 +77,22 @@ sudo zypper install ./openusage-cli-<version>-1.<arch>.rpm
 ## Run
 
 ```bash
-openusage-cli query --host 127.0.0.1 --port 0
+openusage-cli query
 ```
 
 If mode is omitted, `query` is used by default, so this is equivalent:
 
 ```bash
-openusage-cli --host 127.0.0.1 --port 0
+openusage-cli
 ```
 
-Default bind port is `0` (random free port assigned by OS).
+For daemon mode bind options, use:
+
+```bash
+openusage-cli run-daemon --host 127.0.0.1 --port 0
+```
+
+Default daemon bind port is `0` (random free port assigned by OS).
 
 Commands:
 
@@ -105,13 +111,14 @@ Runtime flags (`query`, `run-daemon`):
 
 - `--plugins-dir <path>` (or `OPENUSAGE_PLUGINS_DIR`)
 - `--enabled-plugins <csv-globs>` (or `OPENUSAGE_ENABLED_PLUGINS`, default: `*`)
-- `--port <port>` (default: `0` = random free port)
 - `--app-data-dir <path>` (or `OPENUSAGE_APP_DATA_DIR`)
 - `--plugin-overrides-dir <path>` (or `OPENUSAGE_PLUGIN_OVERRIDES_DIR`)
-- `--refresh-interval-secs <seconds>` (default: `300`)
 
 `run-daemon`-only flags:
 
+- `--host <host>` (default: `127.0.0.1`)
+- `--port <port>` (default: `0` = random free port)
+- `--refresh-interval-secs <seconds>` (default: `300`)
 - `--existing-instance <error|ignore|replace>` (default: `error`; controls behavior when a running daemon is already discovered)
 - `--service-mode <standalone|systemd>` (default: `standalone`; mainly for service managers)
 - `--foreground[=true|false]` (optional value; `--foreground` means `true`; default: `false`)
