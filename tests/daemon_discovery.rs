@@ -449,6 +449,64 @@ fn query_mode_plugins_connects_to_running_daemon() {
 }
 
 #[test]
+fn query_mode_with_state_reports_cache_when_daemon_response_is_used() {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home_dir = temp.path().join("home");
+    let app_data_dir = temp.path().join("app-data");
+
+    fs::create_dir_all(&home_dir).expect("create HOME dir");
+    fs::create_dir_all(&app_data_dir).expect("create app data dir");
+
+    let mut daemon = DaemonProcess::spawn(&workspace_root, &home_dir, &app_data_dir);
+
+    let endpoint_path = app_data_dir
+        .join(RUNTIME_DIR_NAME)
+        .join(DAEMON_ENDPOINT_FILE_NAME);
+    wait_for_endpoint_file(&endpoint_path, daemon.child_mut());
+    let endpoint_url = read_endpoint_url(&endpoint_path);
+    wait_for_health_ok(&endpoint_url, daemon.child_mut());
+
+    let daemon_bin = PathBuf::from(env!("CARGO_BIN_EXE_openusage-cli"));
+    let query_output = Command::new(daemon_bin)
+        .arg("query")
+        .arg("--with-state=true")
+        .arg("--test-mode")
+        .arg("--app-data-dir")
+        .arg(&app_data_dir)
+        .env("HOME", &home_dir)
+        .output()
+        .expect("run query mode");
+
+    let stdout = String::from_utf8_lossy(&query_output.stdout);
+    let stderr = String::from_utf8_lossy(&query_output.stderr);
+
+    assert!(
+        query_output.status.success(),
+        "query mode with state should succeed. stdout: {}, stderr: {}",
+        stdout,
+        stderr
+    );
+
+    let json: Value = serde_json::from_str(&stdout).expect("query output should be valid JSON");
+    assert_eq!(
+        json["state"]["queryMode"],
+        Value::String("cache".to_string())
+    );
+
+    let snapshots = json["data"].as_array().expect("data should be an array");
+    assert!(!snapshots.is_empty(), "should have at least one snapshot");
+    assert!(
+        snapshots
+            .iter()
+            .any(|s| s.get("providerId").and_then(|id| id.as_str()) == Some("mock")),
+        "query --with-state should include mock provider snapshot"
+    );
+
+    daemon.terminate_gracefully();
+}
+
+#[test]
 fn query_mode_falls_back_to_local_execution_when_no_daemon() {
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let temp = tempfile::tempdir().expect("temp dir");
@@ -547,6 +605,60 @@ fn query_mode_plugins_falls_back_to_local_generation_when_no_daemon() {
             .iter()
             .any(|item| item.get("id").and_then(|id| id.as_str()) == Some("mock")),
         "query --type plugins local fallback should include mock plugin metadata"
+    );
+}
+
+#[test]
+fn query_mode_plugins_with_state_reports_direct_when_local_fallback_is_used() {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home_dir = temp.path().join("home");
+    let app_data_dir = temp.path().join("app-data");
+
+    fs::create_dir_all(&home_dir).expect("create HOME dir");
+    fs::create_dir_all(&app_data_dir).expect("create app data dir");
+
+    let daemon_bin = PathBuf::from(env!("CARGO_BIN_EXE_openusage-cli"));
+    let plugins_dir = workspace_root.join("vendor/openusage/plugins");
+
+    let query_output = Command::new(daemon_bin)
+        .arg("query")
+        .arg("--type")
+        .arg("plugins")
+        .arg("--with-state")
+        .arg("--test-mode")
+        .arg("--plugins-dir")
+        .arg(&plugins_dir)
+        .arg("--enabled-plugins")
+        .arg("mock")
+        .arg("--app-data-dir")
+        .arg(&app_data_dir)
+        .env("HOME", &home_dir)
+        .output()
+        .expect("run query mode");
+
+    let stdout = String::from_utf8_lossy(&query_output.stdout);
+    let stderr = String::from_utf8_lossy(&query_output.stderr);
+
+    assert!(
+        query_output.status.success(),
+        "query mode plugins with state should succeed without daemon. stdout: {}, stderr: {}",
+        stdout,
+        stderr
+    );
+
+    let json: Value = serde_json::from_str(&stdout).expect("query output should be valid JSON");
+    assert_eq!(
+        json["state"]["queryMode"],
+        Value::String("direct".to_string())
+    );
+
+    let plugins = json["data"].as_array().expect("data should be an array");
+    assert!(
+        plugins
+            .iter()
+            .any(|item| item.get("id").and_then(|id| id.as_str()) == Some("mock")),
+        "query --type plugins --with-state local fallback should include mock plugin metadata"
     );
 }
 

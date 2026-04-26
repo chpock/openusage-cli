@@ -106,7 +106,8 @@ impl QueryType {
 }
 
 // NOTE: When adding new value-taking arguments here, also update
-// `option_consumes_separate_value` to keep pre-parser positional detection in sync.
+// `option_requires_separate_value` / `option_optionally_consumes_separate_value`
+// to keep pre-parser positional detection in sync.
 #[derive(Debug, Clone, Default, Args)]
 struct SharedRuntimeArgs {
     /// Directory containing plugin JS files [default: auto-discover]
@@ -135,6 +136,25 @@ struct QueryArgs {
     /// Query payload type [default: usage]
     #[arg(long = "type", value_enum, default_value_t = QueryType::Usage)]
     query_type: QueryType,
+
+    /// Include query mode metadata in output [default: false]
+    #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true")]
+    with_state: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryModeState {
+    Cache,
+    Direct,
+}
+
+impl QueryModeState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cache => "cache",
+            Self::Direct => "direct",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Args)]
@@ -156,7 +176,8 @@ struct DaemonRuntimeArgs {
 }
 
 // NOTE: When adding new value-taking arguments here, also update
-// `option_consumes_separate_value` to keep pre-parser positional detection in sync.
+// `option_requires_separate_value` / `option_optionally_consumes_separate_value`
+// to keep pre-parser positional detection in sync.
 #[derive(Debug, Clone, Args)]
 #[command(next_help_heading = HELP_HEADING_MODE_OPTIONS)]
 struct RunDaemonArgs {
@@ -287,7 +308,17 @@ fn first_positional_token(raw_args: &[OsString]) -> Option<String> {
             return Some(token.into_owned());
         }
 
-        if option_consumes_separate_value(&token) && !token.contains('=') {
+        if option_requires_separate_value(&token) && !token.contains('=') {
+            index += 1;
+        }
+
+        if option_optionally_consumes_separate_value(&token)
+            && !token.contains('=')
+            && raw_args
+                .get(index + 1)
+                .map(|value| is_explicit_bool_value(&value.to_string_lossy()))
+                .unwrap_or(false)
+        {
             index += 1;
         }
 
@@ -402,7 +433,17 @@ fn raw_args_contains_positional(raw_args: &[OsString]) -> bool {
             return true;
         }
 
-        if option_consumes_separate_value(&token) && !token.contains('=') {
+        if option_requires_separate_value(&token) && !token.contains('=') {
+            index += 1;
+        }
+
+        if option_optionally_consumes_separate_value(&token)
+            && !token.contains('=')
+            && raw_args
+                .get(index + 1)
+                .map(|value| is_explicit_bool_value(&value.to_string_lossy()))
+                .unwrap_or(false)
+        {
             index += 1;
         }
 
@@ -412,7 +453,7 @@ fn raw_args_contains_positional(raw_args: &[OsString]) -> bool {
     false
 }
 
-fn option_consumes_separate_value(option: &str) -> bool {
+fn option_requires_separate_value(option: &str) -> bool {
     let option_name = option.split('=').next().unwrap_or(option);
     matches!(
         option_name,
@@ -423,12 +464,20 @@ fn option_consumes_separate_value(option: &str) -> bool {
             | "--app-data-dir"
             | "--plugin-overrides-dir"
             | "--refresh-interval-secs"
-            | "--foreground"
             | "--existing-instance"
             | "--service-mode"
             | "--log-level"
             | "--type"
     )
+}
+
+fn option_optionally_consumes_separate_value(option: &str) -> bool {
+    let option_name = option.split('=').next().unwrap_or(option);
+    matches!(option_name, "--foreground" | "--with-state")
+}
+
+fn is_explicit_bool_value(value: &str) -> bool {
+    matches!(value, "true" | "false")
 }
 
 #[tokio::main]
@@ -531,8 +580,9 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
     match &runtime {
         RuntimeCli::Query(query_runtime) => {
             log::debug!(
-                "startup options: mode=query, type={}, test_mode={}, plugins_dir={:?}, enabled_plugins='{}', app_data_dir={:?}, plugin_overrides_dir={:?}, log_level={}",
+                "startup options: mode=query, type={}, with_state={}, test_mode={}, plugins_dir={:?}, enabled_plugins='{}', app_data_dir={:?}, plugin_overrides_dir={:?}, log_level={}",
                 query_runtime.query_type.as_str(),
+                query_runtime.with_state,
                 query_runtime.shared.test_mode,
                 query_runtime.shared.plugins_dir,
                 query_runtime.shared.enabled_plugins,
@@ -738,7 +788,7 @@ async fn run_query_mode(runtime: QueryRuntimeCli, app_version: &str) -> Result<R
         );
         match query_daemon_via_http(&daemon_base_url, runtime.query_type).await {
             Ok(json_output) => {
-                println!("{}", json_output);
+                print_query_output(&json_output, runtime.with_state, QueryModeState::Cache)?;
                 return Ok(RunOutcome::Completed);
             }
             Err(err) => {
@@ -766,7 +816,7 @@ async fn run_query_mode(runtime: QueryRuntimeCli, app_version: &str) -> Result<R
     let json_output = build_local_query_output(initialized.daemon.as_ref(), runtime.query_type)
         .await
         .context("failed to build local query response")?;
-    println!("{}", json_output);
+    print_query_output(&json_output, runtime.with_state, QueryModeState::Direct)?;
 
     Ok(RunOutcome::Completed)
 }
@@ -1145,6 +1195,7 @@ struct SharedRuntimeCli {
 struct QueryRuntimeCli {
     shared: SharedRuntimeCli,
     query_type: QueryType,
+    with_state: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1185,6 +1236,7 @@ impl RuntimeCli {
             Some(ModeCommand::Query(args)) => Ok(Self::Query(QueryRuntimeCli {
                 shared: resolve_shared_runtime(args.shared, test_mode, log_level, &env, &config),
                 query_type: args.query_type,
+                with_state: args.with_state,
             })),
             Some(ModeCommand::RunDaemon(args)) => {
                 let runtime_args = args.runtime;
@@ -1244,6 +1296,7 @@ impl RuntimeCli {
                         &config,
                     ),
                     query_type: default_query_args.query_type,
+                    with_state: default_query_args.with_state,
                 }))
             }
             Some(
@@ -2172,6 +2225,27 @@ async fn build_local_query_output(daemon: &DaemonState, query_type: QueryType) -
     }
 }
 
+fn print_query_output(payload: &str, with_state: bool, query_mode: QueryModeState) -> Result<()> {
+    if !with_state {
+        println!("{}", payload);
+        return Ok(());
+    }
+
+    let data: serde_json::Value = serde_json::from_str(payload)
+        .context("failed to parse query payload for --with-state output")?;
+    let output = serde_json::json!({
+        "data": data,
+        "state": {
+            "queryMode": query_mode.as_str(),
+        },
+    });
+    let serialized = serde_json::to_string(&output)
+        .context("failed to serialize query payload with --with-state")?;
+    println!("{}", serialized);
+
+    Ok(())
+}
+
 /// Queries a running daemon via HTTP and returns validated JSON payload.
 async fn query_daemon_via_http(base_url: &str, query_type: QueryType) -> Result<String> {
     let url = format!(
@@ -2424,6 +2498,65 @@ mod tests {
             _ => panic!("expected query command"),
         };
         assert_eq!(query_args.query_type, QueryType::Usage);
+    }
+
+    #[test]
+    fn cli_accepts_with_state_flag_without_value() {
+        let cli = parse_with_default_mode(&["query", "--with-state"]).expect("--with-state parses");
+        let query_args = match cli.command {
+            Some(ModeCommand::Query(args)) => args,
+            _ => panic!("expected query command"),
+        };
+        assert!(query_args.with_state);
+    }
+
+    #[test]
+    fn cli_accepts_with_state_with_explicit_boolean_value() {
+        let cli = parse_with_default_mode(&["query", "--with-state=false"])
+            .expect("--with-state=false parses");
+        let query_args = match cli.command {
+            Some(ModeCommand::Query(args)) => args,
+            _ => panic!("expected query command"),
+        };
+        assert!(!query_args.with_state);
+
+        let cli = parse_with_default_mode(&["query", "--with-state=true"])
+            .expect("--with-state=true parses");
+        let query_args = match cli.command {
+            Some(ModeCommand::Query(args)) => args,
+            _ => panic!("expected query command"),
+        };
+        assert!(query_args.with_state);
+    }
+
+    #[test]
+    fn cli_defaults_to_query_mode_with_with_state_space_syntax() {
+        let cli = parse_with_default_mode(&["--with-state", "true"])
+            .expect("--with-state true should default to query mode");
+        let query_args = match cli.command {
+            Some(ModeCommand::Query(args)) => args,
+            _ => panic!("expected query mode by default"),
+        };
+        assert!(query_args.with_state);
+    }
+
+    #[test]
+    fn cli_defaults_to_query_mode_with_with_state_then_type_flag() {
+        let cli = parse_with_default_mode(&[
+            "--with-state",
+            "--type",
+            "plugins",
+            "--enabled-plugins",
+            "mock",
+        ])
+        .expect("flags without mode should parse as query mode");
+        let query_args = match cli.command {
+            Some(ModeCommand::Query(args)) => args,
+            _ => panic!("expected query mode by default"),
+        };
+        assert!(query_args.with_state);
+        assert_eq!(query_args.query_type, QueryType::Plugins);
+        assert_eq!(query_args.shared.enabled_plugins.as_deref(), Some("mock"));
     }
 
     #[test]
@@ -2723,6 +2856,7 @@ mod tests {
         assert!(mode_block < global_block);
         assert!(help.contains("--plugins-dir <PLUGINS_DIR>"));
         assert!(help.contains("--type <QUERY_TYPE>"));
+        assert!(help.contains("--with-state [<WITH_STATE>]"));
         assert!(!help.contains("--host <HOST>"));
         assert!(!help.contains("--refresh-interval-secs <REFRESH_INTERVAL_SECS>"));
         assert!(help.contains("--log-level <LOG_LEVEL>"));
@@ -2783,6 +2917,7 @@ mod tests {
             config::DEFAULT_ENABLED_PLUGINS
         );
         assert_eq!(runtime.query_type, QueryType::Usage);
+        assert!(!runtime.with_state);
         assert_eq!(runtime.shared.log_level, config::DEFAULT_LOG_LEVEL);
     }
 
@@ -2792,6 +2927,7 @@ mod tests {
             command: Some(ModeCommand::Query(QueryArgs {
                 shared: SharedRuntimeArgs::default(),
                 query_type: QueryType::Plugins,
+                with_state: false,
             })),
             ..empty_cli()
         };
@@ -2802,6 +2938,7 @@ mod tests {
         );
 
         assert_eq!(runtime.query_type, QueryType::Plugins);
+        assert!(!runtime.with_state);
     }
 
     #[test]
