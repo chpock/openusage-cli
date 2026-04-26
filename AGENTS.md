@@ -6,7 +6,7 @@
 - Do not edit `openusage/` or `vendor/*` during feature work; implement fixes in `src/`.
 
 ## Language policy
-- Use English only for user-facing messages.
+- Use English only in generated project artifacts (comments, documentation, logs, errors, UI/API messages, and other string literals).
 
 ## Verification commands
 - Full CI parity command: `make ci-compact`.
