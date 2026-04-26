@@ -10,6 +10,7 @@ use openusage_cli::http_api::{self, ApiState, LifecycleCommand, RuntimeConfig};
 use openusage_cli::instance_control::{self, ExistingInstancePolicy, ServiceMode};
 use openusage_cli::plugin_engine::manifest;
 use openusage_cli::plugin_engine::runtime::MetricLine;
+use openusage_cli::restart_watcher;
 use std::ffi::{OsStr, OsString};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -473,6 +474,16 @@ async fn main() -> Result<()> {
             log::info!("openusage-cli shutdown complete");
             Ok(())
         }
+        Ok(RunOutcome::RestartSelf) => {
+            log::info!("openusage-cli self-restart requested; spawning replacement process");
+            let replacement_pid = spawn_replacement_process(&raw_args)
+                .context("failed to spawn replacement process for self-restart")?;
+            log::info!(
+                "replacement process started (pid={}); exiting current process",
+                replacement_pid
+            );
+            Ok(())
+        }
         Ok(RunOutcome::ExitWithCode(exit_code)) => {
             log::info!("openusage-cli exiting with requested code {}", exit_code);
             std::process::exit(exit_code);
@@ -570,6 +581,25 @@ struct InitializedRuntimeContext {
     app_data_dir: PathBuf,
     plugins_dir: PathBuf,
     plugin_overrides_dir: Option<PathBuf>,
+}
+
+fn build_restart_watch_inputs(
+    runtime: &DaemonRuntimeCli,
+    initialized: &InitializedRuntimeContext,
+) -> Result<restart_watcher::RestartWatchInputs> {
+    let config_file = if runtime.shared.test_mode {
+        None
+    } else {
+        Some(config::config_path().context("failed to resolve config file path")?)
+    };
+    let binary_file = std::env::current_exe().context("failed to resolve current executable")?;
+
+    Ok(restart_watcher::RestartWatchInputs {
+        plugins_dir: initialized.plugins_dir.clone(),
+        plugin_overrides_dir: initialized.plugin_overrides_dir.clone(),
+        config_file,
+        binary_file,
+    })
 }
 
 fn resolve_runtime_directories(shared: &SharedRuntimeCli) -> Result<RuntimeDirectories> {
@@ -951,7 +981,7 @@ async fn run_daemon_mode(
         daemon,
         app_version: app_version.to_string(),
         config: runtime_config,
-        lifecycle_tx: Some(lifecycle_tx),
+        lifecycle_tx: Some(Arc::clone(&lifecycle_tx)),
     });
     log::debug!("HTTP router initialized");
 
@@ -1006,6 +1036,20 @@ async fn run_daemon_mode(
     notify_systemd_ready(runtime.service_mode)
         .context("failed to notify systemd that daemon startup completed")?;
     let watchdog_task = spawn_systemd_watchdog_task(runtime.service_mode);
+
+    let restart_watcher_task = match build_restart_watch_inputs(&runtime, &initialized).and_then(
+        |inputs| restart_watcher::spawn_restart_watcher(inputs, Arc::clone(&lifecycle_tx)),
+    ) {
+        Ok(task) => Some(task),
+        Err(err) => {
+            log::warn!(
+                "filesystem restart watcher is unavailable; continuing without auto-restart-on-change: {}",
+                err
+            );
+            None
+        }
+    };
+
     log::debug!("waiting for shutdown signal");
 
     let server_result = server_task
@@ -1034,23 +1078,39 @@ async fn run_daemon_mode(
         }
     }
 
+    if let Some(task) = restart_watcher_task {
+        task.abort();
+        match task.await {
+            Ok(()) => log::debug!("filesystem restart watcher task exited"),
+            Err(err) if err.is_cancelled() => {
+                log::debug!("filesystem restart watcher task cancelled during shutdown")
+            }
+            Err(err) => log::warn!("filesystem restart watcher task ended with error: {}", err),
+        }
+    }
+
     server_result?;
 
     notify_systemd_status(runtime.service_mode, "stopping daemon");
     log::info!("HTTP server stopped");
     notify_systemd_stopping(runtime.service_mode);
     if lifecycle_reason.load(Ordering::Relaxed) == LIFECYCLE_RESTART {
-        if runtime.service_mode == ServiceMode::Systemd {
-            log::info!(
-                "service_mode=systemd and restart requested; exiting with code {}",
-                SYSTEMD_RESTART_EXIT_CODE
-            );
-            return Ok(RunOutcome::ExitWithCode(SYSTEMD_RESTART_EXIT_CODE));
+        let outcome = restart_outcome_for_service_mode(runtime.service_mode);
+        match outcome {
+            RunOutcome::ExitWithCode(code) => {
+                log::info!(
+                    "service_mode=systemd and restart requested; exiting with code {}",
+                    code
+                );
+            }
+            RunOutcome::RestartSelf => {
+                log::info!(
+                    "restart requested in standalone mode; spawning replacement process and exiting"
+                );
+            }
+            RunOutcome::Completed => {}
         }
-        log::warn!(
-            "restart requested but service_mode={} does not support manager-driven restart; exiting normally",
-            runtime.service_mode
-        );
+        return Ok(outcome);
     }
 
     Ok(RunOutcome::Completed)
@@ -1059,7 +1119,16 @@ async fn run_daemon_mode(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunOutcome {
     Completed,
+    RestartSelf,
     ExitWithCode(i32),
+}
+
+fn restart_outcome_for_service_mode(service_mode: ServiceMode) -> RunOutcome {
+    if service_mode == ServiceMode::Systemd {
+        return RunOutcome::ExitWithCode(SYSTEMD_RESTART_EXIT_CODE);
+    }
+
+    RunOutcome::RestartSelf
 }
 
 #[derive(Debug, Clone)]
@@ -1655,6 +1724,15 @@ fn spawn_daemon_process(raw_args: &[OsString]) -> Result<u32> {
         .stderr(Stdio::null());
 
     let child = command.spawn().context("failed to spawn daemon child")?;
+    Ok(child.id())
+}
+
+fn spawn_replacement_process(raw_args: &[OsString]) -> Result<u32> {
+    let executable = std::env::current_exe().context("cannot resolve current executable")?;
+    let child = Command::new(executable)
+        .args(raw_args)
+        .spawn()
+        .context("failed to spawn replacement process")?;
     Ok(child.id())
 }
 
@@ -2928,6 +3006,22 @@ mod tests {
         runtime.foreground = false;
         runtime.daemon_child = true;
         assert!(!should_spawn_daemon_parent(&runtime));
+    }
+
+    #[test]
+    fn restart_outcome_for_systemd_requests_exit_code_75() {
+        assert_eq!(
+            restart_outcome_for_service_mode(ServiceMode::Systemd),
+            RunOutcome::ExitWithCode(SYSTEMD_RESTART_EXIT_CODE)
+        );
+    }
+
+    #[test]
+    fn restart_outcome_for_standalone_requests_self_restart() {
+        assert_eq!(
+            restart_outcome_for_service_mode(ServiceMode::Standalone),
+            RunOutcome::RestartSelf
+        );
     }
 
     #[test]
