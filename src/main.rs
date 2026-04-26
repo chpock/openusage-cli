@@ -1639,6 +1639,7 @@ fn install_user_systemd_unit() -> Result<()> {
         let unit_path = home_dir
             .join(".config/systemd/user")
             .join(USER_SYSTEMD_SERVICE_NAME);
+        let unit_existed = unit_path.is_file();
         let executable = std::env::current_exe().context("cannot resolve current executable")?;
         let exec_start = systemd_exec_start(executable.as_os_str());
         let unit_content = build_systemd_unit(&exec_start);
@@ -1646,20 +1647,47 @@ fn install_user_systemd_unit() -> Result<()> {
         std::fs::write(&unit_path, unit_content)
             .with_context(|| format!("failed to write unit file {}", unit_path.display()))?;
 
-        println!("Systemd user unit installed.");
-        println!("Created files:");
-        println!("  - {}", unit_path.display());
-        println!("Next commands:");
-        println!("  - systemctl --user daemon-reload");
-        println!(
-            "  - systemctl --user enable --now {}",
-            USER_SYSTEMD_SERVICE_NAME
-        );
-        println!("  - systemctl --user status {}", USER_SYSTEMD_SERVICE_NAME);
-        println!("Service logs:");
-        println!("  - journalctl --user -u {} -f", USER_SYSTEMD_SERVICE_NAME);
+        print!("{}", systemd_unit_install_message(&unit_path, unit_existed));
 
         Ok(())
+    }
+}
+
+fn systemd_unit_install_message(unit_path: &Path, unit_existed: bool) -> String {
+    let unit_file = unit_path.display().to_string();
+    let service_name = USER_SYSTEMD_SERVICE_NAME;
+
+    if unit_existed {
+        return formatdoc! {"
+            Systemd user unit updated.
+            Updated files:
+              - {unit_file}
+            Next commands to apply the updated unit:
+              - systemctl --user daemon-reload
+              - systemctl --user enable --now {service_name}
+              - systemctl --user restart {service_name}
+              - systemctl --user status {service_name}
+            Service logs:
+              - journalctl --user -u {service_name} -f
+            ",
+            unit_file = unit_file,
+            service_name = service_name,
+        };
+    }
+
+    formatdoc! {"
+        Systemd user unit installed.
+        Created files:
+          - {unit_file}
+        Next commands:
+          - systemctl --user daemon-reload
+          - systemctl --user enable --now {service_name}
+          - systemctl --user status {service_name}
+        Service logs:
+          - journalctl --user -u {service_name} -f
+        ",
+        unit_file = unit_file,
+        service_name = service_name,
     }
 }
 
@@ -2915,6 +2943,37 @@ mod tests {
             systemd_exec_start(OsStr::new("/usr/bin/openusage-cli")),
             "/usr/bin/openusage-cli run-daemon --foreground=true --service-mode=systemd --log-level=info"
         );
+    }
+
+    #[test]
+    fn systemd_unit_install_messages_for_new_file_keep_enable_flow() {
+        let message = systemd_unit_install_message(Path::new("/tmp/openusage-cli.service"), false);
+
+        assert!(message.starts_with("Systemd user unit installed."));
+        assert!(message.contains("Created files:"));
+        assert!(message.contains("Next commands:"));
+        assert!(message.contains(&format!(
+            "  - systemctl --user enable --now {}",
+            USER_SYSTEMD_SERVICE_NAME
+        )));
+        assert!(!message.contains("restart"));
+    }
+
+    #[test]
+    fn systemd_unit_install_messages_for_existing_file_require_restart() {
+        let message = systemd_unit_install_message(Path::new("/tmp/openusage-cli.service"), true);
+
+        assert!(message.starts_with("Systemd user unit updated."));
+        assert!(message.contains("Updated files:"));
+        assert!(message.contains("Next commands to apply the updated unit:"));
+        assert!(message.contains(&format!(
+            "  - systemctl --user enable --now {}",
+            USER_SYSTEMD_SERVICE_NAME
+        )));
+        assert!(message.contains(&format!(
+            "  - systemctl --user restart {}",
+            USER_SYSTEMD_SERVICE_NAME
+        )));
     }
 
     #[test]
