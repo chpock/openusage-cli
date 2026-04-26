@@ -230,7 +230,7 @@ enum ModeCommand {
 
 #[derive(Debug, Parser)]
 #[command(name = "openusage-cli")]
-#[command(about = "HTTP daemon for AI usage limit plugins")]
+#[command(about = "Local daemon and CLI for AI provider usage/quota via OpenUsage plugins")]
 #[command(version = APP_VERSION)]
 #[command(propagate_version = true)]
 #[command(disable_help_flag = true)]

@@ -2,7 +2,7 @@
 name = "openusage-cli"
 version = "0.0.0"
 edition = "2024"
-description = "HTTP daemon for OpenUsage plugins"
+description = "Local daemon and CLI for AI provider usage/quota via OpenUsage plugins"
 license = "MIT"
 authors = ["Kostiantyn Kushnir"]
 
@@ -10,6 +10,14 @@ authors = ["Kostiantyn Kushnir"]
 depends = "$auto"
 section = "utils"
 priority = "optional"
+extended-description = """\
+openusage-cli collects usage and quota data from AI providers via OpenUsage-compatible plugins.
+It runs as a local daemon with periodic refresh and exposes normalized snapshots
+through a local REST API and CLI query mode.
+The query command reads from a running daemon when available and falls back
+to direct local collection when no daemon is running.
+Designed to be a data source for scripts, dashboards, notifications, alerts, and integrations.
+"""
 assets = [
     ["target/release/openusage-cli", "usr/bin/openusage-cli", "755"],
     ["vendor/openusage/plugins/**/*", "usr/share/openusage-cli/openusage-plugins/", "644"],

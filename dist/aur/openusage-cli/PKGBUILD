@@ -2,7 +2,7 @@
 pkgname=openusage-cli
 pkgver=VERSION_PLACEHOLDER
 pkgrel=1
-pkgdesc="HTTP daemon for executing OpenUsage plugins and exposing local usage snapshots"
+pkgdesc="Local daemon and CLI for AI provider usage/quota via OpenUsage plugins"
 arch=('x86_64' 'aarch64')
 url="https://github.com/chpock/openusage-cli"
 license=('MIT')
