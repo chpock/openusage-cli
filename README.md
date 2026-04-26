@@ -61,13 +61,13 @@ openusage-cli query
 Or start daemon mode:
 
 ```bash
-openusage-cli run-daemon --host 127.0.0.1 --port 0
+openusage-cli run-daemon --host 127.0.0.1 --port 6738
 ```
 
 Then call the API, for example:
 
 ```bash
-curl http://127.0.0.1:<port>/v1/usage
+curl http://127.0.0.1:6738/v1/usage
 ```
 
 ## Main commands
