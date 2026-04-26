@@ -135,7 +135,7 @@ Main runtime knobs:
 - `app_data_dir`
 - `existing_instance`
 
-Set these via CLI flags, environment variables, or `config.yaml`.
+Set these via CLI flags or `config.yaml`.
 For config location and precedence, see `docs/configuration.md`.
 
 ## Practical recommendation

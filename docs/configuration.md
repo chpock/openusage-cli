@@ -2,12 +2,11 @@
 
 ## Config file location
 
-`openusage-cli` resolves config using:
+`openusage-cli` looks for `config.yaml` at:
 
-1. `ProjectDirs::from("com", "openusage", "openusage-cli")` -> `config.yaml`
-2. fallback: `./.openusage-cli/config.yaml`
+1. XDG config directory (typically `~/.config/openusage-cli/config.yaml`)
 
-Missing config file is valid: startup continues with CLI/env/default values.
+Missing config file is valid: startup continues with CLI/config/default values.
 
 Print the default template:
 
@@ -19,11 +18,30 @@ openusage-cli show-default-config
 
 Configuration sources are merged in strict order:
 
-1. CLI flags and environment variables
+1. CLI flags
 2. `config.yaml`
 3. built-in defaults
 
 For operational behavior of `query` and `run-daemon` (including standalone vs systemd user service), see `docs/daemon-modes.md`.
+
+## Proxy configuration
+
+Proxy settings apply to outgoing plugin HTTP requests.
+
+Set in `config.yaml`:
+
+```yaml
+proxy:
+  enabled: true
+  url: http://127.0.0.1:7890
+```
+
+Notes:
+
+- `proxy.enabled: true` is required for `proxy.url` to be used.
+- `proxy.url` can be `http://...`, `https://...`, or `socks5h://...`.
+- If config proxy is not enabled/valid, standard proxy environment variables are used: `HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, `http_proxy`.
+- Local daemon traffic (`localhost`, `127.0.0.1`, `::1`) is excluded from proxying.
 
 ## Plugin discovery
 

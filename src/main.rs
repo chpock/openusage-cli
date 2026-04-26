@@ -289,21 +289,14 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Resolve log level from CLI/env/config (in that order of precedence)
-    let env_overrides = if cli.test_mode {
-        EnvOverrides::default()
-    } else {
-        EnvOverrides::from_process()
-    };
-
-    let log_level =
-        resolve_log_level(&cli, &env_overrides).context("failed to resolve log level")?;
+    // Resolve log level from CLI/config/default values (in that order of precedence)
+    let log_level = resolve_log_level(&cli).context("failed to resolve log level")?;
 
     // Initialize logger with resolved log level
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level.as_str()))
         .init();
 
-    let result = run(cli, env_overrides, &raw_args).await;
+    let result = run(cli, &raw_args).await;
     match result {
         Ok(RunOutcome::Completed) => {
             log::info!("openusage-cli shutdown complete");
@@ -330,12 +323,10 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Result<RunOutcome> {
+async fn run(cli: Cli, raw_args: &[OsString]) -> Result<RunOutcome> {
     let test_mode = cli.test_mode;
     let loaded_config = if test_mode {
-        log::info!(
-            "test mode enabled; ignoring config file and OPENUSAGE_* runtime environment overrides"
-        );
+        log::info!("test mode enabled; ignoring config file");
         None
     } else {
         config::load_config_if_exists().context("failed to load config")?
@@ -344,18 +335,18 @@ async fn run(cli: Cli, env_overrides: EnvOverrides, raw_args: &[OsString]) -> Re
     let runtime = match loaded_config {
         Some(loaded) => {
             log::info!("using config file: {}", loaded.path.display());
-            RuntimeCli::from_sources(cli, env_overrides, loaded.config)
+            RuntimeCli::from_sources(cli, loaded.config)
                 .context("failed to resolve runtime options")?
         }
         None => {
             if !test_mode {
                 let path = config::config_path().context("failed to resolve config path")?;
                 log::info!(
-                    "config file not found at {}; using CLI/env/default values",
+                    "config file not found at {}; using CLI/config/default values",
                     path.display()
                 );
             }
-            RuntimeCli::from_sources(cli, env_overrides, config::AppConfig::default())
+            RuntimeCli::from_sources(cli, config::AppConfig::default())
                 .context("failed to resolve runtime options")?
         }
     };
@@ -1002,7 +993,7 @@ enum RuntimeCli {
 }
 
 impl RuntimeCli {
-    fn from_sources(cli: Cli, env: EnvOverrides, config: config::AppConfig) -> Result<Self> {
+    fn from_sources(cli: Cli, config: config::AppConfig) -> Result<Self> {
         let Cli {
             log_level: cli_log_level,
             _help: _,
@@ -1012,26 +1003,20 @@ impl RuntimeCli {
         } = cli;
         let raw_log_level = cli_log_level
             .map(|level| level.as_str().to_string())
-            .or(env.log_level.clone())
             .or(config.log_level.clone())
             .unwrap_or_else(|| config::DEFAULT_LOG_LEVEL.to_string());
         let log_level = normalize_log_level(raw_log_level)?;
 
         match command {
             Some(ModeCommand::Query(args)) => Ok(Self::Query(QueryRuntimeCli {
-                shared: resolve_shared_runtime(args.shared, test_mode, log_level, &env, &config),
+                shared: resolve_shared_runtime(args.shared, test_mode, log_level, &config),
                 query_type: args.query_type,
                 with_state: args.with_state,
             })),
             Some(ModeCommand::RunDaemon(args)) => {
                 let runtime_args = args.runtime;
-                let shared = resolve_shared_runtime(
-                    runtime_args.shared,
-                    test_mode,
-                    log_level,
-                    &env,
-                    &config,
-                );
+                let shared =
+                    resolve_shared_runtime(runtime_args.shared, test_mode, log_level, &config);
                 let host = runtime_args
                     .host
                     .or(config.host)
@@ -1077,7 +1062,6 @@ impl RuntimeCli {
                         default_query_args.shared,
                         test_mode,
                         log_level,
-                        &env,
                         &config,
                     ),
                     query_type: default_query_args.query_type,
@@ -1099,35 +1083,26 @@ fn resolve_shared_runtime(
     mode_args: SharedRuntimeArgs,
     test_mode: bool,
     log_level: String,
-    env: &EnvOverrides,
     config: &config::AppConfig,
 ) -> SharedRuntimeCli {
     let enabled_plugins = mode_args
         .enabled_plugins
-        .or(env.enabled_plugins.clone())
         .or_else(|| config.enabled_plugins.clone().map(|masks| masks.join(",")))
         .unwrap_or_else(|| config::DEFAULT_ENABLED_PLUGINS.to_string());
 
     SharedRuntimeCli {
-        plugins_dir: mode_args
-            .plugins_dir
-            .or(env.plugins_dir.clone())
-            .or(config.plugins_dir.clone()),
+        plugins_dir: mode_args.plugins_dir.or(config.plugins_dir.clone()),
         enabled_plugins,
-        app_data_dir: mode_args
-            .app_data_dir
-            .or(env.app_data_dir.clone())
-            .or(config.app_data_dir.clone()),
+        app_data_dir: mode_args.app_data_dir.or(config.app_data_dir.clone()),
         plugin_overrides_dir: mode_args
             .plugin_overrides_dir
-            .or(env.plugin_overrides_dir.clone())
             .or(config.plugin_overrides_dir.clone()),
         test_mode,
         log_level,
     }
 }
 
-fn resolve_log_level(cli: &Cli, env_overrides: &EnvOverrides) -> Result<String> {
+fn resolve_log_level(cli: &Cli) -> Result<String> {
     let config_log_level = if cli.test_mode {
         None
     } else {
@@ -1137,7 +1112,6 @@ fn resolve_log_level(cli: &Cli, env_overrides: &EnvOverrides) -> Result<String> 
     let raw_log_level = cli
         .log_level
         .map(|level| level.as_str().to_string())
-        .or(env_overrides.log_level.clone())
         .or(config_log_level)
         .unwrap_or_else(|| config::DEFAULT_LOG_LEVEL.to_string());
 
@@ -1154,57 +1128,6 @@ fn normalize_log_level(log_level: String) -> Result<String> {
             VALID_LOG_LEVELS
         ),
     }
-}
-
-#[derive(Debug, Clone, Default)]
-struct EnvOverrides {
-    plugins_dir: Option<PathBuf>,
-    enabled_plugins: Option<String>,
-    app_data_dir: Option<PathBuf>,
-    plugin_overrides_dir: Option<PathBuf>,
-    log_level: Option<String>,
-}
-
-impl EnvOverrides {
-    fn from_process() -> Self {
-        Self::from_reader(|name| std::env::var_os(name))
-    }
-
-    fn from_reader<F>(mut reader: F) -> Self
-    where
-        F: FnMut(&str) -> Option<OsString>,
-    {
-        Self {
-            plugins_dir: env_path(&mut reader, "OPENUSAGE_PLUGINS_DIR"),
-            enabled_plugins: env_string(&mut reader, "OPENUSAGE_ENABLED_PLUGINS"),
-            app_data_dir: env_path(&mut reader, "OPENUSAGE_APP_DATA_DIR"),
-            plugin_overrides_dir: env_path(&mut reader, "OPENUSAGE_PLUGIN_OVERRIDES_DIR"),
-            log_level: env_string(&mut reader, "OPENUSAGE_LOG_LEVEL"),
-        }
-    }
-}
-
-fn env_path<F>(reader: &mut F, name: &str) -> Option<PathBuf>
-where
-    F: FnMut(&str) -> Option<OsString>,
-{
-    let value = reader(name)?;
-    if value.is_empty() {
-        return None;
-    }
-    Some(PathBuf::from(value))
-}
-
-fn env_string<F>(reader: &mut F, name: &str) -> Option<String>
-where
-    F: FnMut(&str) -> Option<OsString>,
-{
-    let value = reader(name)?;
-    let value = value.to_string_lossy().trim().to_string();
-    if value.is_empty() {
-        return None;
-    }
-    Some(value)
 }
 
 #[derive(Debug, Clone)]
@@ -2187,12 +2110,8 @@ mod tests {
     #[test]
     fn runtime_cli_uses_defaults_when_no_input_values() {
         let runtime = expect_query_runtime(
-            RuntimeCli::from_sources(
-                cli_without_mode(),
-                EnvOverrides::default(),
-                config::AppConfig::default(),
-            )
-            .expect("runtime defaults should resolve"),
+            RuntimeCli::from_sources(cli_without_mode(), config::AppConfig::default())
+                .expect("runtime defaults should resolve"),
         );
 
         assert_eq!(runtime.shared.plugins_dir, None);
@@ -2219,7 +2138,7 @@ mod tests {
         };
 
         let runtime = expect_query_runtime(
-            RuntimeCli::from_sources(cli, EnvOverrides::default(), config::AppConfig::default())
+            RuntimeCli::from_sources(cli, config::AppConfig::default())
                 .expect("query type should resolve"),
         );
 
@@ -2243,7 +2162,7 @@ mod tests {
             proxy: None,
         };
         let runtime = expect_query_runtime(
-            RuntimeCli::from_sources(empty_cli(), EnvOverrides::default(), app_config)
+            RuntimeCli::from_sources(empty_cli(), app_config)
                 .expect("runtime config values should resolve"),
         );
 
@@ -2303,8 +2222,7 @@ mod tests {
         };
 
         let runtime = expect_daemon_runtime(
-            RuntimeCli::from_sources(cli, EnvOverrides::default(), app_config)
-                .expect("runtime CLI values should resolve"),
+            RuntimeCli::from_sources(cli, app_config).expect("runtime CLI values should resolve"),
         );
 
         assert_eq!(runtime.host, "127.0.0.2");
@@ -2334,12 +2252,8 @@ mod tests {
 
     #[test]
     fn runtime_cli_defaults_to_query_mode_without_explicit_command() {
-        let runtime = RuntimeCli::from_sources(
-            cli_without_mode(),
-            EnvOverrides::default(),
-            config::AppConfig::default(),
-        )
-        .expect("runtime mode should resolve");
+        let runtime = RuntimeCli::from_sources(cli_without_mode(), config::AppConfig::default())
+            .expect("runtime mode should resolve");
 
         assert!(matches!(runtime, RuntimeCli::Query(_)));
     }
@@ -2359,9 +2273,8 @@ mod tests {
             ..empty_cli()
         };
 
-        let runtime =
-            RuntimeCli::from_sources(cli, EnvOverrides::default(), config::AppConfig::default())
-                .expect("runtime mode should resolve");
+        let runtime = RuntimeCli::from_sources(cli, config::AppConfig::default())
+            .expect("runtime mode should resolve");
 
         assert!(matches!(runtime, RuntimeCli::RunDaemon(_)));
     }
@@ -2384,7 +2297,7 @@ mod tests {
             ..empty_cli()
         };
 
-        let err = RuntimeCli::from_sources(cli, EnvOverrides::default(), app_config)
+        let err = RuntimeCli::from_sources(cli, app_config)
             .expect_err("invalid existing_instance value must be rejected in run-daemon mode");
         assert!(err.to_string().contains("invalid existing_instance"));
     }
@@ -2396,7 +2309,7 @@ mod tests {
             ..config::AppConfig::default()
         };
 
-        let runtime = RuntimeCli::from_sources(empty_cli(), EnvOverrides::default(), app_config)
+        let runtime = RuntimeCli::from_sources(empty_cli(), app_config)
             .expect("query mode should ignore existing_instance config");
         assert!(matches!(runtime, RuntimeCli::Query(_)));
     }
@@ -2448,80 +2361,6 @@ mod tests {
     }
 
     #[test]
-    fn env_overrides_parse_expected_runtime_variables() {
-        let env = EnvOverrides::from_reader(|name| match name {
-            "OPENUSAGE_PLUGINS_DIR" => Some(OsString::from("/env/plugins")),
-            "OPENUSAGE_ENABLED_PLUGINS" => Some(OsString::from("mock,codex")),
-            "OPENUSAGE_APP_DATA_DIR" => Some(OsString::from("/env/data")),
-            "OPENUSAGE_PLUGIN_OVERRIDES_DIR" => Some(OsString::from("/env/overrides")),
-            "OPENUSAGE_LOG_LEVEL" => Some(OsString::from("warn")),
-            _ => None,
-        });
-
-        assert_eq!(env.plugins_dir, Some(PathBuf::from("/env/plugins")));
-        assert_eq!(env.enabled_plugins.as_deref(), Some("mock,codex"));
-        assert_eq!(env.app_data_dir, Some(PathBuf::from("/env/data")));
-        assert_eq!(
-            env.plugin_overrides_dir,
-            Some(PathBuf::from("/env/overrides"))
-        );
-        assert_eq!(env.log_level.as_deref(), Some("warn"));
-    }
-
-    #[test]
-    fn runtime_cli_uses_env_overrides_between_cli_and_config() {
-        let cli = empty_cli();
-        let env = EnvOverrides {
-            plugins_dir: Some(PathBuf::from("/env/plugins")),
-            enabled_plugins: Some("mock".to_string()),
-            app_data_dir: Some(PathBuf::from("/env/data")),
-            plugin_overrides_dir: Some(PathBuf::from("/env/overrides")),
-            log_level: Some("info".to_string()),
-        };
-        let app_config = config::AppConfig {
-            plugins_dir: Some(PathBuf::from("/cfg/plugins")),
-            enabled_plugins: Some(vec!["codex".to_string()]),
-            app_data_dir: Some(PathBuf::from("/cfg/data")),
-            plugin_overrides_dir: Some(PathBuf::from("/cfg/overrides")),
-            log_level: Some("debug".to_string()),
-            ..config::AppConfig::default()
-        };
-
-        let runtime = expect_query_runtime(
-            RuntimeCli::from_sources(cli, env, app_config)
-                .expect("runtime env values should resolve"),
-        );
-
-        assert_eq!(
-            runtime.shared.plugins_dir,
-            Some(PathBuf::from("/env/plugins"))
-        );
-        assert_eq!(runtime.shared.enabled_plugins, "mock");
-        assert_eq!(
-            runtime.shared.app_data_dir,
-            Some(PathBuf::from("/env/data"))
-        );
-        assert_eq!(
-            runtime.shared.plugin_overrides_dir,
-            Some(PathBuf::from("/env/overrides"))
-        );
-        assert_eq!(runtime.shared.log_level, "info");
-    }
-
-    #[test]
-    fn runtime_cli_rejects_invalid_env_log_level() {
-        let cli = empty_cli();
-        let env = EnvOverrides {
-            log_level: Some("inof".to_string()),
-            ..EnvOverrides::default()
-        };
-
-        let err = RuntimeCli::from_sources(cli, env, config::AppConfig::default())
-            .expect_err("invalid env log level must be rejected");
-        assert!(err.to_string().contains("invalid log level"));
-    }
-
-    #[test]
     fn runtime_cli_rejects_invalid_config_log_level() {
         let cli = empty_cli();
         let app_config = config::AppConfig {
@@ -2529,7 +2368,7 @@ mod tests {
             ..config::AppConfig::default()
         };
 
-        let err = RuntimeCli::from_sources(cli, EnvOverrides::default(), app_config)
+        let err = RuntimeCli::from_sources(cli, app_config)
             .expect_err("invalid config log level must be rejected");
         assert!(err.to_string().contains("invalid log level"));
     }

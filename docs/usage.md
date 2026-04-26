@@ -58,10 +58,10 @@ Global flags:
 
 Runtime flags (`query`, `run-daemon`):
 
-- `--plugins-dir <path>` (or `OPENUSAGE_PLUGINS_DIR`)
-- `--enabled-plugins <csv-globs>` (or `OPENUSAGE_ENABLED_PLUGINS`, default: `*`)
-- `--app-data-dir <path>` (or `OPENUSAGE_APP_DATA_DIR`)
-- `--plugin-overrides-dir <path>` (or `OPENUSAGE_PLUGIN_OVERRIDES_DIR`)
+- `--plugins-dir <path>`
+- `--enabled-plugins <csv-globs>` (default: `*`)
+- `--app-data-dir <path>`
+- `--plugin-overrides-dir <path>`
 
 `run-daemon` flags:
 
@@ -75,11 +75,34 @@ Runtime flags (`query`, `run-daemon`):
 
 ## API endpoints
 
-- `GET /health`
-- `GET /v1/plugins`
-- `GET /v1/usage`
-- `GET /v1/usage/{provider}`
-- `POST /v1/probe`
-- `GET /v1/config`
-- `POST /v1/shutdown`
-- `POST /v1/restart`
+Base URL example:
+
+```text
+http://127.0.0.1:6738
+```
+
+- `GET /health`: service health and loaded plugin count.
+- `GET /v1/plugins`: plugin metadata for discovered plugins.
+- `GET /v1/usage[?refresh=true][&pluginIds=codex,cursor]`: usage snapshots.
+  - `refresh` (optional, default `false`): trigger fresh probe before returning data.
+  - `pluginIds` (optional): comma-separated plugin IDs filter.
+- `GET /v1/usage/{provider}[?refresh=true]`: usage snapshot for one provider.
+  - `404` with `{"error":"provider_not_found"}` for unknown provider.
+  - `204 No Content` when provider exists but no cached snapshot is available.
+- `POST /v1/probe`: force refresh. Optional JSON body:
+
+```json
+{
+  "pluginIds": ["codex", "cursor"]
+}
+```
+
+- `GET /v1/config`: runtime config currently used by daemon.
+- `POST /v1/shutdown`: request graceful shutdown.
+- `POST /v1/restart`: request daemon restart.
+
+Control endpoint restrictions (`/v1/shutdown`, `/v1/restart`):
+
+- Requests must come from loopback address (`127.0.0.1` / `::1`).
+- If `Origin` header is present, it must also be local (`localhost` or loopback IP).
+- Non-local remote/origin requests are rejected with `403`.

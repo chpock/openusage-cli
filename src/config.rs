@@ -59,7 +59,13 @@ pub fn get_resolved_proxy() -> Option<&'static ResolvedProxy> {
 }
 
 pub fn load_config_if_exists() -> Result<Option<LoadedConfig>> {
-    let path = config_path()?;
+    let path = match config_path() {
+        Ok(path) => path,
+        Err(err) => {
+            log::debug!("config path unavailable; continuing without config file: {err:#}");
+            return Ok(None);
+        }
+    };
     if !path.exists() {
         return Ok(None);
     }
@@ -82,8 +88,7 @@ pub fn config_path() -> Result<PathBuf> {
         return Ok(project_dirs.config_dir().join(CONFIG_FILE_NAME));
     }
 
-    let cwd = std::env::current_dir().context("cannot get current directory")?;
-    Ok(cwd.join(".openusage-cli").join(CONFIG_FILE_NAME))
+    anyhow::bail!("failed to resolve configuration directory")
 }
 
 pub fn daemon_endpoint_path() -> Result<DaemonEndpointPath> {
@@ -125,7 +130,7 @@ fn write_default_config_to_path(path: &Path, overwrite: bool) -> Result<bool> {
 pub fn default_config_template() -> &'static str {
     r#"# openusage-cli configuration.
 # Print this template explicitly with: openusage-cli show-default-config
-# CLI flags (and env vars for supported args) override this file.
+# CLI flags override this file.
 
 # HTTP bind host.
 host: 127.0.0.1

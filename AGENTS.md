@@ -34,9 +34,9 @@
 - Plugin load/eval/host bridge/AST patching: `src/plugin_engine/{manifest.rs,runtime.rs,host_api.rs,script_patch.rs}`.
 
 ## Config contract (keep in sync)
-- Config path resolution: `ProjectDirs::from("com", "openusage", "openusage-cli")/config.yaml`, fallback `./.openusage-cli/config.yaml`.
+- Config path resolution: `ProjectDirs::from("com", "openusage", "openusage-cli")/config.yaml`.
 - Missing config is valid at startup (no auto-create). Template generation is explicit via `show-default-config`.
-- Precedence is strict: CLI flags/env > `config.yaml` > built-in defaults.
+- Precedence is strict: CLI flags > `config.yaml` > built-in defaults.
 - For any new runtime setting, update together:
   1) `Cli` args in `src/main.rs`,
   2) `AppConfig` in `src/config.rs`,
@@ -44,21 +44,21 @@
   4) `RuntimeCli::from_sources` merge logic,
   5) tests for defaults and CLI-over-config precedence.
 - Keep `default_config_template()` valid YAML and synchronized with `AppConfig`.
-- Do not introduce config-only knobs for behavior already controlled by runtime CLI/env.
+- Do not introduce config-only knobs for behavior already controlled by runtime CLI.
 - Practical defaults: host `127.0.0.1`, port `0` (random), refresh interval `300s`.
 - `run-daemon` spawns background child (`--daemon-child`) and exits parent; preserve this flow when changing startup.
 - If no plugins are discovered/enabled, startup must fail early with explicit error.
 
 ## Plugin and override resolution
 - Plugin dir resolution order (`src/main.rs`):
-  1) `--plugins-dir` / `OPENUSAGE_PLUGINS_DIR`
+  1) `--plugins-dir`
   2) source checkout roots (`vendor/openusage/plugins`, then `plugins`)
   3) current working dir (`vendor/openusage/plugins`, then `plugins`)
   4) executable dir (`vendor/openusage/plugins`, then `plugins`)
   5) packaged path (`<prefix>/share/openusage-cli/openusage-plugins`)
   6) `/usr/share/openusage-cli/openusage-plugins`
 - Override dir resolution order (`src/main.rs`):
-  1) `--plugin-overrides-dir` / `OPENUSAGE_PLUGIN_OVERRIDES_DIR`
+  1) `--plugin-overrides-dir`
   2) source checkout root `plugin-overrides`
   3) current working dir `plugin-overrides`
   4) executable dir `plugin-overrides`

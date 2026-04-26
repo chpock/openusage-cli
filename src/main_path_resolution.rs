@@ -83,7 +83,7 @@ pub(super) fn push_unique_path(candidates: &mut Vec<PathBuf>, candidate: PathBuf
 
 pub(super) fn resolve_app_data_dir(cli_value: Option<PathBuf>, test_mode: bool) -> Result<PathBuf> {
     if let Some(path) = cli_value {
-        log::debug!("app data dir provided via CLI/env: {}", path.display());
+        log::debug!("app data dir provided via CLI: {}", path.display());
         return Ok(path);
     }
     if test_mode {
@@ -108,7 +108,7 @@ pub(super) fn resolve_app_data_dir(cli_value: Option<PathBuf>, test_mode: bool) 
 
 pub(super) fn resolve_plugins_dir(cli_value: Option<PathBuf>, test_mode: bool) -> Result<PathBuf> {
     if let Some(path) = cli_value {
-        log::debug!("plugins dir provided via CLI/env: {}", path.display());
+        log::debug!("plugins dir provided via CLI: {}", path.display());
         return Ok(path);
     }
     if test_mode {
@@ -144,10 +144,7 @@ pub(super) fn resolve_plugin_overrides_dir(
                 path.display()
             );
         }
-        log::debug!(
-            "plugin overrides dir provided via CLI/env: {}",
-            path.display()
-        );
+        log::debug!("plugin overrides dir provided via CLI: {}", path.display());
         return Ok(Some(path));
     }
 
