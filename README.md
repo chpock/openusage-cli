@@ -94,7 +94,7 @@ curl http://127.0.0.1:6738/v1/usage
 - Configuration and daemon discovery: [docs/configuration.md](docs/configuration.md)
 - Plugin overrides and AST patching: [docs/plugin-overrides.md](docs/plugin-overrides.md)
 - Development, testing, packaging, releases: [docs/development.md](docs/development.md)
-- Known intentional behavior differences: [OPENUSAGE_DIFFERENCES.md](OPENUSAGE_DIFFERENCES.md)
+- Known intentional behavior differences: [openusage_differences.md](docs/openusage_differences.md)
 
 For upstream project [OpenUsage](https://github.com/robinebers/openusage) plugin contracts, see vendored upstream docs:
 
