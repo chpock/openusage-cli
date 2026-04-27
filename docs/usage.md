@@ -39,7 +39,7 @@ openusage-cli query --with-state
 - Serves data through the local REST API
 - Also accelerates `query`, because `query` can reuse daemon data
 
-For daemon operation patterns (standalone vs systemd), see `docs/daemon-modes.md`.
+For daemon operation patterns (standalone vs systemd), see [daemon-modes.md](daemon-modes.md).
 
 ## Command reference
 

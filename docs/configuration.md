@@ -22,7 +22,7 @@ Configuration sources are merged in strict order:
 2. `config.yaml`
 3. built-in defaults
 
-For operational behavior of `query` and `run-daemon` (including standalone vs systemd user service), see `docs/daemon-modes.md`.
+For operational behavior of `query` and `run-daemon` (including standalone vs systemd user service), see [daemon-modes.md](daemon-modes.md).
 
 ## Proxy configuration
 

@@ -63,4 +63,4 @@ systemctl --user daemon-reload
 systemctl --user enable --now openusage-cli.service
 ```
 
-See `docs/daemon-modes.md` for standalone and systemd tradeoffs.
+See [daemon-modes.md](daemon-modes.md) for standalone and systemd tradeoffs.

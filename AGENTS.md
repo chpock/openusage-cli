@@ -72,7 +72,7 @@
 ## Compatibility guardrails
 - Keep upstream plugin contract compatibility first; prefer host/runtime fixes over vendored JS edits.
 - `host.env.get` is intentionally restricted: process env only, and only for `WHITELISTED_ENV_VARS` (`src/plugin_engine/host_api.rs`).
-- Intentional behavior diffs vs upstream are documented in `OPENUSAGE_DIFFERENCES.md` (check before changing host behavior).
+- Intentional behavior diffs vs upstream are documented in [OPENUSAGE_DIFFERENCES.md](OPENUSAGE_DIFFERENCES.md) (check before changing host behavior).
 - HTTP behavior enforced by tests:
   - `GET /v1/usage` returns cached snapshots unless `refresh=true`.
   - `GET /v1/usage/{provider}` unknown provider -> `404 {"error":"provider_not_found"}`.

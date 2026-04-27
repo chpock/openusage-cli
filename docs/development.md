@@ -7,7 +7,7 @@
 - Upstream references are vendored in `vendor/openusage/`
 - Runtime compatibility fixes should be implemented in `src/` (not by editing vendored plugin files)
 
-See `OPENUSAGE_DIFFERENCES.md` for intentional behavior differences.
+See [OPENUSAGE_DIFFERENCES.md](../OPENUSAGE_DIFFERENCES.md) for intentional behavior differences.
 
 ## Verification
 

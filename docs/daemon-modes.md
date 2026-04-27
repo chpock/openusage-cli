@@ -136,7 +136,7 @@ Main runtime knobs:
 - `existing_instance`
 
 Set these via CLI flags or `config.yaml`.
-For config location and precedence, see `docs/configuration.md`.
+For config location and precedence, see [configuration.md](configuration.md).
 
 ## Practical recommendation
 

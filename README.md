@@ -31,14 +31,14 @@ That one thing is reliable data collection from AI providers, so other tools can
 - Keeps plugin runtime initialized and refreshes snapshots in the background
 - Data is then available immediately through REST API or `openusage-cli query`
 
-See `docs/daemon-modes.md` for mode behavior, tradeoffs, and operational guidance.
+See [docs/daemon-modes.md](docs/daemon-modes.md) for mode behavior, tradeoffs, and operational guidance.
 
 ## Daemon operation choices
 
 - Standalone (`run-daemon`): quick to start manually, good for local/dev sessions
 - User systemd service (`install-systemd-unit`): recommended for daily use, process supervision, and persistent lifecycle management
 
-Detailed setup, pros/cons, and configuration are documented in `docs/daemon-modes.md`.
+Detailed setup, pros/cons, and configuration are documented in [docs/daemon-modes.md](docs/daemon-modes.md).
 
 ## Linux support
 
@@ -88,15 +88,15 @@ curl http://127.0.0.1:6738/v1/usage
 
 ## Documentation
 
-- Installation details: `docs/installation.md`
-- CLI and runtime options: `docs/usage.md`
-- Query/daemon behavior and systemd operation: `docs/daemon-modes.md`
-- Configuration and daemon discovery: `docs/configuration.md`
-- Plugin overrides and AST patching: `docs/plugin-overrides.md`
-- Development, testing, packaging, releases: `docs/development.md`
-- Known intentional behavior differences: `OPENUSAGE_DIFFERENCES.md`
+- Installation details: [docs/installation.md](docs/installation.md)
+- CLI and runtime options: [docs/usage.md](docs/usage.md)
+- Query/daemon behavior and systemd operation: [docs/daemon-modes.md](docs/daemon-modes.md)
+- Configuration and daemon discovery: [docs/configuration.md](docs/configuration.md)
+- Plugin overrides and AST patching: [docs/plugin-overrides.md](docs/plugin-overrides.md)
+- Development, testing, packaging, releases: [docs/development.md](docs/development.md)
+- Known intentional behavior differences: [OPENUSAGE_DIFFERENCES.md](OPENUSAGE_DIFFERENCES.md)
 
 For upstream project [OpenUsage](https://github.com/robinebers/openusage) plugin contracts, see vendored upstream docs:
 
-- `vendor/openusage/docs/plugins/api.md`
-- `vendor/openusage/docs/plugins/schema.md`
+- [vendor/openusage/docs/plugins/api.md](vendor/openusage/docs/plugins/api.md)
+- [vendor/openusage/docs/plugins/schema.md](vendor/openusage/docs/plugins/schema.md)
