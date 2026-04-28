@@ -34,7 +34,7 @@ help:
 	@printf "  make test         Run full test suite\n"
 	@printf "  make ci-compact   Run CI parity with compact output\n"
 	@printf "  make query        Run one-shot query mode\n"
-	@printf "  make run-daemon   Run daemon in background\n"
+	@printf "  make run-daemon   Run daemon in foreground\n"
 	@printf "  make deb          Build .deb package (cargo-deb)\n"
 	@printf "  make rpm          Build .rpm package (cargo-generate-rpm)\n"
 	@printf "  make packages     Build both .deb and .rpm\n"
@@ -80,7 +80,7 @@ query:
 	$(CARGO) run -- query $(QUERY_ARGS)
 
 run-daemon:
-	$(CARGO) run -- run-daemon $(RUN_DAEMON_ARGS) --existing-instance=$(RUN_EXISTING_INSTANCE_POLICY)
+	$(CARGO) run -- run-daemon $(RUN_DAEMON_ARGS) --foreground=true --existing-instance=$(RUN_EXISTING_INSTANCE_POLICY)
 
 deb:
 	$(CARGO) deb
