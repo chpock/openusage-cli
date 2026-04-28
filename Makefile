@@ -14,10 +14,15 @@ PLUGIN_OVERRIDES_DIR ?=
 
 LOG_LEVEL ?= debug
 RUN_EXISTING_INSTANCE_POLICY ?= ignore
-RUN_ARGS = --host $(HOST) --port $(PORT) --refresh-interval-secs $(REFRESH_INTERVAL_SECS) --log-level $(LOG_LEVEL)
-RUN_ARGS += $(if $(PLUGINS_DIR),--plugins-dir $(PLUGINS_DIR),)
-RUN_ARGS += $(if $(APP_DATA_DIR),--app-data-dir $(APP_DATA_DIR),)
-RUN_ARGS += $(if $(PLUGIN_OVERRIDES_DIR),--plugin-overrides-dir $(PLUGIN_OVERRIDES_DIR),)
+SHARED_RUNTIME_ARGS = $(if $(PLUGINS_DIR),--plugins-dir $(PLUGINS_DIR),)
+SHARED_RUNTIME_ARGS += $(if $(APP_DATA_DIR),--app-data-dir $(APP_DATA_DIR),)
+SHARED_RUNTIME_ARGS += $(if $(PLUGIN_OVERRIDES_DIR),--plugin-overrides-dir $(PLUGIN_OVERRIDES_DIR),)
+
+QUERY_ARGS = --log-level $(LOG_LEVEL)
+QUERY_ARGS += $(SHARED_RUNTIME_ARGS)
+
+RUN_DAEMON_ARGS = --host $(HOST) --port $(PORT) --refresh-interval-secs $(REFRESH_INTERVAL_SECS) --log-level $(LOG_LEVEL)
+RUN_DAEMON_ARGS += $(SHARED_RUNTIME_ARGS)
 
 CI_VERBOSE_FLAG = $(if $(filter 1 true TRUE yes YES on ON,$(VERBOSE)),--verbose,)
 
@@ -69,10 +74,10 @@ ci-compact:
 	run_step test $(CARGO) test --locked $(CI_VERBOSE_FLAG)
 
 query:
-	$(CARGO) run -- query $(RUN_ARGS)
+	$(CARGO) run -- query $(QUERY_ARGS)
 
 run-daemon:
-	$(CARGO) run -- run-daemon $(RUN_ARGS) --existing-instance=$(RUN_EXISTING_INSTANCE_POLICY)
+	$(CARGO) run -- run-daemon $(RUN_DAEMON_ARGS) --existing-instance=$(RUN_EXISTING_INSTANCE_POLICY)
 
 deb:
 	$(CARGO) deb
