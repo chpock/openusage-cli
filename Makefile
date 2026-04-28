@@ -77,10 +77,14 @@ ci-compact:
 	run_step test $(CARGO) test --locked $(CI_VERBOSE_FLAG)
 
 query:
+	# Query is short-lived, so cargo-run convenience is fine.
 	$(CARGO) run -- query $(QUERY_ARGS)
 
 run-daemon:
-	$(CARGO) run -- run-daemon $(RUN_DAEMON_ARGS) --foreground=true --existing-instance=$(RUN_EXISTING_INSTANCE_POLICY)
+	# Daemon is long-lived and must receive Ctrl+C directly.
+	# Build first, then run the binary to avoid cargo as an extra signal-handling layer.
+	$(CARGO) build
+	"$(CURDIR)/target/debug/openusage-cli" run-daemon $(RUN_DAEMON_ARGS) --foreground=true --existing-instance=$(RUN_EXISTING_INSTANCE_POLICY)
 
 deb:
 	$(CARGO) deb
