@@ -623,6 +623,15 @@ struct RuntimeConfigState {
 }
 
 impl RuntimeConfigState {
+    fn enabled_plugins_list(&self) -> Vec<String> {
+        self.enabled_plugins
+            .split(',')
+            .map(str::trim)
+            .filter(|mask| !mask.is_empty())
+            .map(ToString::to_string)
+            .collect()
+    }
+
     fn from_daemon_runtime(
         app_version: &str,
         runtime: &DaemonRuntimeCli,
@@ -672,7 +681,7 @@ impl RuntimeConfigState {
             service_mode: self.service_mode.to_string(),
             existing_instance_policy: self.existing_instance_policy.to_string(),
             plugins_dir: Some(self.plugins_dir.clone()),
-            enabled_plugins: self.enabled_plugins.clone(),
+            enabled_plugins: self.enabled_plugins_list(),
             app_data_dir: Some(self.app_data_dir.clone()),
             plugin_overrides_dir: self.plugin_overrides_dir.clone(),
             refresh_interval_secs: self.refresh_interval_secs,

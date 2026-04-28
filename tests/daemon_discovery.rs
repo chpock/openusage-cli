@@ -721,7 +721,7 @@ fn query_mode_config_falls_back_to_local_generation_when_no_daemon() {
     assert_eq!(config_json["port"], 0);
     assert_eq!(config_json["serviceMode"], "standalone");
     assert_eq!(config_json["existingInstancePolicy"], "error");
-    assert_eq!(config_json["enabledPlugins"], "mock");
+    assert_eq!(config_json["enabledPlugins"], serde_json::json!(["mock"]));
     assert_eq!(config_json["pluginsDir"], plugins_dir_string);
     assert_eq!(config_json["appDataDir"], app_data_dir_string);
     assert_eq!(config_json["refreshIntervalSecs"], 300);

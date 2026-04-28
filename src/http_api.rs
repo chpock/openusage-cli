@@ -37,7 +37,7 @@ pub struct RuntimeConfig {
     pub service_mode: String,
     pub existing_instance_policy: String,
     pub plugins_dir: Option<PathBuf>,
-    pub enabled_plugins: String,
+    pub enabled_plugins: Vec<String>,
     pub app_data_dir: Option<PathBuf>,
     pub plugin_overrides_dir: Option<PathBuf>,
     pub refresh_interval_secs: u64,
