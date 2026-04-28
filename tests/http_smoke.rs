@@ -1,5 +1,5 @@
 use openusage_cli::daemon::DaemonState;
-use openusage_cli::http_api::{self, ApiState, LifecycleCommand, RuntimeConfig};
+use openusage_cli::http_api::{self, ApiState, AvailablePlugins, LifecycleCommand, RuntimeConfig};
 use openusage_cli::plugin_engine::manifest;
 use serde_json::Value;
 use std::net::SocketAddr;
@@ -44,6 +44,14 @@ async fn http_api_smoke_for_plugins_and_usage_refresh() {
         existing_instance_policy: "error".to_string(),
         plugins_dir: Some(vendor_plugins_dir()),
         enabled_plugins: vec!["mock".to_string()],
+        available_plugins: AvailablePlugins {
+            active: vec!["mock".to_string()],
+            inactive: vec![
+                "claude".to_string(),
+                "codex".to_string(),
+                "cursor".to_string(),
+            ],
+        },
         app_data_dir: Some(tmp.path().to_path_buf()),
         plugin_overrides_dir: None,
         refresh_interval_secs: 300,
@@ -157,6 +165,14 @@ async fn http_api_smoke_for_plugins_and_usage_refresh() {
     assert_eq!(config_json["serviceMode"], "standalone");
     assert_eq!(config_json["existingInstancePolicy"], "error");
     assert_eq!(config_json["enabledPlugins"], serde_json::json!(["mock"]));
+    assert_eq!(
+        config_json["availablePlugins"]["active"],
+        serde_json::json!(["mock"])
+    );
+    assert_eq!(
+        config_json["availablePlugins"]["inactive"],
+        serde_json::json!(["claude", "codex", "cursor"])
+    );
     assert_eq!(config_json["logLevel"], "error");
     assert!(config_json["refreshIntervalSecs"].is_number());
 

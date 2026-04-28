@@ -38,10 +38,18 @@ pub struct RuntimeConfig {
     pub existing_instance_policy: String,
     pub plugins_dir: Option<PathBuf>,
     pub enabled_plugins: Vec<String>,
+    pub available_plugins: AvailablePlugins,
     pub app_data_dir: Option<PathBuf>,
     pub plugin_overrides_dir: Option<PathBuf>,
     pub refresh_interval_secs: u64,
     pub log_level: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AvailablePlugins {
+    pub active: Vec<String>,
+    pub inactive: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]

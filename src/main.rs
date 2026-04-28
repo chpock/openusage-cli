@@ -4,7 +4,7 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use openusage_cli::config;
 use openusage_cli::daemon::{CachedPluginSnapshot, DaemonState};
 use openusage_cli::discovery::{PublishedDiscovery, discover_daemon_endpoint_with_override};
-use openusage_cli::http_api::{self, ApiState, LifecycleCommand, RuntimeConfig};
+use openusage_cli::http_api::{self, ApiState, AvailablePlugins, LifecycleCommand, RuntimeConfig};
 use openusage_cli::instance_control::{self, ExistingInstancePolicy, ServiceMode};
 use openusage_cli::plugin_engine::manifest;
 use openusage_cli::plugin_engine::runtime::MetricLine;
@@ -412,6 +412,8 @@ struct InitializedRuntimeContext {
     app_data_dir: PathBuf,
     plugins_dir: PathBuf,
     plugin_overrides_dir: Option<PathBuf>,
+    active_plugin_ids: Vec<String>,
+    inactive_plugin_ids: Vec<String>,
 }
 
 fn build_restart_watch_inputs(
@@ -492,9 +494,20 @@ async fn initialize_runtime_context(
             )
         })?;
     let total_loaded_plugins = loaded_plugins.len();
+    let mut active_plugin_ids = Vec::new();
+    let mut inactive_plugin_ids = Vec::new();
     let plugins: Vec<_> = loaded_plugins
         .into_iter()
-        .filter(|plugin| enabled_plugins_matcher.is_enabled(&plugin.manifest.id))
+        .filter_map(|plugin| {
+            let plugin_id = plugin.manifest.id.clone();
+            if enabled_plugins_matcher.is_enabled(&plugin_id) {
+                active_plugin_ids.push(plugin_id);
+                Some(plugin)
+            } else {
+                inactive_plugin_ids.push(plugin_id);
+                None
+            }
+        })
         .collect();
 
     if plugins.is_empty() {
@@ -551,6 +564,8 @@ async fn initialize_runtime_context(
         app_data_dir,
         plugins_dir,
         plugin_overrides_dir,
+        active_plugin_ids,
+        inactive_plugin_ids,
     })
 }
 
@@ -616,6 +631,8 @@ struct RuntimeConfigState {
     existing_instance_policy: ExistingInstancePolicy,
     plugins_dir: PathBuf,
     enabled_plugins: String,
+    active_plugin_ids: Vec<String>,
+    inactive_plugin_ids: Vec<String>,
     app_data_dir: PathBuf,
     plugin_overrides_dir: Option<PathBuf>,
     refresh_interval_secs: u64,
@@ -646,6 +663,8 @@ impl RuntimeConfigState {
             existing_instance_policy: runtime.existing_instance_policy,
             plugins_dir: initialized.plugins_dir.clone(),
             enabled_plugins: runtime.shared.enabled_plugins.clone(),
+            active_plugin_ids: initialized.active_plugin_ids.clone(),
+            inactive_plugin_ids: initialized.inactive_plugin_ids.clone(),
             app_data_dir: initialized.app_data_dir.clone(),
             plugin_overrides_dir: initialized.plugin_overrides_dir.clone(),
             refresh_interval_secs: runtime.refresh_interval_secs,
@@ -666,6 +685,8 @@ impl RuntimeConfigState {
             existing_instance_policy: runtime.existing_instance_policy,
             plugins_dir: initialized.plugins_dir.clone(),
             enabled_plugins: runtime.shared.enabled_plugins.clone(),
+            active_plugin_ids: initialized.active_plugin_ids.clone(),
+            inactive_plugin_ids: initialized.inactive_plugin_ids.clone(),
             app_data_dir: initialized.app_data_dir.clone(),
             plugin_overrides_dir: initialized.plugin_overrides_dir.clone(),
             refresh_interval_secs: runtime.refresh_interval_secs,
@@ -682,6 +703,10 @@ impl RuntimeConfigState {
             existing_instance_policy: self.existing_instance_policy.to_string(),
             plugins_dir: Some(self.plugins_dir.clone()),
             enabled_plugins: self.enabled_plugins_list(),
+            available_plugins: AvailablePlugins {
+                active: self.active_plugin_ids.clone(),
+                inactive: self.inactive_plugin_ids.clone(),
+            },
             app_data_dir: Some(self.app_data_dir.clone()),
             plugin_overrides_dir: self.plugin_overrides_dir.clone(),
             refresh_interval_secs: self.refresh_interval_secs,

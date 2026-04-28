@@ -722,6 +722,18 @@ fn query_mode_config_falls_back_to_local_generation_when_no_daemon() {
     assert_eq!(config_json["serviceMode"], "standalone");
     assert_eq!(config_json["existingInstancePolicy"], "error");
     assert_eq!(config_json["enabledPlugins"], serde_json::json!(["mock"]));
+    assert_eq!(
+        config_json["availablePlugins"]["active"],
+        serde_json::json!(["mock"])
+    );
+    let inactive = config_json["availablePlugins"]["inactive"]
+        .as_array()
+        .expect("availablePlugins.inactive should be an array");
+    let inactive_ids: Vec<&str> = inactive.iter().filter_map(Value::as_str).collect();
+    assert!(inactive_ids.contains(&"claude"));
+    assert!(inactive_ids.contains(&"codex"));
+    assert!(inactive_ids.contains(&"cursor"));
+    assert!(!inactive_ids.contains(&"mock"));
     assert_eq!(config_json["pluginsDir"], plugins_dir_string);
     assert_eq!(config_json["appDataDir"], app_data_dir_string);
     assert_eq!(config_json["refreshIntervalSecs"], 300);
