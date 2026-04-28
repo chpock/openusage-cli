@@ -82,6 +82,7 @@ enum QueryType {
     #[default]
     Usage,
     Plugins,
+    Config,
 }
 
 impl QueryType {
@@ -89,6 +90,7 @@ impl QueryType {
         match self {
             Self::Usage => "usage",
             Self::Plugins => "plugins",
+            Self::Config => "config",
         }
     }
 
@@ -96,6 +98,7 @@ impl QueryType {
         match self {
             Self::Usage => "v1/usage",
             Self::Plugins => "v1/plugins",
+            Self::Config => "v1/config",
         }
     }
 
@@ -107,6 +110,7 @@ impl QueryType {
         match self {
             Self::Usage => "local plugin execution",
             Self::Plugins => "local plugins response generation",
+            Self::Config => "local config response generation",
         }
     }
 }
@@ -213,7 +217,7 @@ enum ModeCommand {
     #[command(name = CMD_RUN_DAEMON)]
     RunDaemon(RunDaemonArgs),
 
-    /// Query one-shot JSON payload (`--type=usage|plugins`; default: usage)
+    /// Query one-shot JSON payload (`--type=usage|plugins|config`; default: usage)
     Query(QueryArgs),
 
     /// Print the default configuration template to stdout
@@ -589,12 +593,92 @@ async fn run_query_mode(runtime: QueryRuntimeCli, app_version: &str) -> Result<R
         runtime.query_type.requires_local_refresh(),
     )
     .await?;
-    let json_output = build_local_query_output(initialized.daemon.as_ref(), runtime.query_type)
-        .await
-        .context("failed to build local query response")?;
+    let runtime_config_state =
+        RuntimeConfigState::from_query_runtime(app_version, &runtime, &initialized);
+    let json_output = build_local_query_output(
+        initialized.daemon.as_ref(),
+        runtime.query_type,
+        &runtime_config_state,
+    )
+    .await
+    .context("failed to build local query response")?;
     print_query_output(&json_output, runtime.with_state, QueryModeState::Direct)?;
 
     Ok(RunOutcome::Completed)
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeConfigState {
+    app_version: String,
+    host: String,
+    port: u16,
+    service_mode: ServiceMode,
+    existing_instance_policy: ExistingInstancePolicy,
+    plugins_dir: PathBuf,
+    enabled_plugins: String,
+    app_data_dir: PathBuf,
+    plugin_overrides_dir: Option<PathBuf>,
+    refresh_interval_secs: u64,
+    log_level: String,
+}
+
+impl RuntimeConfigState {
+    fn from_daemon_runtime(
+        app_version: &str,
+        runtime: &DaemonRuntimeCli,
+        initialized: &InitializedRuntimeContext,
+        bound_port: u16,
+    ) -> Self {
+        Self {
+            app_version: app_version.to_string(),
+            host: runtime.host.clone(),
+            port: bound_port,
+            service_mode: runtime.service_mode,
+            existing_instance_policy: runtime.existing_instance_policy,
+            plugins_dir: initialized.plugins_dir.clone(),
+            enabled_plugins: runtime.shared.enabled_plugins.clone(),
+            app_data_dir: initialized.app_data_dir.clone(),
+            plugin_overrides_dir: initialized.plugin_overrides_dir.clone(),
+            refresh_interval_secs: runtime.refresh_interval_secs,
+            log_level: runtime.shared.log_level.clone(),
+        }
+    }
+
+    fn from_query_runtime(
+        app_version: &str,
+        runtime: &QueryRuntimeCli,
+        initialized: &InitializedRuntimeContext,
+    ) -> Self {
+        Self {
+            app_version: app_version.to_string(),
+            host: runtime.host.clone(),
+            port: runtime.port,
+            service_mode: runtime.service_mode,
+            existing_instance_policy: runtime.existing_instance_policy,
+            plugins_dir: initialized.plugins_dir.clone(),
+            enabled_plugins: runtime.shared.enabled_plugins.clone(),
+            app_data_dir: initialized.app_data_dir.clone(),
+            plugin_overrides_dir: initialized.plugin_overrides_dir.clone(),
+            refresh_interval_secs: runtime.refresh_interval_secs,
+            log_level: runtime.shared.log_level.clone(),
+        }
+    }
+
+    fn to_api_response(&self) -> RuntimeConfig {
+        RuntimeConfig {
+            app_version: self.app_version.clone(),
+            host: self.host.clone(),
+            port: self.port,
+            service_mode: self.service_mode.to_string(),
+            existing_instance_policy: self.existing_instance_policy.to_string(),
+            plugins_dir: Some(self.plugins_dir.clone()),
+            enabled_plugins: self.enabled_plugins.clone(),
+            app_data_dir: Some(self.app_data_dir.clone()),
+            plugin_overrides_dir: self.plugin_overrides_dir.clone(),
+            refresh_interval_secs: self.refresh_interval_secs,
+            log_level: self.log_level.clone(),
+        }
+    }
 }
 
 async fn run_daemon_mode(
@@ -789,19 +873,13 @@ async fn run_daemon_mode(
     let lifecycle_tx = Arc::new(tokio::sync::Mutex::new(Some(lifecycle_tx)));
     let lifecycle_reason = Arc::new(AtomicU8::new(LIFECYCLE_NONE));
 
-    let runtime_config = RuntimeConfig {
-        app_version: app_version.to_string(),
-        host: runtime.host.clone(),
-        port: bound_addr.port(),
-        service_mode: runtime.service_mode.to_string(),
-        existing_instance_policy: runtime.existing_instance_policy.to_string(),
-        plugins_dir: Some(initialized.plugins_dir.clone()),
-        enabled_plugins: runtime.shared.enabled_plugins.clone(),
-        app_data_dir: Some(initialized.app_data_dir.clone()),
-        plugin_overrides_dir: initialized.plugin_overrides_dir.clone(),
-        refresh_interval_secs: runtime.refresh_interval_secs,
-        log_level: runtime.shared.log_level.clone(),
-    };
+    let runtime_config = RuntimeConfigState::from_daemon_runtime(
+        app_version,
+        &runtime,
+        &initialized,
+        bound_addr.port(),
+    )
+    .to_api_response();
 
     let app = http_api::router(ApiState {
         daemon,
@@ -972,6 +1050,11 @@ struct QueryRuntimeCli {
     shared: SharedRuntimeCli,
     query_type: QueryType,
     with_state: bool,
+    host: String,
+    port: u16,
+    refresh_interval_secs: u64,
+    existing_instance_policy: ExistingInstancePolicy,
+    service_mode: ServiceMode,
 }
 
 #[derive(Debug, Clone)]
@@ -1006,12 +1089,26 @@ impl RuntimeCli {
             .or(config.log_level.clone())
             .unwrap_or_else(|| config::DEFAULT_LOG_LEVEL.to_string());
         let log_level = normalize_log_level(raw_log_level)?;
+        let query_host = config
+            .host
+            .clone()
+            .unwrap_or_else(|| config::DEFAULT_HOST.to_string());
+        let query_port = config.port.unwrap_or(config::DEFAULT_PORT);
+        let query_refresh_interval_secs = config
+            .refresh_interval_secs
+            .unwrap_or(config::DEFAULT_REFRESH_INTERVAL_SECS);
+        let query_existing_instance_policy = resolve_query_existing_instance_policy(&config);
 
         match command {
             Some(ModeCommand::Query(args)) => Ok(Self::Query(QueryRuntimeCli {
                 shared: resolve_shared_runtime(args.shared, test_mode, log_level, &config),
                 query_type: args.query_type,
                 with_state: args.with_state,
+                host: query_host,
+                port: query_port,
+                refresh_interval_secs: query_refresh_interval_secs,
+                existing_instance_policy: query_existing_instance_policy,
+                service_mode: ServiceMode::Standalone,
             })),
             Some(ModeCommand::RunDaemon(args)) => {
                 let runtime_args = args.runtime;
@@ -1066,6 +1163,11 @@ impl RuntimeCli {
                     ),
                     query_type: default_query_args.query_type,
                     with_state: default_query_args.with_state,
+                    host: query_host,
+                    port: query_port,
+                    refresh_interval_secs: query_refresh_interval_secs,
+                    existing_instance_policy: query_existing_instance_policy,
+                    service_mode: ServiceMode::Standalone,
                 }))
             }
             Some(
@@ -1100,6 +1202,14 @@ fn resolve_shared_runtime(
         test_mode,
         log_level,
     }
+}
+
+fn resolve_query_existing_instance_policy(config: &config::AppConfig) -> ExistingInstancePolicy {
+    let Some(raw_value) = config.existing_instance.as_deref() else {
+        return ExistingInstancePolicy::Error;
+    };
+
+    ExistingInstancePolicy::parse(raw_value).unwrap_or(ExistingInstancePolicy::Error)
 }
 
 fn resolve_log_level(cli: &Cli) -> Result<String> {
@@ -1418,7 +1528,11 @@ fn truncate_for_log(value: &str, max_chars: usize) -> String {
     }
 }
 
-async fn build_local_query_output(daemon: &DaemonState, query_type: QueryType) -> Result<String> {
+async fn build_local_query_output(
+    daemon: &DaemonState,
+    query_type: QueryType,
+    runtime_config_state: &RuntimeConfigState,
+) -> Result<String> {
     match query_type {
         QueryType::Usage => {
             let snapshots = daemon.cached(None).await;
@@ -1427,6 +1541,10 @@ async fn build_local_query_output(daemon: &DaemonState, query_type: QueryType) -
         QueryType::Plugins => {
             let plugins = daemon.plugins_meta();
             serde_json::to_string(&plugins).context("failed to serialize local plugins query")
+        }
+        QueryType::Config => {
+            let runtime_config = runtime_config_state.to_api_response();
+            serde_json::to_string(&runtime_config).context("failed to serialize local config query")
         }
     }
 }
@@ -1486,17 +1604,29 @@ async fn query_daemon_via_http(base_url: &str, query_type: QueryType) -> Result<
     let payload: serde_json::Value = serde_json::from_str(&body)
         .with_context(|| format!("daemon returned non-JSON {} payload", query_type.as_str()))?;
 
-    let entries = payload.as_array().with_context(|| {
-        format!(
-            "daemon returned unexpected {} payload shape (expected JSON array)",
-            query_type.as_str()
-        )
-    })?;
-    if !entries.iter().all(serde_json::Value::is_object) {
-        anyhow::bail!(
-            "daemon returned unexpected {} payload shape (array entries must be objects)",
-            query_type.as_str()
-        );
+    match query_type {
+        QueryType::Usage | QueryType::Plugins => {
+            let entries = payload.as_array().with_context(|| {
+                format!(
+                    "daemon returned unexpected {} payload shape (expected JSON array)",
+                    query_type.as_str()
+                )
+            })?;
+            if !entries.iter().all(serde_json::Value::is_object) {
+                anyhow::bail!(
+                    "daemon returned unexpected {} payload shape (array entries must be objects)",
+                    query_type.as_str()
+                );
+            }
+        }
+        QueryType::Config => {
+            if !payload.is_object() {
+                anyhow::bail!(
+                    "daemon returned unexpected {} payload shape (expected JSON object)",
+                    query_type.as_str()
+                );
+            }
+        }
     }
 
     Ok(body)
@@ -1707,6 +1837,17 @@ mod tests {
             _ => panic!("expected query command"),
         };
         assert_eq!(query_args.query_type, QueryType::Usage);
+    }
+
+    #[test]
+    fn cli_accepts_query_type_config() {
+        let cli = parse_with_default_mode(&["query", "--type", "config"])
+            .expect("query --type config should parse");
+        let query_args = match cli.command {
+            Some(ModeCommand::Query(args)) => args,
+            _ => panic!("expected query command"),
+        };
+        assert_eq!(query_args.query_type, QueryType::Config);
     }
 
     #[test]
@@ -2123,6 +2264,17 @@ mod tests {
         );
         assert_eq!(runtime.query_type, QueryType::Usage);
         assert!(!runtime.with_state);
+        assert_eq!(runtime.host, config::DEFAULT_HOST);
+        assert_eq!(runtime.port, config::DEFAULT_PORT);
+        assert_eq!(
+            runtime.refresh_interval_secs,
+            config::DEFAULT_REFRESH_INTERVAL_SECS
+        );
+        assert_eq!(
+            runtime.existing_instance_policy,
+            ExistingInstancePolicy::Error
+        );
+        assert_eq!(runtime.service_mode, ServiceMode::Standalone);
         assert_eq!(runtime.shared.log_level, config::DEFAULT_LOG_LEVEL);
     }
 
@@ -2179,6 +2331,14 @@ mod tests {
             runtime.shared.plugin_overrides_dir,
             Some(PathBuf::from("/tmp/overrides"))
         );
+        assert_eq!(runtime.host, "0.0.0.0");
+        assert_eq!(runtime.port, 9000);
+        assert_eq!(runtime.refresh_interval_secs, 42);
+        assert_eq!(
+            runtime.existing_instance_policy,
+            ExistingInstancePolicy::Ignore
+        );
+        assert_eq!(runtime.service_mode, ServiceMode::Standalone);
         assert_eq!(runtime.shared.log_level, "debug");
     }
 
@@ -2311,7 +2471,11 @@ mod tests {
 
         let runtime = RuntimeCli::from_sources(empty_cli(), app_config)
             .expect("query mode should ignore existing_instance config");
-        assert!(matches!(runtime, RuntimeCli::Query(_)));
+        let query_runtime = expect_query_runtime(runtime);
+        assert_eq!(
+            query_runtime.existing_instance_policy,
+            ExistingInstancePolicy::Error
+        );
     }
 
     #[test]
