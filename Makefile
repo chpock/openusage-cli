@@ -13,12 +13,14 @@ APP_DATA_DIR ?=
 PLUGIN_OVERRIDES_DIR ?=
 
 LOG_LEVEL ?= debug
+QUERY_TYPE ?=
 RUN_EXISTING_INSTANCE_POLICY ?= ignore
 SHARED_RUNTIME_ARGS = $(if $(PLUGINS_DIR),--plugins-dir $(PLUGINS_DIR),)
 SHARED_RUNTIME_ARGS += $(if $(APP_DATA_DIR),--app-data-dir $(APP_DATA_DIR),)
 SHARED_RUNTIME_ARGS += $(if $(PLUGIN_OVERRIDES_DIR),--plugin-overrides-dir $(PLUGIN_OVERRIDES_DIR),)
 
 QUERY_ARGS = --log-level $(LOG_LEVEL)
+QUERY_ARGS += $(if $(QUERY_TYPE),--type $(QUERY_TYPE),)
 QUERY_ARGS += $(SHARED_RUNTIME_ARGS)
 
 RUN_DAEMON_ARGS = --host $(HOST) --port $(PORT) --refresh-interval-secs $(REFRESH_INTERVAL_SECS) --log-level $(LOG_LEVEL)
@@ -42,6 +44,7 @@ help:
 	@printf "\nRun variables (optional):\n"
 	@printf "  HOST=127.0.0.1 PORT=0 REFRESH_INTERVAL_SECS=300\n"
 	@printf "  LOG_LEVEL=debug VERBOSE=1 CI_LOG_DIR=.ci-logs\n"
+	@printf "  QUERY_TYPE=usage|plugins|config\n"
 	@printf "  RUN_EXISTING_INSTANCE_POLICY=ignore\n"
 	@printf "  PLUGINS_DIR=/path/to/plugins APP_DATA_DIR=/path/to/data\n"
 	@printf "  PLUGIN_OVERRIDES_DIR=/path/to/plugin-overrides\n"
