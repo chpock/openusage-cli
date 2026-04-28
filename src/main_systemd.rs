@@ -105,8 +105,6 @@ pub(super) fn build_systemd_unit(exec_start: &str) -> String {
         ExecStart={exec_start}
         Restart=on-failure
         RestartSec=2s
-        SuccessExitStatus={SYSTEMD_RESTART_EXIT_CODE}
-        RestartForceExitStatus={SYSTEMD_RESTART_EXIT_CODE}
 
         [Install]
         WantedBy=default.target

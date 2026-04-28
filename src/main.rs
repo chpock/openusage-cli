@@ -31,7 +31,6 @@ const SYSTEM_PLUGIN_OVERRIDES_DIR: &str = "/usr/share/openusage-cli/plugin-overr
 const USER_SYSTEMD_SERVICE_NAME: &str = "openusage-cli.service";
 const EXISTING_INSTANCE_SHUTDOWN_TIMEOUT_SECS: u64 = 15;
 const QUERY_DAEMON_HTTP_TIMEOUT_SECS: u64 = 5;
-const SYSTEMD_RESTART_EXIT_CODE: i32 = 75;
 const SYSTEMD_WATCHDOG_SEC: u64 = 30;
 const SYSTEMD_TIMEOUT_START_SECS: u64 = 120;
 const STARTUP_READINESS_TIMEOUT_SECS: u64 = 10;
@@ -307,18 +306,8 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Ok(RunOutcome::RestartSelf) => {
-            log::info!("openusage-cli self-restart requested; spawning replacement process");
-            let replacement_pid = spawn_replacement_process(&raw_args)
-                .context("failed to spawn replacement process for self-restart")?;
-            log::info!(
-                "replacement process started (pid={}); exiting current process",
-                replacement_pid
-            );
-            Ok(())
-        }
-        Ok(RunOutcome::ExitWithCode(exit_code)) => {
-            log::info!("openusage-cli exiting with requested code {}", exit_code);
-            std::process::exit(exit_code);
+            log::info!("openusage-cli self-restart requested");
+            restart_self_process(&raw_args).context("failed to restart openusage-cli process")
         }
         Err(err) => {
             log::error!("openusage-cli exiting with error: {err:#}");
@@ -751,7 +740,7 @@ async fn run_daemon_mode(
                             .await
                             .context("failed to request restart for systemd-managed instance")?;
                         println!(
-                            "Existing systemd-managed daemon at {} received restart request. The systemd unit should restart it automatically.",
+                            "Existing systemd-managed daemon at {} received restart request and will self-restart.",
                             running_instance.base_url
                         );
                         return Ok(RunOutcome::Completed);
@@ -1034,19 +1023,11 @@ async fn run_daemon_mode(
     notify_systemd_stopping(runtime.service_mode);
     if lifecycle_reason.load(Ordering::Relaxed) == LIFECYCLE_RESTART {
         let outcome = restart_outcome_for_service_mode(runtime.service_mode);
-        match outcome {
-            RunOutcome::ExitWithCode(code) => {
-                log::info!(
-                    "service_mode=systemd and restart requested; exiting with code {}",
-                    code
-                );
-            }
-            RunOutcome::RestartSelf => {
-                log::info!(
-                    "restart requested in standalone mode; spawning replacement process and exiting"
-                );
-            }
-            RunOutcome::Completed => {}
+        if outcome == RunOutcome::RestartSelf {
+            log::info!(
+                "restart requested in {} mode; restarting current daemon process",
+                runtime.service_mode
+            );
         }
         return Ok(outcome);
     }
@@ -1058,14 +1039,9 @@ async fn run_daemon_mode(
 enum RunOutcome {
     Completed,
     RestartSelf,
-    ExitWithCode(i32),
 }
 
-fn restart_outcome_for_service_mode(service_mode: ServiceMode) -> RunOutcome {
-    if service_mode == ServiceMode::Systemd {
-        return RunOutcome::ExitWithCode(SYSTEMD_RESTART_EXIT_CODE);
-    }
-
+fn restart_outcome_for_service_mode(_service_mode: ServiceMode) -> RunOutcome {
     RunOutcome::RestartSelf
 }
 
@@ -1449,6 +1425,45 @@ fn spawn_daemon_process(raw_args: &[OsString]) -> Result<u32> {
     Ok(child.id())
 }
 
+#[cfg(unix)]
+fn restart_self_process(raw_args: &[OsString]) -> Result<()> {
+    log::info!(
+        "restarting using '{}' strategy (replace current process via exec)",
+        self_restart_strategy_tag()
+    );
+    exec_replacement_process(raw_args)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restart_self_process(raw_args: &[OsString]) -> Result<()> {
+    log::info!(
+        "restarting using '{}' strategy (spawn replacement process)",
+        self_restart_strategy_tag()
+    );
+    let replacement_pid = spawn_replacement_process(raw_args)
+        .context("failed to spawn replacement process for self-restart")?;
+    log::info!(
+        "replacement process started (pid={}); exiting current process",
+        replacement_pid
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn exec_replacement_process(raw_args: &[OsString]) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let executable = std::env::current_exe().context("cannot resolve current executable")?;
+    let err = Command::new(executable).args(raw_args).exec();
+    Err(anyhow!("failed to exec replacement process: {}", err))
+}
+
+fn self_restart_strategy_tag() -> &'static str {
+    cfg!(unix).then_some("exec").unwrap_or("spawn")
+}
+
+#[cfg(not(unix))]
 fn spawn_replacement_process(raw_args: &[OsString]) -> Result<u32> {
     let executable = std::env::current_exe().context("cannot resolve current executable")?;
     let child = Command::new(executable)
@@ -2543,10 +2558,10 @@ mod tests {
     }
 
     #[test]
-    fn restart_outcome_for_systemd_requests_exit_code_75() {
+    fn restart_outcome_for_systemd_requests_self_restart() {
         assert_eq!(
             restart_outcome_for_service_mode(ServiceMode::Systemd),
-            RunOutcome::ExitWithCode(SYSTEMD_RESTART_EXIT_CODE)
+            RunOutcome::RestartSelf
         );
     }
 
@@ -2556,6 +2571,12 @@ mod tests {
             restart_outcome_for_service_mode(ServiceMode::Standalone),
             RunOutcome::RestartSelf
         );
+    }
+
+    #[test]
+    fn self_restart_strategy_tag_matches_platform() {
+        let expected = if cfg!(unix) { "exec" } else { "spawn" };
+        assert_eq!(self_restart_strategy_tag(), expected);
     }
 
     #[test]
@@ -2682,8 +2703,8 @@ mod tests {
         assert!(unit.contains("TimeoutStartSec=120s"));
         assert!(unit.contains("Restart=on-failure"));
         assert!(unit.contains("RestartSec=2s"));
-        assert!(unit.contains("SuccessExitStatus=75"));
-        assert!(unit.contains("RestartForceExitStatus=75"));
+        assert!(!unit.contains("SuccessExitStatus="));
+        assert!(!unit.contains("RestartForceExitStatus="));
     }
 
     #[test]

@@ -244,23 +244,6 @@ fn wait_for_process_exit_success(child: &mut Child) {
     panic!("timed out waiting for daemon process to exit");
 }
 
-fn wait_for_process_exit_code(child: &mut Child, expected_code: i32) {
-    let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
-    while Instant::now() < deadline {
-        if let Some(status) = child.try_wait().expect("poll daemon process exit") {
-            assert_eq!(
-                status.code(),
-                Some(expected_code),
-                "daemon process exited with unexpected status {status}"
-            );
-            return;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-
-    panic!("timed out waiting for daemon process to exit");
-}
-
 fn wait_for_endpoint_file_without_process_check(endpoint_path: &Path) {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     while Instant::now() < deadline {
@@ -1045,11 +1028,14 @@ fn daemon_replace_policy_requests_restart_for_systemd_managed_instance() {
         stderr
     );
     assert!(
-        stdout.contains("systemd unit should restart"),
-        "stdout must mention systemd restart hint. stdout: {}",
+        stdout.contains("will self-restart"),
+        "stdout must mention self-restart hint. stdout: {}",
         stdout
     );
 
-    wait_for_process_exit_code(old_daemon.child_mut(), 75);
+    wait_for_endpoint_file_without_process_check(&endpoint_path);
+    let restarted_endpoint_url = read_endpoint_url(&endpoint_path);
+    wait_for_health_ok(&restarted_endpoint_url, old_daemon.child_mut());
+    shutdown_daemon_via_http(&restarted_endpoint_url);
     wait_for_endpoint_file_removal(&endpoint_path);
 }
