@@ -1,6 +1,8 @@
 use crate::http_api::LifecycleCommand;
 use anyhow::{Context, Result};
-use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{
+    Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher, event::ModifyKind,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -175,7 +177,7 @@ fn handle_event(
         }
     };
 
-    if matches!(event.kind, EventKind::Access(_)) {
+    if !is_interesting_event_kind(&event.kind) {
         return false;
     }
 
@@ -187,20 +189,31 @@ fn handle_event(
         return false;
     };
 
+    let event_details = format_event_details(&event);
+
     if restart_deadline.is_some() {
         log::info!(
-            "detected additional filesystem change ({change_description}); restarting debounce timer ({}s)",
-            RESTART_DEBOUNCE_DELAY.as_secs()
+            "detected additional filesystem change ({change_description}; {event_details}); restarting debounce timer ({}s)",
+            RESTART_DEBOUNCE_DELAY.as_secs(),
         );
     } else {
         log::info!(
-            "detected filesystem change ({change_description}); scheduling daemon restart in {}s",
-            RESTART_DEBOUNCE_DELAY.as_secs()
+            "detected filesystem change ({change_description}; {event_details}); scheduling daemon restart in {}s",
+            RESTART_DEBOUNCE_DELAY.as_secs(),
         );
     }
 
     *restart_deadline = Some(tokio::time::Instant::now() + RESTART_DEBOUNCE_DELAY);
     true
+}
+
+fn is_interesting_event_kind(kind: &EventKind) -> bool {
+    match kind {
+        EventKind::Create(_) | EventKind::Remove(_) | EventKind::Any | EventKind::Other => true,
+        EventKind::Modify(ModifyKind::Metadata(_)) => false,
+        EventKind::Modify(_) => true,
+        EventKind::Access(_) => false,
+    }
 }
 
 fn classify_changed_path(path: &Path, watch_plan: &WatchPlan) -> Option<String> {
@@ -231,6 +244,23 @@ fn classify_changed_path(path: &Path, watch_plan: &WatchPlan) -> Option<String> 
     }
 
     None
+}
+
+fn format_event_details(event: &Event) -> String {
+    format!(
+        "kind={:?}, paths=[{}], attrs={:?}",
+        event.kind,
+        format_event_paths(&event.paths),
+        event.attrs
+    )
+}
+
+fn format_event_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| normalize_event_path(path).display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn add_file_watch(watch_roots: &mut Vec<WatchRoot>, file_path: &Path) -> Result<()> {
@@ -341,7 +371,7 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use notify::event::{AccessKind, CreateKind, ModifyKind};
+    use notify::event::{AccessKind, CreateKind, MetadataKind, ModifyKind};
     use tempfile::tempdir;
 
     fn event_with_path(kind: EventKind, path: &Path) -> Event {
@@ -425,6 +455,39 @@ mod tests {
 
         assert!(!changed);
         assert!(restart_deadline.is_none());
+    }
+
+    #[test]
+    fn handle_event_ignores_metadata_only_changes() {
+        let plan = WatchPlan {
+            plugin_roots: vec![PathBuf::from("/tmp/plugins")],
+            ..WatchPlan::default()
+        };
+        let mut restart_deadline = None;
+        let event = event_with_path(
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+            Path::new("/tmp/plugins/codex/plugin.js"),
+        );
+
+        let changed = handle_event(Ok(event), &plan, &mut restart_deadline);
+
+        assert!(!changed);
+        assert!(restart_deadline.is_none());
+    }
+
+    #[test]
+    fn handle_event_accepts_any_events_for_watched_paths() {
+        let plan = WatchPlan {
+            plugin_roots: vec![PathBuf::from("/tmp/plugins")],
+            ..WatchPlan::default()
+        };
+        let mut restart_deadline = None;
+        let event = event_with_path(EventKind::Any, Path::new("/tmp/plugins/codex/plugin.js"));
+
+        let changed = handle_event(Ok(event), &plan, &mut restart_deadline);
+
+        assert!(changed);
+        assert!(restart_deadline.is_some());
     }
 
     #[test]
