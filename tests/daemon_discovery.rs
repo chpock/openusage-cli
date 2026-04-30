@@ -719,7 +719,8 @@ fn query_mode_config_falls_back_to_local_generation_when_no_daemon() {
     assert!(!inactive_ids.contains(&"mock"));
     assert_eq!(config_json["pluginsDir"], plugins_dir_string);
     assert_eq!(config_json["appDataDir"], app_data_dir_string);
-    assert_eq!(config_json["refreshIntervalSecs"], 300);
+    assert_eq!(config_json["refreshIntervalSecs"], 180);
+    assert_eq!(config_json["aggressiveRefreshIntervalSecs"], 10);
 }
 
 #[test]

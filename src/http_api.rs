@@ -42,6 +42,7 @@ pub struct RuntimeConfig {
     pub app_data_dir: Option<PathBuf>,
     pub plugin_overrides_dir: Option<PathBuf>,
     pub refresh_interval_secs: u64,
+    pub aggressive_refresh_interval_secs: u64,
     pub log_level: String,
 }
 

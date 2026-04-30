@@ -182,6 +182,7 @@ pub(super) fn option_requires_separate_value(option: &str) -> bool {
             | "--app-data-dir"
             | "--plugin-overrides-dir"
             | "--refresh-interval-secs"
+            | "--aggressive-refresh-interval-secs"
             | "--existing-instance"
             | "--service-mode"
             | "--log-level"

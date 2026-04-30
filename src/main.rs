@@ -179,9 +179,13 @@ struct DaemonRuntimeArgs {
     #[command(flatten)]
     shared: SharedRuntimeArgs,
 
-    /// Background refresh interval in seconds (0 = disable) [default: 300]
+    /// Background refresh interval in seconds (0 = disable) [default: 180]
     #[arg(long)]
     refresh_interval_secs: Option<u64>,
+
+    /// Aggressive-mode refresh interval in seconds [default: 10]
+    #[arg(long)]
+    aggressive_refresh_interval_secs: Option<u64>,
 }
 
 // NOTE: When adding new value-taking arguments here, also update
@@ -362,12 +366,13 @@ async fn run(cli: Cli, raw_args: &[OsString]) -> Result<RunOutcome> {
         }
         RuntimeCli::RunDaemon(daemon_runtime) => {
             log::debug!(
-                "startup options: mode={}, foreground={}, host={}, port={}, refresh_interval_secs={}, existing_instance={}, service_mode={}, daemon_child={}, test_mode={}, plugins_dir={:?}, enabled_plugins='{}', app_data_dir={:?}, plugin_overrides_dir={:?}, log_level={}",
+                "startup options: mode={}, foreground={}, host={}, port={}, refresh_interval_secs={}, aggressive_refresh_interval_secs={}, existing_instance={}, service_mode={}, daemon_child={}, test_mode={}, plugins_dir={:?}, enabled_plugins='{}', app_data_dir={:?}, plugin_overrides_dir={:?}, log_level={}",
                 CMD_RUN_DAEMON,
                 daemon_runtime.foreground,
                 daemon_runtime.host,
                 daemon_runtime.port,
                 daemon_runtime.refresh_interval_secs,
+                daemon_runtime.aggressive_refresh_interval_secs,
                 daemon_runtime.existing_instance_policy,
                 daemon_runtime.service_mode,
                 daemon_runtime.daemon_child,
@@ -625,6 +630,7 @@ struct RuntimeConfigState {
     app_data_dir: PathBuf,
     plugin_overrides_dir: Option<PathBuf>,
     refresh_interval_secs: u64,
+    aggressive_refresh_interval_secs: u64,
     log_level: String,
 }
 
@@ -657,6 +663,7 @@ impl RuntimeConfigState {
             app_data_dir: initialized.app_data_dir.clone(),
             plugin_overrides_dir: initialized.plugin_overrides_dir.clone(),
             refresh_interval_secs: runtime.refresh_interval_secs,
+            aggressive_refresh_interval_secs: runtime.aggressive_refresh_interval_secs,
             log_level: runtime.shared.log_level.clone(),
         }
     }
@@ -679,6 +686,7 @@ impl RuntimeConfigState {
             app_data_dir: initialized.app_data_dir.clone(),
             plugin_overrides_dir: initialized.plugin_overrides_dir.clone(),
             refresh_interval_secs: runtime.refresh_interval_secs,
+            aggressive_refresh_interval_secs: runtime.aggressive_refresh_interval_secs,
             log_level: runtime.shared.log_level.clone(),
         }
     }
@@ -699,6 +707,7 @@ impl RuntimeConfigState {
             app_data_dir: Some(self.app_data_dir.clone()),
             plugin_overrides_dir: self.plugin_overrides_dir.clone(),
             refresh_interval_secs: self.refresh_interval_secs,
+            aggressive_refresh_interval_secs: self.aggressive_refresh_interval_secs,
             log_level: self.log_level.clone(),
         }
     }
@@ -789,15 +798,15 @@ async fn run_daemon_mode(
     let daemon = initialized.daemon.clone();
 
     const RESET_CHECK_MARGIN_SECS: u64 = 5;
-    const RESET_RETRY_DELAY_SECS: u64 = 30;
     const MAX_RETRY_AGE_SECS: u64 = 300; // Stop retrying after 5 minutes
 
     let refresh_task = if runtime.refresh_interval_secs > 0 {
         let refresh_state = daemon.clone();
         let refresh_every = Duration::from_secs(runtime.refresh_interval_secs);
         log::info!(
-            "background refresh enabled (every {}s, reset-aware)",
-            runtime.refresh_interval_secs
+            "background refresh enabled (every {}s, reset-aware, aggressive every {}s)",
+            runtime.refresh_interval_secs,
+            runtime.aggressive_refresh_interval_secs
         );
         Some(tokio::spawn(async move {
             log::debug!("background refresh task started (reset-aware)");
@@ -850,7 +859,7 @@ async fn run_daemon_mode(
                     &refresh_state,
                     proactive_trigger_time,
                     RESET_CHECK_MARGIN_SECS,
-                    Duration::from_secs(RESET_RETRY_DELAY_SECS),
+                    Duration::from_secs(runtime.aggressive_refresh_interval_secs),
                     Duration::from_secs(MAX_RETRY_AGE_SECS),
                 )
                 .await;
@@ -1073,6 +1082,7 @@ struct QueryRuntimeCli {
     host: String,
     port: u16,
     refresh_interval_secs: u64,
+    aggressive_refresh_interval_secs: u64,
     existing_instance_policy: ExistingInstancePolicy,
     service_mode: ServiceMode,
 }
@@ -1084,6 +1094,7 @@ struct DaemonRuntimeCli {
     host: String,
     port: u16,
     refresh_interval_secs: u64,
+    aggressive_refresh_interval_secs: u64,
     existing_instance_policy: ExistingInstancePolicy,
     service_mode: ServiceMode,
     daemon_child: bool,
@@ -1117,6 +1128,9 @@ impl RuntimeCli {
         let query_refresh_interval_secs = config
             .refresh_interval_secs
             .unwrap_or(config::DEFAULT_REFRESH_INTERVAL_SECS);
+        let query_aggressive_refresh_interval_secs = config
+            .aggressive_refresh_interval_secs
+            .unwrap_or(config::DEFAULT_AGGRESSIVE_REFRESH_INTERVAL_SECS);
         let query_existing_instance_policy = resolve_query_existing_instance_policy(&config);
 
         match command {
@@ -1127,6 +1141,7 @@ impl RuntimeCli {
                 host: query_host,
                 port: query_port,
                 refresh_interval_secs: query_refresh_interval_secs,
+                aggressive_refresh_interval_secs: query_aggressive_refresh_interval_secs,
                 existing_instance_policy: query_existing_instance_policy,
                 service_mode: ServiceMode::Standalone,
             })),
@@ -1146,6 +1161,15 @@ impl RuntimeCli {
                     .refresh_interval_secs
                     .or(config.refresh_interval_secs)
                     .unwrap_or(config::DEFAULT_REFRESH_INTERVAL_SECS);
+                let aggressive_refresh_interval_secs = runtime_args
+                    .aggressive_refresh_interval_secs
+                    .or(config.aggressive_refresh_interval_secs)
+                    .unwrap_or(config::DEFAULT_AGGRESSIVE_REFRESH_INTERVAL_SECS);
+                if aggressive_refresh_interval_secs == 0 {
+                    anyhow::bail!(
+                        "aggressive_refresh_interval_secs must be greater than 0 (use --aggressive-refresh-interval-secs >= 1)"
+                    );
+                }
                 let config_existing_instance_policy = match config.existing_instance {
                     Some(value) => {
                         Some(ExistingInstancePolicy::parse(&value).with_context(|| {
@@ -1167,6 +1191,7 @@ impl RuntimeCli {
                     host,
                     port,
                     refresh_interval_secs,
+                    aggressive_refresh_interval_secs,
                     existing_instance_policy,
                     service_mode,
                     daemon_child: args.daemon_child,
@@ -1186,6 +1211,7 @@ impl RuntimeCli {
                     host: query_host,
                     port: query_port,
                     refresh_interval_secs: query_refresh_interval_secs,
+                    aggressive_refresh_interval_secs: query_aggressive_refresh_interval_secs,
                     existing_instance_policy: query_existing_instance_policy,
                     service_mode: ServiceMode::Standalone,
                 }))
@@ -1316,41 +1342,56 @@ async fn run_past_reset_retry_loop(
     let mut retry_attempts = 0usize;
     let mut aggressive_mode_active = false;
     let mut retry_window_expired = false;
+    let mut ended_with_future_reset = false;
 
-    while refresh_state.has_past_resets(reset_check_margin_secs).await {
-        if !aggressive_mode_active {
-            aggressive_mode_active = true;
-            if proactive_triggered {
-                log::info!("aggressive refresh mode started: proactive reset trigger detected");
-            } else {
-                log::info!(
-                    "aggressive refresh mode started: past reset times detected in cached data"
-                );
+    if proactive_triggered {
+        aggressive_mode_active = true;
+        log::info!("aggressive refresh mode started: proactive reset trigger detected");
+    } else if refresh_state.has_past_resets(reset_check_margin_secs).await {
+        aggressive_mode_active = true;
+        log::info!("aggressive refresh mode started: past reset times detected in cached data");
+    }
+
+    if aggressive_mode_active {
+        loop {
+            let has_past_resets = refresh_state.has_past_resets(reset_check_margin_secs).await;
+            let has_future_reset = refresh_state
+                .next_reset_with_delay(reset_check_margin_secs)
+                .await
+                .is_some();
+
+            if has_future_reset && !has_past_resets {
+                ended_with_future_reset = true;
+                break;
             }
-        }
 
-        if aggressive_mode_started_at.elapsed() >= max_retry_age {
-            retry_window_expired = true;
+            if !proactive_triggered && !has_past_resets {
+                break;
+            }
+
+            if aggressive_mode_started_at.elapsed() >= max_retry_age {
+                retry_window_expired = true;
+                log::info!(
+                    "retry window expired (>{}s), returning to normal interval",
+                    max_retry_age.as_secs()
+                );
+                break;
+            }
+
             log::info!(
-                "retry window expired (>{}s), returning to normal interval",
-                max_retry_age.as_secs()
+                "provider data still shows past reset times, retrying in {}s",
+                reset_retry_delay.as_secs()
             );
-            break;
+            tokio::time::sleep(reset_retry_delay).await;
+
+            if let Err(err) = refresh_state.refresh(None).await {
+                log::warn!("retry refresh failed: {}", err);
+            } else {
+                log::debug!("retry refresh completed");
+            }
+
+            retry_attempts += 1;
         }
-
-        log::info!(
-            "provider data still shows past reset times, retrying in {}s",
-            reset_retry_delay.as_secs()
-        );
-        tokio::time::sleep(reset_retry_delay).await;
-
-        if let Err(err) = refresh_state.refresh(None).await {
-            log::warn!("retry refresh failed: {}", err);
-        } else {
-            log::debug!("retry refresh completed");
-        }
-
-        retry_attempts += 1;
     }
 
     if aggressive_mode_active {
@@ -1359,16 +1400,17 @@ async fn run_past_reset_retry_loop(
                 "aggressive refresh mode ended: retry window expired after {} attempt(s)",
                 retry_attempts
             );
+        } else if ended_with_future_reset {
+            log::info!(
+                "aggressive refresh mode ended: nearest reset moved to future after {} attempt(s)",
+                retry_attempts
+            );
         } else {
             log::info!(
                 "aggressive refresh mode ended: stale reset timestamps cleared after {} attempt(s)",
                 retry_attempts
             );
         }
-    } else if proactive_triggered {
-        log::info!(
-            "aggressive refresh mode not started: no past reset times detected after proactive refresh"
-        );
     } else {
         log::info!(
             "aggressive refresh mode not started: no past reset times detected after scheduled refresh"
@@ -2281,6 +2323,7 @@ mod tests {
             "--app-data-dir=/tmp/data-daemon-eq",
             "--plugin-overrides-dir=/tmp/overrides-daemon-eq",
             "--refresh-interval-secs=17",
+            "--aggressive-refresh-interval-secs=9",
             "--foreground=false",
             "--existing-instance=replace",
             "--service-mode=systemd",
@@ -2313,6 +2356,7 @@ mod tests {
             Some(PathBuf::from("/tmp/overrides-daemon-eq"))
         );
         assert_eq!(run_args.runtime.refresh_interval_secs, Some(17));
+        assert_eq!(run_args.runtime.aggressive_refresh_interval_secs, Some(9));
         assert_eq!(run_args.foreground, Some(false));
         assert!(matches!(
             run_args.existing_instance,
@@ -2340,6 +2384,8 @@ mod tests {
             "/tmp/overrides-daemon-space",
             "--refresh-interval-secs",
             "17",
+            "--aggressive-refresh-interval-secs",
+            "9",
             "--foreground",
             "false",
             "--existing-instance",
@@ -2376,6 +2422,7 @@ mod tests {
             Some(PathBuf::from("/tmp/overrides-daemon-space"))
         );
         assert_eq!(run_args.runtime.refresh_interval_secs, Some(17));
+        assert_eq!(run_args.runtime.aggressive_refresh_interval_secs, Some(9));
         assert_eq!(run_args.foreground, Some(false));
         assert!(matches!(
             run_args.existing_instance,
@@ -2414,6 +2461,15 @@ mod tests {
     #[test]
     fn unknown_command_error_ignores_flag_only_inputs() {
         let raw_args = vec![OsString::from("--host"), OsString::from("127.0.0.1")];
+        assert!(unknown_command_error(&raw_args).is_none());
+    }
+
+    #[test]
+    fn unknown_command_error_ignores_aggressive_interval_flag_value() {
+        let raw_args = vec![
+            OsString::from("--aggressive-refresh-interval-secs"),
+            OsString::from("5"),
+        ];
         assert!(unknown_command_error(&raw_args).is_none());
     }
 
@@ -2542,6 +2598,10 @@ mod tests {
             config::DEFAULT_REFRESH_INTERVAL_SECS
         );
         assert_eq!(
+            runtime.aggressive_refresh_interval_secs,
+            config::DEFAULT_AGGRESSIVE_REFRESH_INTERVAL_SECS
+        );
+        assert_eq!(
             runtime.existing_instance_policy,
             ExistingInstancePolicy::Error
         );
@@ -2579,6 +2639,7 @@ mod tests {
             app_data_dir: Some(PathBuf::from("/tmp/data")),
             plugin_overrides_dir: Some(PathBuf::from("/tmp/overrides")),
             refresh_interval_secs: Some(42),
+            aggressive_refresh_interval_secs: Some(11),
             foreground: Some(true),
             existing_instance: Some("ignore".to_string()),
             log_level: Some("debug".to_string()),
@@ -2605,6 +2666,7 @@ mod tests {
         assert_eq!(runtime.host, "0.0.0.0");
         assert_eq!(runtime.port, 9000);
         assert_eq!(runtime.refresh_interval_secs, 42);
+        assert_eq!(runtime.aggressive_refresh_interval_secs, 11);
         assert_eq!(
             runtime.existing_instance_policy,
             ExistingInstancePolicy::Ignore
@@ -2631,6 +2693,7 @@ mod tests {
                         plugin_overrides_dir: Some(PathBuf::from("/cli/overrides")),
                     },
                     refresh_interval_secs: Some(7),
+                    aggressive_refresh_interval_secs: Some(3),
                 },
                 foreground: Some(true),
                 existing_instance: Some(ExistingInstancePolicy::Replace),
@@ -2646,6 +2709,7 @@ mod tests {
             app_data_dir: Some(PathBuf::from("/cfg/data")),
             plugin_overrides_dir: Some(PathBuf::from("/cfg/overrides")),
             refresh_interval_secs: Some(60),
+            aggressive_refresh_interval_secs: Some(15),
             foreground: Some(false),
             existing_instance: Some("error".to_string()),
             log_level: Some("debug".to_string()),
@@ -2672,6 +2736,7 @@ mod tests {
             Some(PathBuf::from("/cli/overrides"))
         );
         assert_eq!(runtime.refresh_interval_secs, 7);
+        assert_eq!(runtime.aggressive_refresh_interval_secs, 3);
         assert_eq!(runtime.shared.log_level, "trace");
         assert!(runtime.foreground);
         assert_eq!(
@@ -2734,6 +2799,32 @@ mod tests {
     }
 
     #[test]
+    fn runtime_cli_rejects_zero_aggressive_refresh_interval_for_run_daemon() {
+        let app_config = config::AppConfig {
+            aggressive_refresh_interval_secs: Some(0),
+            ..config::AppConfig::default()
+        };
+
+        let cli = Cli {
+            command: Some(ModeCommand::RunDaemon(RunDaemonArgs {
+                runtime: DaemonRuntimeArgs::default(),
+                foreground: None,
+                existing_instance: None,
+                service_mode: None,
+                daemon_child: false,
+            })),
+            ..empty_cli()
+        };
+
+        let err = RuntimeCli::from_sources(cli, app_config)
+            .expect_err("zero aggressive interval must be rejected in run-daemon mode");
+        assert!(
+            err.to_string()
+                .contains("aggressive_refresh_interval_secs must be greater than 0")
+        );
+    }
+
+    #[test]
     fn runtime_cli_query_mode_ignores_existing_instance_config() {
         let app_config = config::AppConfig {
             existing_instance: Some("invalid".to_string()),
@@ -2766,6 +2857,7 @@ mod tests {
             host: config::DEFAULT_HOST.to_string(),
             port: config::DEFAULT_PORT,
             refresh_interval_secs: config::DEFAULT_REFRESH_INTERVAL_SECS,
+            aggressive_refresh_interval_secs: config::DEFAULT_AGGRESSIVE_REFRESH_INTERVAL_SECS,
             existing_instance_policy: ExistingInstancePolicy::Error,
             service_mode: ServiceMode::Standalone,
             daemon_child: false,
@@ -3145,6 +3237,50 @@ mod tests {
         )
     }
 
+    fn future_reset_plugin() -> manifest::LoadedPlugin {
+        manifest::LoadedPlugin {
+            manifest: manifest::PluginManifest {
+                schema_version: 1,
+                id: "future-reset".to_string(),
+                name: "Future Reset".to_string(),
+                version: "0.0.0-test".to_string(),
+                entry: "plugin.js".to_string(),
+                icon: "icon.svg".to_string(),
+                brand_color: None,
+                lines: Vec::new(),
+                links: Vec::new(),
+            },
+            plugin_dir: PathBuf::from("."),
+            entry_script: r#"
+                globalThis.__openusage_plugin = {
+                    probe() {
+                        return {
+                            lines: [{
+                                type: "progress",
+                                label: "Limit",
+                                used: 10,
+                                limit: 100,
+                                format: { kind: "percent" },
+                                resetsAt: "2999-01-01T00:00:00Z"
+                            }]
+                        };
+                    }
+                };
+            "#
+            .to_string(),
+            icon_data_url: "data:image/svg+xml;base64,".to_string(),
+        }
+    }
+
+    fn daemon_with_future_reset_plugin() -> DaemonState {
+        DaemonState::new(
+            vec![future_reset_plugin()],
+            PathBuf::from("."),
+            "0.0.0-test".to_string(),
+            None,
+        )
+    }
+
     #[tokio::test]
     async fn run_past_reset_retry_loop_stops_after_retry_window() {
         let daemon = daemon_with_stale_reset_plugin();
@@ -3291,6 +3427,33 @@ mod tests {
             }),
             "expected aggressive mode end log message, got logs: {:?}",
             logs
+        );
+    }
+
+    #[tokio::test]
+    async fn run_past_reset_retry_loop_turns_off_when_next_reset_is_future() {
+        let daemon = daemon_with_future_reset_plugin();
+        daemon
+            .refresh(None)
+            .await
+            .expect("initial refresh should seed future reset data");
+
+        let attempts = tokio::time::timeout(
+            Duration::from_millis(200),
+            run_past_reset_retry_loop(
+                &daemon,
+                Some(tokio::time::Instant::now()),
+                0,
+                Duration::from_millis(20),
+                Duration::from_millis(120),
+            ),
+        )
+        .await
+        .expect("retry loop should stop quickly when next reset is in the future");
+
+        assert_eq!(
+            attempts, 0,
+            "aggressive mode should stop immediately without retries when refreshed data has a future reset"
         );
     }
 

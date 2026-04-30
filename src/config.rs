@@ -10,7 +10,8 @@ pub const RUNTIME_DIR_NAME: &str = "runtime";
 pub const DAEMON_ENDPOINT_FILE_NAME: &str = "daemon-endpoint";
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const DEFAULT_PORT: u16 = 0;
-pub const DEFAULT_REFRESH_INTERVAL_SECS: u64 = 300;
+pub const DEFAULT_REFRESH_INTERVAL_SECS: u64 = 180;
+pub const DEFAULT_AGGRESSIVE_REFRESH_INTERVAL_SECS: u64 = 10;
 pub const DEFAULT_ENABLED_PLUGINS: &str = "*";
 pub const DEFAULT_LOG_LEVEL: &str = "error";
 
@@ -35,6 +36,7 @@ pub struct AppConfig {
     pub app_data_dir: Option<PathBuf>,
     pub plugin_overrides_dir: Option<PathBuf>,
     pub refresh_interval_secs: Option<u64>,
+    pub aggressive_refresh_interval_secs: Option<u64>,
     pub foreground: Option<bool>,
     pub existing_instance: Option<String>,
     pub log_level: Option<String>,
@@ -156,7 +158,10 @@ app_data_dir: null
 plugin_overrides_dir: null
 
 # Background refresh interval in seconds. 0 disables periodic refresh.
-refresh_interval_secs: 300
+refresh_interval_secs: 180
+
+# Aggressive-mode refresh interval in seconds (used after resetAt is reached).
+aggressive_refresh_interval_secs: 10
 
 # Run daemon in foreground mode (run-daemon only).
 # false keeps default background startup behavior.
@@ -229,6 +234,10 @@ mod tests {
         assert_eq!(
             parsed.refresh_interval_secs,
             Some(DEFAULT_REFRESH_INTERVAL_SECS)
+        );
+        assert_eq!(
+            parsed.aggressive_refresh_interval_secs,
+            Some(DEFAULT_AGGRESSIVE_REFRESH_INTERVAL_SECS)
         );
         assert_eq!(parsed.foreground, Some(false));
         assert_eq!(parsed.existing_instance.as_deref(), Some("error"));

@@ -54,7 +54,8 @@ async fn http_api_smoke_for_plugins_and_usage_refresh() {
         },
         app_data_dir: Some(tmp.path().to_path_buf()),
         plugin_overrides_dir: None,
-        refresh_interval_secs: 300,
+        refresh_interval_secs: 180,
+        aggressive_refresh_interval_secs: 10,
         log_level: "error".to_string(),
     };
 
@@ -175,6 +176,7 @@ async fn http_api_smoke_for_plugins_and_usage_refresh() {
     );
     assert_eq!(config_json["logLevel"], "error");
     assert!(config_json["refreshIntervalSecs"].is_number());
+    assert!(config_json["aggressiveRefreshIntervalSecs"].is_number());
 
     let shutdown_with_foreign_origin_resp = client
         .post(format!("{}/v1/shutdown", base))
