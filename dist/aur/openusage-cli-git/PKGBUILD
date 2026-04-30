@@ -63,6 +63,7 @@ package() {
     # Install plugins
     install -dm755 "$pkgdir/usr/share/openusage-cli/openusage-plugins"
     cp -a vendor/openusage/plugins/. "$pkgdir/usr/share/openusage-cli/openusage-plugins/"
+    rm -rf "$pkgdir/usr/share/openusage-cli/openusage-plugins/mock"
 
     # Install plugin overrides
     install -dm755 "$pkgdir/usr/share/openusage-cli/plugin-overrides"
