@@ -36,6 +36,9 @@ const SYSTEMD_TIMEOUT_START_SECS: u64 = 120;
 const STARTUP_READINESS_TIMEOUT_SECS: u64 = 10;
 const STARTUP_READINESS_POLL_INTERVAL_MS: u64 = 50;
 const CMD_RUN_DAEMON: &str = "run-daemon";
+const LIFECYCLE_NONE: u8 = 0;
+const LIFECYCLE_SHUTDOWN: u8 = 1;
+const LIFECYCLE_RESTART: u8 = 2;
 const HELP_HEADING_MODE_OPTIONS: &str = "Mode options";
 const HELP_HEADING_GLOBAL_OPTIONS: &str = "Global options";
 const KNOWN_COMMANDS: &[&str] = &[
@@ -907,10 +910,6 @@ async fn run_daemon_mode(
         Some(discovery)
     };
 
-    const LIFECYCLE_NONE: u8 = 0;
-    const LIFECYCLE_SHUTDOWN: u8 = 1;
-    const LIFECYCLE_RESTART: u8 = 2;
-
     let (lifecycle_tx, lifecycle_rx) = tokio::sync::oneshot::channel::<LifecycleCommand>();
     let lifecycle_tx = Arc::new(tokio::sync::Mutex::new(Some(lifecycle_tx)));
     let lifecycle_reason = Arc::new(AtomicU8::new(LIFECYCLE_NONE));
@@ -1037,10 +1036,19 @@ async fn run_daemon_mode(
 
     server_result?;
 
-    notify_systemd_status(runtime.service_mode, "stopping daemon");
     log::info!("HTTP server stopped");
-    notify_systemd_stopping(runtime.service_mode);
-    if lifecycle_reason.load(Ordering::Relaxed) == LIFECYCLE_RESTART {
+    let lifecycle_reason_value = lifecycle_reason.load(Ordering::Relaxed);
+    match systemd_exit_notify_for_lifecycle(lifecycle_reason_value) {
+        SystemdExitNotify::Stopping => {
+            notify_systemd_status(runtime.service_mode, "stopping daemon");
+            notify_systemd_stopping(runtime.service_mode);
+        }
+        SystemdExitNotify::Reloading => {
+            notify_systemd_status(runtime.service_mode, "reloading daemon");
+            notify_systemd_reloading(runtime.service_mode);
+        }
+    }
+    if lifecycle_reason_value == LIFECYCLE_RESTART {
         let outcome = restart_outcome_for_service_mode(runtime.service_mode);
         if outcome == RunOutcome::RestartSelf {
             log::info!(
@@ -1058,6 +1066,20 @@ async fn run_daemon_mode(
 enum RunOutcome {
     Completed,
     RestartSelf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SystemdExitNotify {
+    Stopping,
+    Reloading,
+}
+
+fn systemd_exit_notify_for_lifecycle(lifecycle_reason: u8) -> SystemdExitNotify {
+    if lifecycle_reason == LIFECYCLE_RESTART {
+        SystemdExitNotify::Reloading
+    } else {
+        SystemdExitNotify::Stopping
+    }
 }
 
 fn restart_outcome_for_service_mode(_service_mode: ServiceMode) -> RunOutcome {
@@ -2889,6 +2911,26 @@ mod tests {
         assert_eq!(
             restart_outcome_for_service_mode(ServiceMode::Standalone),
             RunOutcome::RestartSelf
+        );
+    }
+
+    #[test]
+    fn restart_lifecycle_uses_reloading_notification() {
+        assert_eq!(
+            systemd_exit_notify_for_lifecycle(LIFECYCLE_RESTART),
+            SystemdExitNotify::Reloading
+        );
+    }
+
+    #[test]
+    fn non_restart_lifecycle_uses_stopping_notification() {
+        assert_eq!(
+            systemd_exit_notify_for_lifecycle(LIFECYCLE_SHUTDOWN),
+            SystemdExitNotify::Stopping
+        );
+        assert_eq!(
+            systemd_exit_notify_for_lifecycle(LIFECYCLE_NONE),
+            SystemdExitNotify::Stopping
         );
     }
 

@@ -255,6 +255,33 @@ pub(super) fn notify_systemd_stopping(service_mode: ServiceMode) {
     }
 }
 
+pub(super) fn notify_systemd_reloading(service_mode: ServiceMode) {
+    if service_mode != ServiceMode::Systemd {
+        return;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let has_notify_socket = std::env::var_os("NOTIFY_SOCKET").is_some();
+        match sd_notify::notify(false, &[sd_notify::NotifyState::Reloading]) {
+            Ok(()) if has_notify_socket => log::info!("sent RELOADING=1 to systemd"),
+            Ok(()) => log::debug!(
+                "service_mode=systemd but NOTIFY_SOCKET is unset; skipping RELOADING=1 notification"
+            ),
+            Err(err) => {
+                log::warn!("failed to send RELOADING=1 via sd_notify: {}", err)
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        log::warn!(
+            "service_mode=systemd requested on a non-Linux platform; reload notification skipped"
+        );
+    }
+}
+
 pub(super) fn spawn_systemd_watchdog_task(
     service_mode: ServiceMode,
 ) -> Option<tokio::task::JoinHandle<()>> {
