@@ -805,15 +805,16 @@ async fn run_daemon_mode(
 
             loop {
                 let mut proactive_trigger_time: Option<tokio::time::Instant> = None;
-                let reset_delay = refresh_state
-                    .time_until_next_reset(RESET_CHECK_MARGIN_SECS)
+                let next_reset = refresh_state
+                    .next_reset_with_delay(RESET_CHECK_MARGIN_SECS)
                     .await;
 
-                if let Some(delay) = reset_delay {
-                    log::debug!(
-                        "next limit reset in {:?} (margin {}s)",
-                        delay,
-                        RESET_CHECK_MARGIN_SECS
+                if let Some((earliest_resets_at, delay)) = next_reset {
+                    log::info!(
+                        "earliest resetsAt={} observed; aggressive mode will trigger in {}s (margin {}s)",
+                        earliest_resets_at,
+                        delay.as_secs(),
+                        RESET_CHECK_MARGIN_SECS,
                     );
 
                     tokio::select! {
@@ -826,6 +827,15 @@ async fn run_daemon_mode(
                         }
                     }
                 } else {
+                    if refresh_state.has_past_resets(RESET_CHECK_MARGIN_SECS).await {
+                        log::info!(
+                            "no upcoming resetsAt found; cached data already contains past reset times"
+                        );
+                    } else {
+                        log::info!(
+                            "no upcoming resetsAt found; aggressive mode will not be proactively armed"
+                        );
+                    }
                     interval_timer.tick().await;
                     log::debug!("running scheduled interval refresh (no upcoming resets)");
                 }
@@ -1299,13 +1309,28 @@ async fn run_past_reset_retry_loop(
     reset_retry_delay: Duration,
     max_retry_age: Duration,
 ) -> usize {
+    let aggressive_mode_started_at =
+        proactive_trigger_time.unwrap_or_else(tokio::time::Instant::now);
+    let proactive_triggered = proactive_trigger_time.is_some();
+
     let mut retry_attempts = 0usize;
+    let mut aggressive_mode_active = false;
+    let mut retry_window_expired = false;
 
     while refresh_state.has_past_resets(reset_check_margin_secs).await {
-        let should_retry = proactive_trigger_time
-            .is_some_and(|trigger_time| trigger_time.elapsed() < max_retry_age);
+        if !aggressive_mode_active {
+            aggressive_mode_active = true;
+            if proactive_triggered {
+                log::info!("aggressive refresh mode started: proactive reset trigger detected");
+            } else {
+                log::info!(
+                    "aggressive refresh mode started: past reset times detected in cached data"
+                );
+            }
+        }
 
-        if !should_retry {
+        if aggressive_mode_started_at.elapsed() >= max_retry_age {
+            retry_window_expired = true;
             log::info!(
                 "retry window expired (>{}s), returning to normal interval",
                 max_retry_age.as_secs()
@@ -1326,6 +1351,28 @@ async fn run_past_reset_retry_loop(
         }
 
         retry_attempts += 1;
+    }
+
+    if aggressive_mode_active {
+        if retry_window_expired {
+            log::info!(
+                "aggressive refresh mode ended: retry window expired after {} attempt(s)",
+                retry_attempts
+            );
+        } else {
+            log::info!(
+                "aggressive refresh mode ended: stale reset timestamps cleared after {} attempt(s)",
+                retry_attempts
+            );
+        }
+    } else if proactive_triggered {
+        log::info!(
+            "aggressive refresh mode not started: no past reset times detected after proactive refresh"
+        );
+    } else {
+        log::info!(
+            "aggressive refresh mode not started: no past reset times detected after scheduled refresh"
+        );
     }
 
     retry_attempts
@@ -1716,6 +1763,73 @@ mod tests {
     use std::ffi::OsStr;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, Once};
+    use tokio::sync::Mutex as AsyncMutex;
+
+    struct TestLogCollector {
+        capture_enabled: AtomicBool,
+        entries: Mutex<Vec<String>>,
+    }
+
+    impl TestLogCollector {
+        const fn new() -> Self {
+            Self {
+                capture_enabled: AtomicBool::new(false),
+                entries: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn start_capture(&self) {
+            let mut entries = self
+                .entries
+                .lock()
+                .expect("test log collector mutex should not be poisoned");
+            entries.clear();
+            drop(entries);
+            self.capture_enabled.store(true, Ordering::Relaxed);
+        }
+
+        fn stop_capture(&self) -> Vec<String> {
+            self.capture_enabled.store(false, Ordering::Relaxed);
+            self.entries
+                .lock()
+                .expect("test log collector mutex should not be poisoned")
+                .clone()
+        }
+    }
+
+    impl log::Log for TestLogCollector {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() <= log::Level::Info
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if !self.enabled(record.metadata()) || !self.capture_enabled.load(Ordering::Relaxed) {
+                return;
+            }
+
+            let mut entries = self
+                .entries
+                .lock()
+                .expect("test log collector mutex should not be poisoned");
+            entries.push(format!("{}", record.args()));
+        }
+
+        fn flush(&self) {}
+    }
+
+    static TEST_LOG_COLLECTOR: TestLogCollector = TestLogCollector::new();
+    static TEST_LOGGER_INIT: Once = Once::new();
+    static TEST_LOG_CAPTURE_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
+
+    fn init_test_logger() {
+        TEST_LOGGER_INIT.call_once(|| {
+            log::set_logger(&TEST_LOG_COLLECTOR)
+                .expect("test logger should initialize exactly once");
+            log::set_max_level(log::LevelFilter::Info);
+        });
+    }
 
     fn empty_cli() -> Cli {
         Cli {
@@ -2895,25 +3009,124 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_past_reset_retry_loop_does_not_retry_without_proactive_trigger() {
+    async fn run_past_reset_retry_loop_retries_without_proactive_trigger_when_stale() {
         let daemon = daemon_with_stale_reset_plugin();
         daemon
             .refresh(None)
             .await
             .expect("initial refresh should seed stale reset data");
 
-        let attempts = run_past_reset_retry_loop(
-            &daemon,
-            None,
-            0,
-            Duration::from_millis(20),
-            Duration::from_millis(120),
+        let result = tokio::time::timeout(
+            Duration::from_millis(700),
+            run_past_reset_retry_loop(
+                &daemon,
+                None,
+                0,
+                Duration::from_millis(20),
+                Duration::from_millis(120),
+            ),
         )
         .await;
 
-        assert_eq!(
-            attempts, 0,
-            "without proactive trigger, retries must be disabled"
+        let attempts = result.expect("retry loop should stop when window expires");
+        assert!(
+            attempts > 0,
+            "without proactive trigger, stale data should still trigger aggressive retries"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_past_reset_retry_loop_logs_aggressive_mode_start_and_end() {
+        let _capture_lock = TEST_LOG_CAPTURE_LOCK.lock().await;
+        init_test_logger();
+        TEST_LOG_COLLECTOR.start_capture();
+
+        let daemon = daemon_with_stale_reset_plugin();
+        daemon
+            .refresh(None)
+            .await
+            .expect("initial refresh should seed stale reset data");
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(700),
+            run_past_reset_retry_loop(
+                &daemon,
+                None,
+                0,
+                Duration::from_millis(20),
+                Duration::from_millis(120),
+            ),
+        )
+        .await;
+
+        let attempts = result.expect("retry loop should stop when window expires");
+        assert!(
+            attempts > 0,
+            "expected at least one retry attempt for stale cached data"
+        );
+
+        let logs = TEST_LOG_COLLECTOR.stop_capture();
+        assert!(
+            logs.iter().any(|line| {
+                line.contains(
+                    "aggressive refresh mode started: past reset times detected in cached data",
+                )
+            }),
+            "expected aggressive mode start log message, got logs: {:?}",
+            logs
+        );
+        assert!(
+            logs.iter().any(|line| {
+                line.contains("aggressive refresh mode ended: retry window expired after")
+            }),
+            "expected aggressive mode end log message, got logs: {:?}",
+            logs
+        );
+    }
+
+    #[tokio::test]
+    async fn run_past_reset_retry_loop_logs_proactive_aggressive_mode_start() {
+        let _capture_lock = TEST_LOG_CAPTURE_LOCK.lock().await;
+        init_test_logger();
+        TEST_LOG_COLLECTOR.start_capture();
+
+        let daemon = daemon_with_stale_reset_plugin();
+        daemon
+            .refresh(None)
+            .await
+            .expect("initial refresh should seed stale reset data");
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(700),
+            run_past_reset_retry_loop(
+                &daemon,
+                Some(tokio::time::Instant::now()),
+                0,
+                Duration::from_millis(20),
+                Duration::from_millis(120),
+            ),
+        )
+        .await;
+
+        let attempts = result.expect("retry loop should stop when window expires");
+        assert!(
+            attempts > 0,
+            "expected at least one retry attempt for stale cached data"
+        );
+
+        let logs = TEST_LOG_COLLECTOR.stop_capture();
+        assert!(
+            logs.iter().any(|line| line
+                .contains("aggressive refresh mode started: proactive reset trigger detected")),
+            "expected proactive aggressive mode start log message, got logs: {:?}",
+            logs
+        );
+        assert!(
+            logs.iter().any(|line| {
+                line.contains("aggressive refresh mode ended: retry window expired after")
+            }),
+            "expected aggressive mode end log message, got logs: {:?}",
+            logs
         );
     }
 

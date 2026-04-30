@@ -208,9 +208,19 @@ impl DaemonState {
     /// The `margin_secs` parameter adds a buffer after the reset time to ensure
     /// the provider has actually updated their data.
     pub async fn time_until_next_reset(&self, margin_secs: u64) -> Option<Duration> {
+        self.next_reset_with_delay(margin_secs)
+            .await
+            .map(|(_, delay)| delay)
+    }
+
+    /// Returns the earliest future reset marker and its effective delay.
+    ///
+    /// The first tuple item is the original `resetsAt` value from provider data.
+    /// The second item is the duration until `resetsAt + margin_secs`.
+    pub async fn next_reset_with_delay(&self, margin_secs: u64) -> Option<(String, Duration)> {
         let cache = self.cache.read().await;
         let now = time::OffsetDateTime::now_utc();
-        let mut next_reset: Option<time::OffsetDateTime> = None;
+        let mut next_reset: Option<(time::OffsetDateTime, String)> = None;
 
         for snapshot in cache.values() {
             for line in &snapshot.lines {
@@ -225,18 +235,22 @@ impl DaemonState {
                 {
                     // Add margin to the reset time
                     let effective_reset = reset_time + time::Duration::seconds(margin_secs as i64);
-                    if effective_reset > now
-                        && (next_reset.is_none() || effective_reset < next_reset.unwrap())
-                    {
-                        next_reset = Some(effective_reset);
+                    if effective_reset > now {
+                        let should_update = match &next_reset {
+                            None => true,
+                            Some((earliest, _)) => effective_reset < *earliest,
+                        };
+                        if should_update {
+                            next_reset = Some((effective_reset, resets_at_str.clone()));
+                        }
                     }
                 }
             }
         }
 
-        next_reset.map(|reset_time| {
+        next_reset.map(|(reset_time, resets_at)| {
             let duration_ms = (reset_time - now).whole_milliseconds().max(0) as u64;
-            Duration::from_millis(duration_ms)
+            (resets_at, Duration::from_millis(duration_ms))
         })
     }
 
@@ -421,6 +435,28 @@ mod tests {
             .await
             .expect("next reset should exist");
 
+        assert!(
+            delay >= Duration::from_secs(27) && delay <= Duration::from_secs(31),
+            "unexpected delay: {:?}",
+            delay
+        );
+    }
+
+    #[tokio::test]
+    async fn next_reset_with_delay_returns_earliest_raw_resets_at() {
+        let earliest = iso_from_now(25);
+        let state = state_with_cache(vec![
+            snapshot("later", vec![progress_line(Some(iso_from_now(120)))]),
+            snapshot("earlier", vec![progress_line(Some(earliest.clone()))]),
+        ])
+        .await;
+
+        let (resets_at, delay) = state
+            .next_reset_with_delay(5)
+            .await
+            .expect("next reset should exist");
+
+        assert_eq!(resets_at, earliest);
         assert!(
             delay >= Duration::from_secs(27) && delay <= Duration::from_secs(31),
             "unexpected delay: {:?}",
