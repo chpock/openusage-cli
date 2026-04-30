@@ -1354,18 +1354,19 @@ async fn run_past_reset_retry_loop(
 
     if aggressive_mode_active {
         loop {
-            let has_past_resets = refresh_state.has_past_resets(reset_check_margin_secs).await;
+            let stale_provider_ids = refresh_state
+                .provider_ids_with_past_resets(reset_check_margin_secs)
+                .await;
+            let has_past_resets = !stale_provider_ids.is_empty();
             let has_future_reset = refresh_state
                 .next_reset_with_delay(reset_check_margin_secs)
                 .await
                 .is_some();
 
-            if has_future_reset && !has_past_resets {
-                ended_with_future_reset = true;
-                break;
-            }
-
-            if !proactive_triggered && !has_past_resets {
+            if !has_past_resets {
+                if has_future_reset {
+                    ended_with_future_reset = true;
+                }
                 break;
             }
 
@@ -1382,9 +1383,13 @@ async fn run_past_reset_retry_loop(
                 "provider data still shows past reset times, retrying in {}s",
                 reset_retry_delay.as_secs()
             );
+            log::debug!(
+                "aggressive retry will refresh provider ids: {:?}",
+                stale_provider_ids
+            );
             tokio::time::sleep(reset_retry_delay).await;
 
-            if let Err(err) = refresh_state.refresh(None).await {
+            if let Err(err) = refresh_state.refresh(Some(stale_provider_ids)).await {
                 log::warn!("retry refresh failed: {}", err);
             } else {
                 log::debug!("retry refresh completed");
@@ -3281,6 +3286,56 @@ mod tests {
         )
     }
 
+    fn no_reset_marker_plugin() -> manifest::LoadedPlugin {
+        manifest::LoadedPlugin {
+            manifest: manifest::PluginManifest {
+                schema_version: 1,
+                id: "no-reset-marker".to_string(),
+                name: "No Reset Marker".to_string(),
+                version: "0.0.0-test".to_string(),
+                entry: "plugin.js".to_string(),
+                icon: "icon.svg".to_string(),
+                brand_color: None,
+                lines: Vec::new(),
+                links: Vec::new(),
+            },
+            plugin_dir: PathBuf::from("."),
+            entry_script: r#"
+                globalThis.__openusage_plugin = {
+                    probe() {
+                        return {
+                            lines: [{
+                                type: "text",
+                                label: "status",
+                                value: "ok"
+                            }]
+                        };
+                    }
+                };
+            "#
+            .to_string(),
+            icon_data_url: "data:image/svg+xml;base64,".to_string(),
+        }
+    }
+
+    fn daemon_with_no_reset_marker_plugin() -> DaemonState {
+        DaemonState::new(
+            vec![no_reset_marker_plugin()],
+            PathBuf::from("."),
+            "0.0.0-test".to_string(),
+            None,
+        )
+    }
+
+    fn daemon_with_mixed_reset_plugins() -> DaemonState {
+        DaemonState::new(
+            vec![stale_reset_plugin(), future_reset_plugin()],
+            PathBuf::from("."),
+            "0.0.0-test".to_string(),
+            None,
+        )
+    }
+
     #[tokio::test]
     async fn run_past_reset_retry_loop_stops_after_retry_window() {
         let daemon = daemon_with_stale_reset_plugin();
@@ -3454,6 +3509,90 @@ mod tests {
         assert_eq!(
             attempts, 0,
             "aggressive mode should stop immediately without retries when refreshed data has a future reset"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_past_reset_retry_loop_proactive_stops_when_no_reset_markers_exist() {
+        let daemon = daemon_with_no_reset_marker_plugin();
+        daemon
+            .refresh(None)
+            .await
+            .expect("initial refresh should seed data without reset markers");
+
+        let attempts = tokio::time::timeout(
+            Duration::from_millis(200),
+            run_past_reset_retry_loop(
+                &daemon,
+                Some(tokio::time::Instant::now()),
+                0,
+                Duration::from_millis(20),
+                Duration::from_millis(120),
+            ),
+        )
+        .await
+        .expect("retry loop should stop when there are no reset markers");
+
+        assert_eq!(
+            attempts, 0,
+            "proactive aggressive mode should not do no-op retries when no providers are stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_past_reset_retry_loop_refreshes_only_stale_providers() {
+        let daemon = daemon_with_mixed_reset_plugins();
+        daemon
+            .refresh(None)
+            .await
+            .expect("initial refresh should seed mixed reset data");
+
+        let stale_before = daemon
+            .cached_one("stale-reset")
+            .await
+            .expect("stale provider should be cached")
+            .fetched_at;
+        let future_before = daemon
+            .cached_one("future-reset")
+            .await
+            .expect("future provider should be cached")
+            .fetched_at;
+
+        tokio::time::sleep(Duration::from_millis(35)).await;
+
+        let attempts = tokio::time::timeout(
+            Duration::from_millis(700),
+            run_past_reset_retry_loop(
+                &daemon,
+                Some(tokio::time::Instant::now()),
+                0,
+                Duration::from_millis(20),
+                Duration::from_millis(120),
+            ),
+        )
+        .await
+        .expect("retry loop should stop when window expires");
+
+        assert!(attempts > 0, "expected at least one retry attempt");
+
+        let stale_after = daemon
+            .cached_one("stale-reset")
+            .await
+            .expect("stale provider should remain cached")
+            .fetched_at;
+        let future_after = daemon
+            .cached_one("future-reset")
+            .await
+            .expect("future provider should remain cached")
+            .fetched_at;
+
+        assert_ne!(
+            stale_after, stale_before,
+            "stale provider should be refreshed during aggressive retries"
+        );
+        assert_eq!(
+            future_after, future_before,
+            "future-reset provider should not be refreshed during aggressive retries"
         );
     }
 

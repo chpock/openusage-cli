@@ -258,10 +258,21 @@ impl DaemonState {
     /// This indicates that a limit was supposed to reset but the provider data
     /// hasn't been updated yet. Returns true if at least one past reset is found.
     pub async fn has_past_resets(&self, margin_secs: u64) -> bool {
+        !self
+            .provider_ids_with_past_resets(margin_secs)
+            .await
+            .is_empty()
+    }
+
+    /// Returns provider ids that still have at least one reset time in the past
+    /// (after applying margin). Output is sorted for stable logging and tests.
+    pub async fn provider_ids_with_past_resets(&self, margin_secs: u64) -> Vec<String> {
         let cache = self.cache.read().await;
         let now = time::OffsetDateTime::now_utc();
+        let mut provider_ids = Vec::new();
 
         for snapshot in cache.values() {
+            let mut has_past_reset = false;
             for line in &snapshot.lines {
                 if let MetricLine::Progress {
                     resets_at: Some(resets_at_str),
@@ -274,13 +285,19 @@ impl DaemonState {
                 {
                     let effective_reset = reset_time + time::Duration::seconds(margin_secs as i64);
                     if effective_reset <= now {
-                        return true;
+                        has_past_reset = true;
+                        break;
                     }
                 }
             }
+
+            if has_past_reset {
+                provider_ids.push(snapshot.provider_id.clone());
+            }
         }
 
-        false
+        provider_ids.sort_unstable();
+        provider_ids
     }
 
     fn resolve_plugins(&self, plugin_ids: Option<&[String]>) -> Vec<LoadedPlugin> {
@@ -473,6 +490,29 @@ mod tests {
         .await;
 
         assert!(state.has_past_resets(5).await);
+    }
+
+    #[tokio::test]
+    async fn provider_ids_with_past_resets_returns_only_stale_ids_sorted() {
+        let state = state_with_cache(vec![
+            snapshot("future", vec![progress_line(Some(iso_from_now(120)))]),
+            snapshot("past-b", vec![progress_line(Some(iso_from_now(-20)))]),
+            snapshot("past-a", vec![progress_line(Some(iso_from_now(-40)))]),
+            snapshot(
+                "invalid",
+                vec![
+                    text_line(),
+                    progress_line(None),
+                    progress_line(Some("bad-timestamp".to_string())),
+                ],
+            ),
+        ])
+        .await;
+
+        assert_eq!(
+            state.provider_ids_with_past_resets(5).await,
+            vec!["past-a".to_string(), "past-b".to_string()]
+        );
     }
 
     #[tokio::test]
