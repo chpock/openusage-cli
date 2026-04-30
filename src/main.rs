@@ -9,9 +9,9 @@ use openusage_cli::instance_control::{self, ExistingInstancePolicy, ServiceMode}
 use openusage_cli::plugin_engine::manifest;
 use openusage_cli::plugin_engine::runtime::MetricLine;
 use openusage_cli::restart_watcher;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -1501,9 +1501,102 @@ fn restart_self_process(raw_args: &[OsString]) -> Result<()> {
 fn exec_replacement_process(raw_args: &[OsString]) -> Result<()> {
     use std::os::unix::process::CommandExt;
 
-    let executable = std::env::current_exe().context("cannot resolve current executable")?;
-    let err = Command::new(executable).args(raw_args).exec();
-    Err(anyhow!("failed to exec replacement process: {}", err))
+    let argv0 = std::env::args_os().next();
+    let path_env = std::env::var_os("PATH");
+    let cwd = std::env::current_dir().ok();
+    let current_exe = std::env::current_exe().ok();
+    let candidates = restart_exec_candidates(
+        argv0.as_deref(),
+        path_env.as_deref(),
+        cwd.as_deref(),
+        current_exe.as_deref(),
+    );
+
+    let mut attempt_errors = Vec::new();
+    for executable in candidates {
+        log::info!(
+            "attempting self-restart via exec with candidate {}",
+            executable.display()
+        );
+        let err = Command::new(&executable).args(raw_args).exec();
+        attempt_errors.push(format!("{}: {}", executable.display(), err));
+    }
+
+    let details = if attempt_errors.is_empty() {
+        "no executable restart candidates were resolved".to_string()
+    } else {
+        attempt_errors.join("; ")
+    };
+
+    Err(anyhow!("failed to exec replacement process: {}", details))
+}
+
+fn restart_exec_candidates(
+    argv0: Option<&OsStr>,
+    path_env: Option<&OsStr>,
+    cwd: Option<&Path>,
+    current_exe: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Some(argv0) = argv0 {
+        let argv0_path = Path::new(argv0);
+        if argv0_path.is_absolute() || argv0_path.components().count() > 1 {
+            if let Some(resolved) = resolve_argv0_path(argv0_path, cwd) {
+                push_unique_candidate(&mut candidates, resolved);
+            }
+        } else if let Some(path_env) = path_env
+            && let Some(resolved) = lookup_executable_in_path(argv0, path_env)
+        {
+            push_unique_candidate(&mut candidates, resolved);
+        }
+    }
+
+    if let Some(current_exe) = current_exe {
+        push_unique_candidate(&mut candidates, current_exe.to_path_buf());
+    }
+
+    candidates
+}
+
+fn resolve_argv0_path(argv0_path: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
+    if argv0_path.is_absolute() {
+        return Some(argv0_path.to_path_buf());
+    }
+
+    cwd.map(|current_dir| current_dir.join(argv0_path))
+}
+
+fn lookup_executable_in_path(executable_name: &OsStr, path_env: &OsStr) -> Option<PathBuf> {
+    std::env::split_paths(path_env)
+        .map(|entry| entry.join(executable_name))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        if !path.is_file() {
+            return false;
+        }
+
+        std::fs::metadata(path)
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
+fn push_unique_candidate(candidates: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if !candidates.iter().any(|existing| existing == &candidate) {
+        candidates.push(candidate);
+    }
 }
 
 fn self_restart_strategy_tag() -> &'static str {
@@ -1765,7 +1858,22 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Mutex, Once};
+    #[cfg(unix)]
+    use tempfile::tempdir;
     use tokio::sync::Mutex as AsyncMutex;
+
+    #[cfg(unix)]
+    fn make_file_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, b"#!/bin/sh\nexit 0\n").expect("executable fixture should be created");
+        let mut permissions = std::fs::metadata(path)
+            .expect("fixture metadata should be readable")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions)
+            .expect("fixture permissions should be set to executable");
+    }
 
     struct TestLogCollector {
         capture_enabled: AtomicBool,
@@ -2691,6 +2799,62 @@ mod tests {
     fn self_restart_strategy_tag_matches_platform() {
         let expected = if cfg!(unix) { "exec" } else { "spawn" };
         assert_eq!(self_restart_strategy_tag(), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_exec_candidates_resolve_path_entry_before_current_exe() {
+        let temp = tempdir().expect("temp dir");
+        let bin_dir = temp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("bin dir");
+        let path_executable = bin_dir.join("openusage-cli");
+        make_file_executable(&path_executable);
+
+        let path_env = std::env::join_paths([bin_dir]).expect("PATH fixture should be joinable");
+        let current_exe = temp.path().join("openusage-cli-old");
+        let candidates = restart_exec_candidates(
+            Some(OsStr::new("openusage-cli")),
+            Some(path_env.as_os_str()),
+            None,
+            Some(current_exe.as_path()),
+        );
+
+        assert_eq!(
+            candidates,
+            vec![path_executable, current_exe],
+            "PATH-resolved executable should be preferred before current_exe fallback"
+        );
+    }
+
+    #[test]
+    fn restart_exec_candidates_resolve_relative_argv0_against_cwd() {
+        let cwd = Path::new("/opt/openusage");
+        let current_exe = Path::new("/proc/self/exe");
+
+        let candidates = restart_exec_candidates(
+            Some(OsStr::new("./openusage-cli")),
+            None,
+            Some(cwd),
+            Some(current_exe),
+        );
+
+        assert_eq!(
+            candidates,
+            vec![cwd.join("./openusage-cli"), current_exe.to_path_buf()]
+        );
+    }
+
+    #[test]
+    fn restart_exec_candidates_deduplicate_identical_entries() {
+        let same = Path::new("/usr/bin/openusage-cli");
+        let candidates = restart_exec_candidates(
+            Some(OsStr::new("/usr/bin/openusage-cli")),
+            None,
+            None,
+            Some(same),
+        );
+
+        assert_eq!(candidates, vec![same.to_path_buf()]);
     }
 
     #[test]
