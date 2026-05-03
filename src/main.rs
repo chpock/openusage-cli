@@ -852,7 +852,14 @@ async fn run_daemon_mode(
                     log::debug!("running scheduled interval refresh (no upcoming resets)");
                 }
 
-                if let Err(err) = refresh_state.refresh(None).await {
+                let refresh_targets = refresh_targets_for_cycle(
+                    &refresh_state,
+                    proactive_trigger_time,
+                    RESET_CHECK_MARGIN_SECS,
+                )
+                .await;
+
+                if let Err(err) = refresh_state.refresh(refresh_targets).await {
                     log::warn!("background refresh failed: {}", err);
                 } else {
                     log::debug!("background refresh completed");
@@ -1445,6 +1452,31 @@ async fn run_past_reset_retry_loop(
     }
 
     retry_attempts
+}
+
+async fn refresh_targets_for_cycle(
+    refresh_state: &DaemonState,
+    proactive_trigger_time: Option<tokio::time::Instant>,
+    reset_check_margin_secs: u64,
+) -> Option<Vec<String>> {
+    if proactive_trigger_time.is_some() {
+        let stale_provider_ids = refresh_state
+            .provider_ids_with_past_resets(reset_check_margin_secs)
+            .await;
+        if !stale_provider_ids.is_empty() {
+            log::debug!(
+                "proactive reset trigger will refresh provider ids: {:?}",
+                stale_provider_ids
+            );
+            return Some(stale_provider_ids);
+        }
+
+        log::debug!(
+            "proactive reset trigger found no stale providers; falling back to full refresh"
+        );
+    }
+
+    None
 }
 
 fn should_spawn_daemon_parent(runtime: &DaemonRuntimeCli) -> bool {
@@ -3578,6 +3610,158 @@ mod tests {
         assert_eq!(
             attempts, 0,
             "proactive aggressive mode should not do no-op retries when no providers are stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn proactive_reset_refresh_should_not_refresh_non_stale_providers() {
+        let daemon = daemon_with_mixed_reset_plugins();
+        daemon
+            .refresh(None)
+            .await
+            .expect("initial refresh should seed mixed reset data");
+
+        let stale_before = daemon
+            .cached_one("stale-reset")
+            .await
+            .expect("stale provider should be cached")
+            .fetched_at;
+        let future_before = daemon
+            .cached_one("future-reset")
+            .await
+            .expect("future provider should be cached")
+            .fetched_at;
+
+        tokio::time::sleep(Duration::from_millis(35)).await;
+
+        let stale_provider_ids = daemon.provider_ids_with_past_resets(0).await;
+        assert_eq!(
+            stale_provider_ids,
+            vec!["stale-reset".to_string()],
+            "expected only stale-reset to be stale at proactive reset trigger time"
+        );
+
+        let refresh_targets =
+            refresh_targets_for_cycle(&daemon, Some(tokio::time::Instant::now()), 0).await;
+        assert_eq!(
+            refresh_targets,
+            Some(vec!["stale-reset".to_string()]),
+            "proactive reset trigger should target only stale providers"
+        );
+
+        daemon
+            .refresh(refresh_targets)
+            .await
+            .expect("proactive reset refresh should execute");
+
+        let stale_after = daemon
+            .cached_one("stale-reset")
+            .await
+            .expect("stale provider should remain cached")
+            .fetched_at;
+        let future_after = daemon
+            .cached_one("future-reset")
+            .await
+            .expect("future provider should remain cached")
+            .fetched_at;
+
+        assert_ne!(
+            stale_after, stale_before,
+            "stale provider should be refreshed when proactive reset trigger fires"
+        );
+        assert_eq!(
+            future_after, future_before,
+            "non-stale providers should not be refreshed when proactive reset trigger fires"
+        );
+    }
+
+    #[tokio::test]
+    async fn proactive_reset_refresh_falls_back_to_full_refresh_when_nothing_is_stale() {
+        let daemon = daemon_with_future_reset_plugin();
+        daemon
+            .refresh(None)
+            .await
+            .expect("initial refresh should seed future reset data");
+
+        let refresh_targets =
+            refresh_targets_for_cycle(&daemon, Some(tokio::time::Instant::now()), 0).await;
+
+        assert_eq!(
+            refresh_targets, None,
+            "proactive refresh should fall back to full refresh when no stale providers exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn regular_interval_refresh_updates_non_stale_providers_after_aggressive_cycle() {
+        let daemon = daemon_with_mixed_reset_plugins();
+        daemon
+            .refresh(None)
+            .await
+            .expect("initial refresh should seed mixed reset data");
+
+        let stale_before_aggressive = daemon
+            .cached_one("stale-reset")
+            .await
+            .expect("stale provider should be cached")
+            .fetched_at;
+        let future_before_aggressive = daemon
+            .cached_one("future-reset")
+            .await
+            .expect("future provider should be cached")
+            .fetched_at;
+
+        tokio::time::sleep(Duration::from_millis(35)).await;
+
+        let aggressive_targets =
+            refresh_targets_for_cycle(&daemon, Some(tokio::time::Instant::now()), 0).await;
+        assert_eq!(
+            aggressive_targets,
+            Some(vec!["stale-reset".to_string()]),
+            "aggressive cycle should refresh only stale providers"
+        );
+
+        daemon
+            .refresh(aggressive_targets)
+            .await
+            .expect("aggressive cycle refresh should execute");
+
+        let stale_after_aggressive = daemon
+            .cached_one("stale-reset")
+            .await
+            .expect("stale provider should remain cached")
+            .fetched_at;
+        let future_after_aggressive = daemon
+            .cached_one("future-reset")
+            .await
+            .expect("future provider should remain cached")
+            .fetched_at;
+
+        assert_ne!(
+            stale_after_aggressive, stale_before_aggressive,
+            "stale provider should be refreshed during aggressive cycle"
+        );
+        assert_eq!(
+            future_after_aggressive, future_before_aggressive,
+            "non-stale provider should not be refreshed during aggressive cycle"
+        );
+
+        tokio::time::sleep(Duration::from_millis(35)).await;
+
+        daemon
+            .refresh(None)
+            .await
+            .expect("regular interval refresh should execute as full refresh");
+
+        let future_after_regular = daemon
+            .cached_one("future-reset")
+            .await
+            .expect("future provider should remain cached")
+            .fetched_at;
+
+        assert_ne!(
+            future_after_regular, future_after_aggressive,
+            "regular interval refresh should update non-stale providers"
         );
     }
 
