@@ -283,7 +283,7 @@ jobs:
         uses: KSXGitHub/github-actions-deploy-aur@v4.1.3
         with:
           pkgname: openusage-cli-git
-          pkgbuild: dist/aur/openusage-cli-git/PKGBUILD
+          pkgbuild: target/aur/openusage-cli-git/PKGBUILD
           commit_username: ${{ secrets.AUR_USERNAME }}
           commit_email: ${{ secrets.AUR_EMAIL }}
           ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
