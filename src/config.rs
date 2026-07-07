@@ -39,6 +39,7 @@ pub struct AppConfig {
     pub aggressive_refresh_interval_secs: Option<u64>,
     pub foreground: Option<bool>,
     pub existing_instance: Option<String>,
+    pub use_daemon: Option<bool>,
     pub log_level: Option<String>,
     pub proxy: Option<ProxyConfig>,
 }
@@ -171,6 +172,10 @@ foreground: false
 # Values: error | ignore | replace
 existing_instance: error
 
+# Query mode daemon discovery behavior.
+# true = try running daemon first, false = always use one-shot local query mode.
+use_daemon: true
+
 # Log level: error, warn, info, debug, trace.
 log_level: error
 
@@ -241,6 +246,7 @@ mod tests {
         );
         assert_eq!(parsed.foreground, Some(false));
         assert_eq!(parsed.existing_instance.as_deref(), Some("error"));
+        assert_eq!(parsed.use_daemon, Some(true));
         assert_eq!(parsed.log_level.as_deref(), Some(DEFAULT_LOG_LEVEL));
         let proxy = parsed.proxy.expect("proxy section must exist");
         assert!(!proxy.enabled);

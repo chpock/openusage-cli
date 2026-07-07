@@ -23,6 +23,8 @@ Behavior:
 2. If found, request data from daemon HTTP endpoints (`/v1/usage` or `/v1/plugins`).
 3. If no daemon is available (or request fails), fall back to local execution.
 
+To disable step 1 entirely, run query with `--use-daemon=false`.
+
 Fallback implications:
 
 - `--type=usage`: initializes runtime and actively polls providers, so response time is slower.

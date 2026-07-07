@@ -20,6 +20,7 @@ SHARED_RUNTIME_ARGS += $(if $(APP_DATA_DIR),--app-data-dir $(APP_DATA_DIR),)
 SHARED_RUNTIME_ARGS += $(if $(PLUGIN_OVERRIDES_DIR),--plugin-overrides-dir $(PLUGIN_OVERRIDES_DIR),)
 
 QUERY_ARGS = --log-level $(LOG_LEVEL)
+QUERY_ARGS += --use-daemon=false
 QUERY_ARGS += $(if $(QUERY_TYPE),--type $(QUERY_TYPE),)
 QUERY_ARGS += $(SHARED_RUNTIME_ARGS)
 

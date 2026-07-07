@@ -24,6 +24,11 @@ Configuration sources are merged in strict order:
 
 For operational behavior of `query` and `run-daemon` (including standalone vs systemd user service), see [daemon-modes.md](daemon-modes.md).
 
+`query`-specific control:
+
+- `use_daemon: true|false` in `config.yaml` controls whether `query` first tries daemon discovery.
+- CLI `--use-daemon` overrides this value when provided.
+
 ## Proxy configuration
 
 Proxy settings apply to outgoing plugin HTTP requests.

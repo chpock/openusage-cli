@@ -152,6 +152,10 @@ struct QueryArgs {
     /// Include query mode metadata in output [default: false]
     #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true")]
     with_state: bool,
+
+    /// Try to discover and query a running daemon first [default: true]
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    use_daemon: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -356,9 +360,10 @@ async fn run(cli: Cli, raw_args: &[OsString]) -> Result<RunOutcome> {
     match &runtime {
         RuntimeCli::Query(query_runtime) => {
             log::debug!(
-                "startup options: mode=query, type={}, with_state={}, test_mode={}, plugins_dir={:?}, enabled_plugins='{}', app_data_dir={:?}, plugin_overrides_dir={:?}, log_level={}",
+                "startup options: mode=query, type={}, with_state={}, use_daemon={}, test_mode={}, plugins_dir={:?}, enabled_plugins='{}', app_data_dir={:?}, plugin_overrides_dir={:?}, log_level={}",
                 query_runtime.query_type.as_str(),
                 query_runtime.with_state,
+                query_runtime.use_daemon,
                 query_runtime.shared.test_mode,
                 query_runtime.shared.plugins_dir,
                 query_runtime.shared.enabled_plugins,
@@ -568,32 +573,39 @@ async fn initialize_runtime_context(
 
 async fn run_query_mode(runtime: QueryRuntimeCli, app_version: &str) -> Result<RunOutcome> {
     let dirs = resolve_runtime_directories(&runtime.shared)?;
-    log::debug!("query mode enabled; attempting to discover running daemon");
+    if runtime.use_daemon {
+        log::debug!("query mode enabled; attempting to discover running daemon");
 
-    if let Some(daemon_base_url) =
-        discover_daemon_endpoint_with_override(dirs.test_runtime_dir.as_deref())
-    {
-        log::info!(
-            "discovered daemon endpoint at {}; querying for {}",
-            daemon_base_url,
-            runtime.query_type.as_str()
-        );
-        match query_daemon_via_http(&daemon_base_url, runtime.query_type).await {
-            Ok(json_output) => {
-                print_query_output(&json_output, runtime.with_state, QueryModeState::Cache)?;
-                return Ok(RunOutcome::Completed);
+        if let Some(daemon_base_url) =
+            discover_daemon_endpoint_with_override(dirs.test_runtime_dir.as_deref())
+        {
+            log::info!(
+                "discovered daemon endpoint at {}; querying for {}",
+                daemon_base_url,
+                runtime.query_type.as_str()
+            );
+            match query_daemon_via_http(&daemon_base_url, runtime.query_type).await {
+                Ok(json_output) => {
+                    print_query_output(&json_output, runtime.with_state, QueryModeState::Cache)?;
+                    return Ok(RunOutcome::Completed);
+                }
+                Err(err) => {
+                    log::warn!(
+                        "failed to query running daemon: {}; falling back to {}",
+                        err,
+                        runtime.query_type.fallback_description()
+                    );
+                }
             }
-            Err(err) => {
-                log::warn!(
-                    "failed to query running daemon: {}; falling back to {}",
-                    err,
-                    runtime.query_type.fallback_description()
-                );
-            }
+        } else {
+            log::info!(
+                "no running daemon discovered; falling back to {}",
+                runtime.query_type.fallback_description()
+            );
         }
     } else {
         log::info!(
-            "no running daemon discovered; falling back to {}",
+            "query daemon discovery disabled (--use-daemon=false); using {}",
             runtime.query_type.fallback_description()
         );
     }
@@ -1108,6 +1120,7 @@ struct QueryRuntimeCli {
     shared: SharedRuntimeCli,
     query_type: QueryType,
     with_state: bool,
+    use_daemon: bool,
     host: String,
     port: u16,
     refresh_interval_secs: u64,
@@ -1167,6 +1180,7 @@ impl RuntimeCli {
                 shared: resolve_shared_runtime(args.shared, test_mode, log_level, &config),
                 query_type: args.query_type,
                 with_state: args.with_state,
+                use_daemon: args.use_daemon.or(config.use_daemon).unwrap_or(true),
                 host: query_host,
                 port: query_port,
                 refresh_interval_secs: query_refresh_interval_secs,
@@ -1237,6 +1251,10 @@ impl RuntimeCli {
                     ),
                     query_type: default_query_args.query_type,
                     with_state: default_query_args.with_state,
+                    use_daemon: default_query_args
+                        .use_daemon
+                        .or(config.use_daemon)
+                        .unwrap_or(true),
                     host: query_host,
                     port: query_port,
                     refresh_interval_secs: query_refresh_interval_secs,
@@ -2223,6 +2241,36 @@ mod tests {
     }
 
     #[test]
+    fn cli_accepts_use_daemon_flag_without_value() {
+        let cli = parse_with_default_mode(&["query", "--use-daemon"])
+            .expect("query --use-daemon should parse");
+        let query_args = match cli.command {
+            Some(ModeCommand::Query(args)) => args,
+            _ => panic!("expected query command"),
+        };
+        assert_eq!(query_args.use_daemon, Some(true));
+    }
+
+    #[test]
+    fn cli_accepts_use_daemon_with_explicit_boolean_value() {
+        let cli = parse_with_default_mode(&["query", "--use-daemon=false"])
+            .expect("query --use-daemon=false should parse");
+        let query_args = match cli.command {
+            Some(ModeCommand::Query(args)) => args,
+            _ => panic!("expected query command"),
+        };
+        assert_eq!(query_args.use_daemon, Some(false));
+
+        let cli = parse_with_default_mode(&["query", "--use-daemon=true"])
+            .expect("query --use-daemon=true should parse");
+        let query_args = match cli.command {
+            Some(ModeCommand::Query(args)) => args,
+            _ => panic!("expected query command"),
+        };
+        assert_eq!(query_args.use_daemon, Some(true));
+    }
+
+    #[test]
     fn cli_accepts_with_state_flag_without_value() {
         let cli = parse_with_default_mode(&["query", "--with-state"]).expect("--with-state parses");
         let query_args = match cli.command {
@@ -2260,6 +2308,17 @@ mod tests {
             _ => panic!("expected query mode by default"),
         };
         assert!(query_args.with_state);
+    }
+
+    #[test]
+    fn cli_defaults_to_query_mode_with_use_daemon_space_syntax() {
+        let cli = parse_with_default_mode(&["--use-daemon", "false"])
+            .expect("--use-daemon false should default to query mode");
+        let query_args = match cli.command {
+            Some(ModeCommand::Query(args)) => args,
+            _ => panic!("expected query mode by default"),
+        };
+        assert_eq!(query_args.use_daemon, Some(false));
     }
 
     #[test]
@@ -2593,6 +2652,7 @@ mod tests {
         assert!(help.contains("--plugins-dir <PLUGINS_DIR>"));
         assert!(help.contains("--type <QUERY_TYPE>"));
         assert!(help.contains("--with-state [<WITH_STATE>]"));
+        assert!(help.contains("--use-daemon [<USE_DAEMON>]"));
         assert!(!help.contains("--host <HOST>"));
         assert!(!help.contains("--refresh-interval-secs <REFRESH_INTERVAL_SECS>"));
         assert!(help.contains("--log-level <LOG_LEVEL>"));
@@ -2650,6 +2710,7 @@ mod tests {
         );
         assert_eq!(runtime.query_type, QueryType::Usage);
         assert!(!runtime.with_state);
+        assert!(runtime.use_daemon);
         assert_eq!(runtime.host, config::DEFAULT_HOST);
         assert_eq!(runtime.port, config::DEFAULT_PORT);
         assert_eq!(
@@ -2675,6 +2736,7 @@ mod tests {
                 shared: SharedRuntimeArgs::default(),
                 query_type: QueryType::Plugins,
                 with_state: false,
+                use_daemon: None,
             })),
             ..empty_cli()
         };
@@ -2686,6 +2748,7 @@ mod tests {
 
         assert_eq!(runtime.query_type, QueryType::Plugins);
         assert!(!runtime.with_state);
+        assert!(runtime.use_daemon);
     }
 
     #[test]
@@ -2701,6 +2764,7 @@ mod tests {
             aggressive_refresh_interval_secs: Some(11),
             foreground: Some(true),
             existing_instance: Some("ignore".to_string()),
+            use_daemon: Some(false),
             log_level: Some("debug".to_string()),
             proxy: None,
         };
@@ -2731,7 +2795,32 @@ mod tests {
             ExistingInstancePolicy::Ignore
         );
         assert_eq!(runtime.service_mode, ServiceMode::Standalone);
+        assert!(!runtime.use_daemon);
         assert_eq!(runtime.shared.log_level, "debug");
+    }
+
+    #[test]
+    fn runtime_cli_query_mode_prioritizes_cli_use_daemon_over_config() {
+        let cli = Cli {
+            command: Some(ModeCommand::Query(QueryArgs {
+                shared: SharedRuntimeArgs::default(),
+                query_type: QueryType::Usage,
+                with_state: false,
+                use_daemon: Some(false),
+            })),
+            ..empty_cli()
+        };
+        let app_config = config::AppConfig {
+            use_daemon: Some(true),
+            ..config::AppConfig::default()
+        };
+
+        let runtime = expect_query_runtime(
+            RuntimeCli::from_sources(cli, app_config)
+                .expect("query use_daemon CLI value should override config"),
+        );
+
+        assert!(!runtime.use_daemon);
     }
 
     #[test]
@@ -2771,6 +2860,7 @@ mod tests {
             aggressive_refresh_interval_secs: Some(15),
             foreground: Some(false),
             existing_instance: Some("error".to_string()),
+            use_daemon: Some(true),
             log_level: Some("debug".to_string()),
             proxy: None,
         };

@@ -550,6 +550,68 @@ fn query_mode_with_state_reports_cache_when_daemon_response_is_used() {
 }
 
 #[test]
+fn query_mode_use_daemon_false_skips_daemon_and_reports_direct_with_state() {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home_dir = temp.path().join("home");
+    let app_data_dir = temp.path().join("app-data");
+
+    fs::create_dir_all(&home_dir).expect("create HOME dir");
+    fs::create_dir_all(&app_data_dir).expect("create app data dir");
+
+    let mut daemon = DaemonProcess::spawn(&workspace_root, &home_dir, &app_data_dir);
+
+    let endpoint_path = app_data_dir
+        .join(RUNTIME_DIR_NAME)
+        .join(DAEMON_ENDPOINT_FILE_NAME);
+    wait_for_endpoint_file(&endpoint_path, daemon.child_mut());
+    let endpoint_url = read_endpoint_url(&endpoint_path);
+    wait_for_health_ok(&endpoint_url, daemon.child_mut());
+
+    let daemon_bin = PathBuf::from(env!("CARGO_BIN_EXE_openusage-cli"));
+    let plugins_dir = workspace_root.join("vendor/openusage/plugins");
+    let query_output = Command::new(daemon_bin)
+        .arg("query")
+        .arg("--use-daemon=false")
+        .arg("--with-state")
+        .arg("--test-mode")
+        .arg("--plugins-dir")
+        .arg(&plugins_dir)
+        .arg("--enabled-plugins")
+        .arg("mock")
+        .arg("--app-data-dir")
+        .arg(&app_data_dir)
+        .arg("--log-level=info")
+        .env("HOME", &home_dir)
+        .output()
+        .expect("run query mode");
+
+    let stdout = String::from_utf8_lossy(&query_output.stdout);
+    let stderr = String::from_utf8_lossy(&query_output.stderr);
+
+    assert!(
+        query_output.status.success(),
+        "query mode with --use-daemon=false should succeed. stdout: {}, stderr: {}",
+        stdout,
+        stderr
+    );
+
+    let json: Value = serde_json::from_str(&stdout).expect("query output should be valid JSON");
+    assert_eq!(
+        json["state"]["queryMode"],
+        Value::String("direct".to_string())
+    );
+
+    assert!(
+        stderr.contains("query daemon discovery disabled (--use-daemon=false)"),
+        "expected explicit skip-daemon log message. stderr: {}",
+        stderr
+    );
+
+    daemon.terminate_gracefully();
+}
+
+#[test]
 fn query_mode_falls_back_to_local_execution_when_no_daemon() {
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let temp = tempfile::tempdir().expect("temp dir");

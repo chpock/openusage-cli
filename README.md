@@ -22,6 +22,7 @@ That one thing is reliable data collection from AI providers, so other tools can
 
 - Best for ad-hoc checks and scripts
 - Tries to read data from a running daemon first (fast path)
+- Can skip daemon discovery with `--use-daemon=false` for guaranteed one-shot local execution
 - If no daemon is available, falls back to direct local plugin execution
 - Fallback is slower because plugin runtime initialization and provider polling happen during command execution
 

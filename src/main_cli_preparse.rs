@@ -187,12 +187,16 @@ pub(super) fn option_requires_separate_value(option: &str) -> bool {
             | "--service-mode"
             | "--log-level"
             | "--type"
+            | "--use-daemon"
     )
 }
 
 pub(super) fn option_optionally_consumes_separate_value(option: &str) -> bool {
     let option_name = option.split('=').next().unwrap_or(option);
-    matches!(option_name, "--foreground" | "--with-state")
+    matches!(
+        option_name,
+        "--foreground" | "--with-state" | "--use-daemon"
+    )
 }
 
 pub(super) fn is_explicit_bool_value(value: &str) -> bool {

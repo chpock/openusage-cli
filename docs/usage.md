@@ -21,6 +21,7 @@ Default daemon port is `0`, which means "pick a free port".
 
 - Returns JSON payload once, then exits
 - Tries daemon first for fast responses
+- Set `--use-daemon=false` to skip daemon discovery and force one-shot local execution
 - Falls back to local plugin execution if daemon is unavailable
 - For `--type=usage`, fallback performs provider polling and can take noticeable time
 
@@ -62,6 +63,10 @@ Runtime flags (`query`, `run-daemon`):
 - `--enabled-plugins <csv-globs>` (default: `*`)
 - `--app-data-dir <path>`
 - `--plugin-overrides-dir <path>`
+
+`query` flags:
+
+- `--use-daemon[=true|false]` (`true` by default; set `false` to skip daemon discovery)
 
 `run-daemon` flags:
 
