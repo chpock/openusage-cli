@@ -76,9 +76,10 @@ ci-compact:
 	run_step build $(CARGO) build --locked $(CI_VERBOSE_FLAG); \
 	run_step test $(CARGO) test --locked $(CI_VERBOSE_FLAG)
 
+# Query is short-lived, so cargo-run convenience is fine.
+# Keep stdout clean for pipelines like `make query > out.json`.
 query:
-	# Query is short-lived, so cargo-run convenience is fine.
-	$(CARGO) run -- query $(QUERY_ARGS)
+	@$(CARGO) run --quiet -- query $(QUERY_ARGS)
 
 run-daemon:
 	# Daemon is long-lived and must receive Ctrl+C directly.
