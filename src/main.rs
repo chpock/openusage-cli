@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 
 mod main_cli_preparse;
 mod main_path_resolution;
@@ -455,6 +456,7 @@ async fn initialize_runtime_context(
     app_version: &str,
     app_data_dir: PathBuf,
     perform_initial_refresh: bool,
+    monitor_cmd_tx: Option<mpsc::UnboundedSender<restart_watcher::ProviderWatchCommand>>,
 ) -> Result<InitializedRuntimeContext> {
     log::info!("using app data dir: {}", app_data_dir.display());
     std::fs::create_dir_all(&app_data_dir).with_context(|| {
@@ -543,6 +545,7 @@ async fn initialize_runtime_context(
         app_data_dir.clone(),
         app_version.to_string(),
         plugin_overrides_dir.clone(),
+        monitor_cmd_tx.clone(),
     ));
 
     if perform_initial_refresh {
@@ -615,6 +618,7 @@ async fn run_query_mode(runtime: QueryRuntimeCli, app_version: &str) -> Result<R
         app_version,
         dirs.app_data_dir.clone(),
         runtime.query_type.requires_local_refresh(),
+        None,
     )
     .await?;
     let runtime_config_state =
@@ -799,6 +803,18 @@ async fn run_daemon_mode(
         return Ok(RunOutcome::Completed);
     }
 
+    // --- Start dynamic provider file-monitor actor ---
+    // On failure, all three values are None — no sender, no dispatcher, no
+    // cleanup needed.
+    let monitor_parts =
+        restart_watcher::try_start_provider_monitor(restart_watcher::spawn_provider_watch_actor);
+    let monitor_cmd_tx = monitor_parts.cmd_tx;
+    let monitor_event_rx = monitor_parts.event_rx;
+    let monitor_handle = monitor_parts.handle;
+    if monitor_cmd_tx.is_some() {
+        log::info!("dynamic provider file-monitor actor started");
+    }
+
     notify_systemd_status(
         runtime.service_mode,
         "initializing runtime context (plugins and cache)",
@@ -808,6 +824,7 @@ async fn run_daemon_mode(
         app_version,
         dirs.app_data_dir.clone(),
         true,
+        monitor_cmd_tx.clone(),
     )
     .await?;
     let daemon = initialized.daemon.clone();
@@ -942,7 +959,7 @@ async fn run_daemon_mode(
     .to_api_response();
 
     let app = http_api::router(ApiState {
-        daemon,
+        daemon: daemon.clone(),
         app_version: app_version.to_string(),
         config: runtime_config,
         lifecycle_tx: Some(Arc::clone(&lifecycle_tx)),
@@ -1001,10 +1018,18 @@ async fn run_daemon_mode(
         .context("failed to notify systemd that daemon startup completed")?;
     let watchdog_task = spawn_systemd_watchdog_task(runtime.service_mode);
 
-    let restart_watcher_task = match build_restart_watch_inputs(&runtime, &initialized).and_then(
-        |inputs| restart_watcher::spawn_restart_watcher(inputs, Arc::clone(&lifecycle_tx)),
-    ) {
-        Ok(task) => Some(task),
+    // --- Restart watcher (independent, always operational) ---
+    let (restart_action_tx, mut restart_action_rx) =
+        mpsc::unbounded_channel::<restart_watcher::WatchAction>();
+
+    let restart_watcher_handle = match build_restart_watch_inputs(&runtime, &initialized)
+        .and_then(restart_watcher::build_restart_registration)
+        .and_then(|reg| restart_watcher::spawn_file_monitor(vec![reg], restart_action_tx))
+    {
+        Ok(handle) => {
+            log::info!("filesystem restart watcher enabled");
+            Some(handle)
+        }
         Err(err) => {
             log::warn!(
                 "filesystem restart watcher is unavailable; continuing without auto-restart-on-change: {}",
@@ -1013,6 +1038,91 @@ async fn run_daemon_mode(
             None
         }
     };
+
+    // Restart dispatcher: immediate, independent — never blocked by refresh.
+    let restart_lifecycle_tx = Arc::clone(&lifecycle_tx);
+    let restart_dispatch_handle = tokio::spawn(async move {
+        while let Some(_action) = restart_action_rx.recv().await {
+            log::info!("daemon restart requested by filesystem watcher");
+            let mut tx_guard = restart_lifecycle_tx.lock().await;
+            if let Some(tx) = tx_guard.take() {
+                if tx.send(LifecycleCommand::Restart).is_err() {
+                    log::warn!(
+                        "filesystem watcher could not trigger restart: lifecycle channel already closed"
+                    );
+                }
+            } else {
+                log::warn!(
+                    "filesystem watcher could not trigger restart: lifecycle command already requested"
+                );
+            }
+        }
+    });
+
+    // --- Dynamic provider file-monitor dispatcher: owned refresh + drain ---
+    // Only spawned when the actor started successfully.
+    // Owns refresh execution inline (no detached child tasks). After each
+    // refresh, drains all queued ProvidersChanged events via try_recv, unions
+    // their IDs, and runs at most one follow-up refresh per drain cycle.
+    let monitor_dispatch_handle: Option<tokio::task::JoinHandle<()>> =
+        if let Some(mut monitor_event_rx) = monitor_event_rx {
+            let monitor_daemon = Arc::clone(&daemon);
+            Some(tokio::spawn(async move {
+                let mut pending_ids: Vec<String> = Vec::new();
+
+                loop {
+                    // Wait for the first event.
+                    let Some(restart_watcher::ProviderWatchEvent::ProvidersChanged(ids)) =
+                        monitor_event_rx.recv().await
+                    else {
+                        break;
+                    };
+
+                    // Accumulate initial batch.
+                    for id in ids {
+                        if !pending_ids.contains(&id) {
+                            pending_ids.push(id);
+                        }
+                    }
+                    pending_ids.sort();
+
+                    // Run refresh.
+                    let ids_to_refresh = std::mem::take(&mut pending_ids);
+                    log::info!(
+                        "provider file change detected; refreshing providers {:?}",
+                        ids_to_refresh
+                    );
+                    if let Err(err) = monitor_daemon.refresh(Some(ids_to_refresh)).await {
+                        log::warn!("provider file change refresh failed: {}", err);
+                    }
+
+                    // Drain any events queued during the refresh, union IDs.
+                    // At most one follow-up refresh per drain cycle.
+                    while let Ok(restart_watcher::ProviderWatchEvent::ProvidersChanged(ids)) =
+                        monitor_event_rx.try_recv()
+                    {
+                        for id in ids {
+                            if !pending_ids.contains(&id) {
+                                pending_ids.push(id);
+                            }
+                        }
+                    }
+                    if !pending_ids.is_empty() {
+                        pending_ids.sort();
+                        let ids_to_refresh = std::mem::take(&mut pending_ids);
+                        log::info!(
+                            "provider file change detected (drained); refreshing providers {:?}",
+                            ids_to_refresh
+                        );
+                        if let Err(err) = monitor_daemon.refresh(Some(ids_to_refresh)).await {
+                            log::warn!("provider file change refresh failed: {}", err);
+                        }
+                    }
+                }
+            }))
+        } else {
+            None
+        };
 
     log::debug!("waiting for shutdown signal");
 
@@ -1042,14 +1152,49 @@ async fn run_daemon_mode(
         }
     }
 
-    if let Some(task) = restart_watcher_task {
+    if let Some(task) = restart_watcher_handle {
         task.abort();
         match task.await {
-            Ok(()) => log::debug!("filesystem restart watcher task exited"),
+            Ok(()) => log::debug!("restart watcher task exited"),
             Err(err) if err.is_cancelled() => {
-                log::debug!("filesystem restart watcher task cancelled during shutdown")
+                log::debug!("restart watcher task cancelled during shutdown")
             }
-            Err(err) => log::warn!("filesystem restart watcher task ended with error: {}", err),
+            Err(err) => log::warn!("restart watcher task ended with error: {}", err),
+        }
+    }
+
+    restart_dispatch_handle.abort();
+    match restart_dispatch_handle.await {
+        Ok(()) => log::debug!("restart dispatch task exited"),
+        Err(err) if err.is_cancelled() => {
+            log::debug!("restart dispatch task cancelled during shutdown")
+        }
+        Err(err) => log::warn!("restart dispatch task ended with error: {}", err),
+    }
+
+    // --- Clean up provider file-monitor: dispatcher first, then actor ---
+    if let Some(task) = monitor_dispatch_handle {
+        task.abort();
+        match task.await {
+            Ok(()) => log::debug!("provider file-monitor dispatch task exited"),
+            Err(err) if err.is_cancelled() => {
+                log::debug!("provider file-monitor dispatch task cancelled during shutdown")
+            }
+            Err(err) => log::warn!(
+                "provider file-monitor dispatch task ended with error: {}",
+                err
+            ),
+        }
+    }
+
+    if let Some(task) = monitor_handle {
+        task.abort();
+        match task.await {
+            Ok(()) => log::debug!("provider file-monitor actor exited"),
+            Err(err) if err.is_cancelled() => {
+                log::debug!("provider file-monitor actor cancelled during shutdown")
+            }
+            Err(err) => log::warn!("provider file-monitor actor ended with error: {}", err),
         }
     }
 
@@ -3403,6 +3548,7 @@ mod tests {
             PathBuf::from("."),
             "0.0.0-test".to_string(),
             None,
+            None,
         )
     }
 
@@ -3447,6 +3593,7 @@ mod tests {
             PathBuf::from("."),
             "0.0.0-test".to_string(),
             None,
+            None,
         )
     }
 
@@ -3488,6 +3635,7 @@ mod tests {
             PathBuf::from("."),
             "0.0.0-test".to_string(),
             None,
+            None,
         )
     }
 
@@ -3496,6 +3644,7 @@ mod tests {
             vec![stale_reset_plugin(), future_reset_plugin()],
             PathBuf::from("."),
             "0.0.0-test".to_string(),
+            None,
             None,
         )
     }

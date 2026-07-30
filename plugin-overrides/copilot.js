@@ -17,6 +17,19 @@ const COPILOT_PROVIDER_KEY = "github-copilot";
 // transformation, so we keep minimal cross-call state on globalThis.
 const COPILOT_OVERRIDE_STATE_KEY = "__openusage_copilot_override_state";
 
+// Declare candidate paths at override evaluation time so the monitor
+// dependency tracker knows about them before any probe runs.
+(function() {
+  try {
+    var ctx = globalThis.__openusage_ctx;
+    if (ctx && ctx.host && ctx.host.fs && typeof ctx.host.fs.subscribeFile === "function") {
+      for (var i = 0; i < OPENCODE_AUTH_PATHS.length; i++) {
+        ctx.host.fs.subscribeFile(OPENCODE_AUTH_PATHS[i]);
+      }
+    }
+  } catch (_) {}
+})();
+
 function patchLoadToken(originalLoadToken, ctx) {
   const primary = originalLoadToken(ctx);
   if (primary && isNonEmptyString(primary.token)) {

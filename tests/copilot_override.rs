@@ -45,6 +45,14 @@ fn execute_probe_with_setup(setup_script: &str) -> Value {
     })
 }
 
+fn assert_subscriptions(output: &Value, expected: &[&str]) {
+    let subs: Vec<&str> = output["state"]["subscriptions"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(subs, expected, "subscription mismatch");
+}
+
 #[test]
 fn copilot_override_uses_opencode_fallback_auth_when_primary_auth_missing() {
     let output = execute_probe_with_setup(
@@ -66,6 +74,15 @@ fn copilot_override_uses_opencode_fallback_auth_when_primary_auth_missing() {
     );
 
     assert_eq!(output["ok"], Value::Bool(true));
+
+    // Both candidate paths declared at override evaluation time.
+    assert_subscriptions(
+        &output,
+        &[
+            "~/.local/share/opencode/auth.json",
+            "~/.config/opencode/auth.json",
+        ],
+    );
 
     let first_request = output["state"]["requests"]
         .as_array()
@@ -102,6 +119,15 @@ fn copilot_override_preserves_original_auth_priority() {
     );
 
     assert_eq!(output["ok"], Value::Bool(true));
+
+    // Both candidate paths declared at override evaluation time.
+    assert_subscriptions(
+        &output,
+        &[
+            "~/.local/share/opencode/auth.json",
+            "~/.config/opencode/auth.json",
+        ],
+    );
 
     let first_request = output["state"]["requests"]
         .as_array()
@@ -144,6 +170,16 @@ fn copilot_override_tries_multiple_opencode_auth_paths() {
 
     assert_eq!(output["ok"], Value::Bool(true));
 
+    // Both candidate paths declared at override evaluation time.
+    // First has no github-copilot key, second has it — no duplicates.
+    assert_subscriptions(
+        &output,
+        &[
+            "~/.local/share/opencode/auth.json",
+            "~/.config/opencode/auth.json",
+        ],
+    );
+
     let first_request = output["state"]["requests"]
         .as_array()
         .and_then(|arr| arr.first())
@@ -164,6 +200,17 @@ fn copilot_override_keeps_not_logged_in_error_without_valid_fallback_payload() {
     );
 
     assert_eq!(output["ok"], Value::Bool(false));
+
+    // Both candidate paths declared at override evaluation time.
+    // Invalid JSON at first path does not prevent declaration.
+    assert_subscriptions(
+        &output,
+        &[
+            "~/.local/share/opencode/auth.json",
+            "~/.config/opencode/auth.json",
+        ],
+    );
+
     let error = output["error"].as_str().unwrap_or_default();
     assert!(error.contains("Not logged in"));
 }
@@ -175,10 +222,19 @@ const HARNESS_SCRIPT: &str = r#"
     keychain: {},
     requests: [],
     logs: [],
+    subscriptions: [],
     responses: {
       usage: []
     }
   };
+
+  function dedupSubscribe(path) {
+    var arr = globalThis.__test_state.subscriptions;
+    for (var i = 0; i < arr.length; i++) {
+      if (arr[i] === path) return;
+    }
+    arr.push(path);
+  }
 
   function cloneHeaders(input) {
     var out = {};
@@ -219,7 +275,12 @@ const HARNESS_SCRIPT: &str = r#"
         writeText: function (path, text) {
           globalThis.__test_state.files[path] = String(text);
         },
-        listDir: function () { return []; }
+        listDir: function () { return []; },
+        subscribeFile: function (path) {
+          if (typeof path !== "string" || path.trim().length === 0) return false;
+          dedupSubscribe(path);
+          return true;
+        }
       },
       keychain: {
         readGenericPassword: function (service) {
@@ -333,6 +394,7 @@ const HARNESS_SCRIPT: &str = r#"
   };
 
   globalThis.__test_ctx = ctx;
+  globalThis.__openusage_ctx = ctx;
 })();
 "#;
 
@@ -346,7 +408,8 @@ const PROBE_EXEC_SCRIPT: &str = r#"
       state: {
         files: globalThis.__test_state.files,
         requests: globalThis.__test_state.requests,
-        logs: globalThis.__test_state.logs
+        logs: globalThis.__test_state.logs,
+        subscriptions: globalThis.__test_state.subscriptions
       }
     });
   } catch (e) {
@@ -356,7 +419,8 @@ const PROBE_EXEC_SCRIPT: &str = r#"
       state: {
         files: globalThis.__test_state.files,
         requests: globalThis.__test_state.requests,
-        logs: globalThis.__test_state.logs
+        logs: globalThis.__test_state.logs,
+        subscriptions: globalThis.__test_state.subscriptions
       }
     });
   }

@@ -1,11 +1,12 @@
 use crate::plugin_engine::manifest::{LoadedPlugin, ManifestLine, PluginLink};
 use crate::plugin_engine::runtime::{self, MetricLine};
+use crate::restart_watcher::ProviderWatchCommand;
 use anyhow::anyhow;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -64,6 +65,9 @@ pub struct DaemonState {
     plugin_overrides_dir: Option<PathBuf>,
     cache: RwLock<HashMap<String, CachedPluginSnapshot>>,
     refresh_lock: Mutex<()>,
+    /// Optional command sender for the provider file-monitor actor.
+    /// When set, ClearProvider/ReplaceProvider are sent around each probe.
+    monitor_cmd_tx: Option<mpsc::UnboundedSender<ProviderWatchCommand>>,
 }
 
 impl DaemonState {
@@ -72,6 +76,7 @@ impl DaemonState {
         app_data_dir: PathBuf,
         app_version: String,
         plugin_overrides_dir: Option<PathBuf>,
+        monitor_cmd_tx: Option<mpsc::UnboundedSender<ProviderWatchCommand>>,
     ) -> Self {
         log::debug!(
             "initializing daemon state: plugins={}, app_data_dir={}, app_version={}, plugin_overrides_dir={}",
@@ -90,6 +95,7 @@ impl DaemonState {
             plugin_overrides_dir,
             cache: RwLock::new(HashMap::new()),
             refresh_lock: Mutex::new(()),
+            monitor_cmd_tx,
         }
     }
 
@@ -160,11 +166,37 @@ impl DaemonState {
 
         for plugin in selected {
             let plugin_id = plugin.manifest.id.clone();
-            log::debug!("running probe for plugin {}", plugin_id);
             let data_dir = self.app_data_dir.clone();
             let app_version = self.app_version.clone();
             let plugin_overrides_dir = self.plugin_overrides_dir.clone();
-            let output = tokio::task::spawn_blocking(move || {
+
+            // --- Provider file-monitor: clear subscriptions before probe ---
+            if let Some(cmd_tx) = &self.monitor_cmd_tx {
+                let (ack, rx) = oneshot::channel();
+                if cmd_tx
+                    .send(ProviderWatchCommand::ClearProvider {
+                        provider_id: plugin_id.clone(),
+                        ack,
+                    })
+                    .is_err()
+                {
+                    log::warn!(
+                        "[daemon] monitor channel closed before clear for {}",
+                        plugin_id
+                    );
+                } else {
+                    if rx.await.is_err() {
+                        log::warn!(
+                            "[daemon] {} acknowledgement canceled for {}",
+                            "clear",
+                            plugin_id
+                        );
+                    }
+                }
+            }
+
+            log::debug!("running probe for plugin {}", plugin_id);
+            let probe_result = tokio::task::spawn_blocking(move || {
                 runtime::run_probe(
                     &plugin,
                     &data_dir,
@@ -176,11 +208,39 @@ impl DaemonState {
             .map_err(|err| anyhow!("plugin probe join error: {err}"))?;
 
             log::debug!(
-                "probe finished for plugin {}: lines={}",
-                output.provider_id,
-                output.lines.len()
+                "probe finished for plugin {}: lines={}, subscriptions={}",
+                probe_result.output.provider_id,
+                probe_result.output.lines.len(),
+                probe_result.subscriptions.len(),
             );
-            snapshots.push(CachedPluginSnapshot::from_output(output));
+
+            // --- Provider file-monitor: replace subscriptions after probe ---
+            if let Some(cmd_tx) = &self.monitor_cmd_tx {
+                let (ack, rx) = oneshot::channel();
+                if cmd_tx
+                    .send(ProviderWatchCommand::ReplaceProvider {
+                        provider_id: probe_result.output.provider_id.clone(),
+                        files: probe_result.subscriptions.clone(),
+                        ack,
+                    })
+                    .is_err()
+                {
+                    log::warn!(
+                        "[daemon] monitor channel closed before replace for {}",
+                        probe_result.output.provider_id
+                    );
+                } else {
+                    if rx.await.is_err() {
+                        log::warn!(
+                            "[daemon] {} acknowledgement canceled for {}",
+                            "replace",
+                            probe_result.output.provider_id
+                        );
+                    }
+                }
+            }
+
+            snapshots.push(CachedPluginSnapshot::from_output(probe_result.output));
         }
 
         let mut cache = self.cache.write().await;
@@ -371,7 +431,29 @@ fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin_engine::manifest::{LoadedPlugin, PluginManifest};
     use crate::plugin_engine::runtime::ProgressFormat;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    fn test_plugin(entry_script: &str) -> LoadedPlugin {
+        LoadedPlugin {
+            manifest: PluginManifest {
+                schema_version: 1,
+                id: "test".to_string(),
+                name: "Test".to_string(),
+                version: "0.0.0".to_string(),
+                entry: "plugin.js".to_string(),
+                icon: "icon.svg".to_string(),
+                brand_color: None,
+                lines: vec![],
+                links: vec![],
+            },
+            plugin_dir: PathBuf::from("."),
+            entry_script: entry_script.to_string(),
+            icon_data_url: "data:image/svg+xml;base64,".to_string(),
+        }
+    }
 
     fn iso_from_now(offset_secs: i64) -> String {
         (time::OffsetDateTime::now_utc() + time::Duration::seconds(offset_secs))
@@ -415,6 +497,7 @@ mod tests {
             Vec::new(),
             PathBuf::from("."),
             "0.0.0-test".to_string(),
+            None,
             None,
         );
         let mut cache = state.cache.write().await;
@@ -562,5 +645,281 @@ mod tests {
 
         assert_eq!(state.time_until_next_reset(5).await, None);
         assert!(state.has_past_resets(5).await);
+    }
+
+    #[tokio::test]
+    async fn refresh_sends_clear_before_probe_and_replace_after() {
+        // A minimal plugin whose probe calls subscribeFile on a known path.
+        let plugin = test_plugin(
+            r#"
+            globalThis.__openusage_plugin = {
+                probe(ctx) {
+                    ctx.host.fs.subscribeFile("/tmp/test-dep.json");
+                    return {
+                        lines: [ctx.line.text({ label: "Status", value: "ok" })]
+                    };
+                }
+            };
+            "#,
+        );
+
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let app_data = std::env::temp_dir().join("daemon-ctrl-test");
+        std::fs::create_dir_all(&app_data).ok();
+
+        let state = Arc::new(DaemonState::new(
+            vec![plugin],
+            app_data,
+            "0.0.0-test".to_string(),
+            None,
+            Some(cmd_tx),
+        ));
+
+        // Spawn refresh in background; it will block on ClearProvider ack.
+        let state_clone = Arc::clone(&state);
+        let refresh_handle = tokio::spawn(async move { state_clone.refresh(None).await });
+
+        // 1) Assert ClearProvider is sent before probe proceeds.
+        let clear_cmd = tokio::time::timeout(Duration::from_secs(5), cmd_rx.recv())
+            .await
+            .expect("timeout waiting for ClearProvider")
+            .expect("channel closed before ClearProvider");
+
+        match &clear_cmd {
+            ProviderWatchCommand::ClearProvider {
+                provider_id,
+                ack: _,
+            } => {
+                assert_eq!(
+                    provider_id, "test",
+                    "ClearProvider should target test plugin"
+                );
+            }
+            other => panic!("expected ClearProvider, got {:?}", other),
+        }
+
+        // At this point refresh is blocked waiting for the ack. No ReplaceProvider yet.
+        let replace_check = tokio::time::timeout(Duration::from_millis(100), cmd_rx.recv()).await;
+        assert!(
+            replace_check.is_err(),
+            "ReplaceProvider should not arrive before ClearProvider ack"
+        );
+
+        // 2) Acknowledge ClearProvider so probe can run.
+        if let ProviderWatchCommand::ClearProvider { ack, .. } = clear_cmd {
+            let _ = ack.send(());
+        }
+
+        // 3) Assert ReplaceProvider arrives with the subscribed file.
+        let replace_cmd = tokio::time::timeout(Duration::from_secs(5), cmd_rx.recv())
+            .await
+            .expect("timeout waiting for ReplaceProvider")
+            .expect("channel closed before ReplaceProvider");
+
+        match &replace_cmd {
+            ProviderWatchCommand::ReplaceProvider {
+                provider_id,
+                files,
+                ack: _,
+            } => {
+                assert_eq!(
+                    provider_id, "test",
+                    "ReplaceProvider should target test plugin"
+                );
+                assert_eq!(files.len(), 1, "expected 1 subscribed file");
+                assert!(
+                    files[0].path.to_string_lossy().ends_with("test-dep.json"),
+                    "expected test-dep.json, got {:?}",
+                    files[0]
+                );
+            }
+            other => panic!("expected ReplaceProvider, got {:?}", other),
+        }
+
+        // 4) Acknowledge ReplaceProvider so refresh completes.
+        if let ProviderWatchCommand::ReplaceProvider { ack, .. } = replace_cmd {
+            let _ = ack.send(());
+        }
+
+        // 5) Assert refresh completed successfully and cached the snapshot.
+        let snapshots = refresh_handle
+            .await
+            .expect("refresh task panicked")
+            .expect("refresh failed");
+
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].provider_id, "test");
+        assert_eq!(snapshots[0].lines.len(), 1);
+
+        // Verify cache was written.
+        let cached = state.cached_one("test").await;
+        assert!(cached.is_some(), "snapshot should be cached");
+    }
+
+    #[tokio::test]
+    async fn refresh_sends_replace_with_empty_files_when_no_subscriptions() {
+        let plugin = test_plugin(
+            r#"
+            globalThis.__openusage_plugin = {
+                probe(ctx) {
+                    return {
+                        lines: [ctx.line.text({ label: "Status", value: "ok" })]
+                    };
+                }
+            };
+            "#,
+        );
+
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let app_data = std::env::temp_dir().join("daemon-ctrl-empty-test");
+        std::fs::create_dir_all(&app_data).ok();
+
+        let state = Arc::new(DaemonState::new(
+            vec![plugin],
+            app_data,
+            "0.0.0-test".to_string(),
+            None,
+            Some(cmd_tx),
+        ));
+
+        let state_clone = Arc::clone(&state);
+        let refresh_handle = tokio::spawn(async move { state_clone.refresh(None).await });
+
+        // ClearProvider
+        let clear_cmd = tokio::time::timeout(Duration::from_secs(5), cmd_rx.recv())
+            .await
+            .expect("timeout waiting for ClearProvider")
+            .expect("channel closed");
+        if let ProviderWatchCommand::ClearProvider { ack, .. } = clear_cmd {
+            let _ = ack.send(());
+        }
+
+        // ReplaceProvider with empty files
+        let replace_cmd = tokio::time::timeout(Duration::from_secs(5), cmd_rx.recv())
+            .await
+            .expect("timeout waiting for ReplaceProvider")
+            .expect("channel closed");
+
+        match &replace_cmd {
+            ProviderWatchCommand::ReplaceProvider {
+                provider_id,
+                files,
+                ack: _,
+            } => {
+                assert_eq!(provider_id, "test");
+                assert!(
+                    files.is_empty(),
+                    "expected empty files when probe calls no subscribeFile"
+                );
+            }
+            other => panic!("expected ReplaceProvider, got {:?}", other),
+        }
+
+        if let ProviderWatchCommand::ReplaceProvider { ack, .. } = replace_cmd {
+            let _ = ack.send(());
+        }
+
+        let snapshots = refresh_handle
+            .await
+            .expect("refresh task panicked")
+            .expect("refresh failed");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].provider_id, "test");
+    }
+
+    #[tokio::test]
+    async fn refresh_replace_provider_carries_existence_metadata() {
+        // Use a temp directory with one explicitly created file and one
+        // missing sibling.  Assert both true and false metadata values
+        // in the ReplaceProvider command.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let existing_path = tmp.path().join("present.json");
+        std::fs::write(&existing_path, "data").expect("write");
+        let missing_path = tmp.path().join("absent.json");
+
+        let plugin = test_plugin(&format!(
+            r#"
+            globalThis.__openusage_plugin = {{
+                probe(ctx) {{
+                    ctx.host.fs.subscribeFile("{}");
+                    ctx.host.fs.subscribeFile("{}");
+                    return {{
+                        lines: [ctx.line.text({{ label: "Status", value: "ok" }})]
+                    }};
+                }}
+            }};
+            "#,
+            existing_path.to_string_lossy().replace("\\", "\\\\"),
+            missing_path.to_string_lossy().replace("\\", "\\\\"),
+        ));
+
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let app_data = std::env::temp_dir().join("daemon-existence-test");
+        std::fs::create_dir_all(&app_data).ok();
+
+        let state = Arc::new(DaemonState::new(
+            vec![plugin],
+            app_data,
+            "0.0.0-test".to_string(),
+            None,
+            Some(cmd_tx),
+        ));
+
+        let state_clone = Arc::clone(&state);
+        let refresh_handle = tokio::spawn(async move { state_clone.refresh(None).await });
+
+        // ClearProvider
+        let clear_cmd = tokio::time::timeout(Duration::from_secs(5), cmd_rx.recv())
+            .await
+            .expect("timeout waiting for ClearProvider")
+            .expect("channel closed");
+        if let ProviderWatchCommand::ClearProvider { ack, .. } = clear_cmd {
+            let _ = ack.send(());
+        }
+
+        // ReplaceProvider
+        let replace_cmd = tokio::time::timeout(Duration::from_secs(5), cmd_rx.recv())
+            .await
+            .expect("timeout waiting for ReplaceProvider")
+            .expect("channel closed");
+
+        match &replace_cmd {
+            ProviderWatchCommand::ReplaceProvider {
+                provider_id,
+                files,
+                ack: _,
+            } => {
+                assert_eq!(provider_id, "test");
+                assert_eq!(files.len(), 2, "expected 2 subscribed files");
+
+                let existing_sub = files
+                    .iter()
+                    .find(|f| f.path == existing_path)
+                    .expect("expected present.json subscription");
+                assert!(
+                    existing_sub.existed_at_declaration,
+                    "present.json should have existed_at_declaration=true"
+                );
+
+                let missing_sub = files
+                    .iter()
+                    .find(|f| f.path == missing_path)
+                    .expect("expected absent.json subscription");
+                assert!(
+                    !missing_sub.existed_at_declaration,
+                    "absent.json should have existed_at_declaration=false"
+                );
+            }
+            other => panic!("expected ReplaceProvider, got {:?}", other),
+        }
+
+        if let ProviderWatchCommand::ReplaceProvider { ack, .. } = replace_cmd {
+            let _ = ack.send(());
+        }
+
+        let _ = refresh_handle
+            .await
+            .expect("refresh task panicked")
+            .expect("refresh failed");
     }
 }

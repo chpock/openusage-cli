@@ -14,6 +14,19 @@ const OPENCODE_AUTH_PATHS = [
 ];
 const OPENAI_PROVIDER_KEY = "openai";
 
+// Declare candidate paths at override evaluation time so the monitor
+// dependency tracker knows about them before any probe runs.
+(function() {
+  try {
+    var ctx = globalThis.__openusage_ctx;
+    if (ctx && ctx.host && ctx.host.fs && typeof ctx.host.fs.subscribeFile === "function") {
+      for (var i = 0; i < OPENCODE_AUTH_PATHS.length; i++) {
+        ctx.host.fs.subscribeFile(OPENCODE_AUTH_PATHS[i]);
+      }
+    }
+  } catch (_) {}
+})();
+
 function patchLoadAuth(originalLoadAuth, ctx) {
   const primary = originalLoadAuth(ctx);
   if (primary) {

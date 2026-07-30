@@ -4,6 +4,7 @@ use crate::plugin_engine::script_patch;
 use rquickjs::{Array, Context, Ctx, Error, Object, Promise, Runtime, Value};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -51,13 +52,30 @@ pub struct PluginOutput {
     pub icon_url: String,
 }
 
+pub use crate::restart_watcher::FileSubscription;
+
+/// Result of a probe execution, including file subscriptions collected
+/// during the probe via `ctx.host.fs.subscribeFile()`.  Subscriptions may
+/// be declared during plugin entry script evaluation, override evaluation,
+/// or the probe call itself.
+#[derive(Debug, Clone)]
+pub struct ProbeResult {
+    pub output: PluginOutput,
+    pub subscriptions: Vec<FileSubscription>,
+}
+
 pub fn run_probe(
     plugin: &LoadedPlugin,
     app_data_dir: &Path,
     app_version: &str,
     plugin_overrides_dir: Option<&Path>,
-) -> PluginOutput {
-    let fallback = error_output(plugin, "runtime error".to_string());
+) -> ProbeResult {
+    let subs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let fallback_subs = Arc::clone(&subs);
+    let fallback = ProbeResult {
+        output: error_output(plugin, "runtime error".to_string()),
+        subscriptions: std::mem::take(&mut *fallback_subs.lock().unwrap()),
+    };
 
     let rt = match Runtime::new() {
         Ok(rt) => rt,
@@ -73,7 +91,12 @@ pub fn run_probe(
     let display_name = plugin.manifest.name.clone();
     let override_script = match load_plugin_override(plugin, plugin_overrides_dir) {
         Ok(value) => value,
-        Err(err) => return error_output(plugin, format!("plugin override failed: {}", err)),
+        Err(err) => {
+            return ProbeResult {
+                output: error_output(plugin, format!("plugin override failed: {}", err)),
+                subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
+            };
+        }
     };
 
     let entry_script = match script_patch::transform_plugin_script(
@@ -93,45 +116,82 @@ pub fn run_probe(
             }
             result.script
         }
-        Err(err) => return error_output(plugin, format!("script transform failed: {}", err)),
+        Err(err) => {
+            return ProbeResult {
+                output: error_output(plugin, format!("script transform failed: {}", err)),
+                subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
+            };
+        }
     };
     let icon_url = plugin.icon_data_url.clone();
     let app_data = app_data_dir.to_path_buf();
 
     ctx.with(|ctx| {
-        if host_api::inject_host_api(&ctx, &plugin_id, &app_data, app_version).is_err() {
-            return error_output(plugin, "host api injection failed".to_string());
+        let subs_pass = Arc::clone(&subs);
+        if host_api::inject_host_api(&ctx, &plugin_id, &app_data, app_version, subs_pass).is_err() {
+            return ProbeResult {
+                output: error_output(plugin, "host api injection failed".to_string()),
+                subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
+            };
         }
         if host_api::patch_http_wrapper(&ctx).is_err() {
-            return error_output(plugin, "http wrapper patch failed".to_string());
+            return ProbeResult {
+                output: error_output(plugin, "http wrapper patch failed".to_string()),
+                subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
+            };
         }
         if host_api::patch_ls_wrapper(&ctx).is_err() {
-            return error_output(plugin, "ls wrapper patch failed".to_string());
+            return ProbeResult {
+                output: error_output(plugin, "ls wrapper patch failed".to_string()),
+                subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
+            };
         }
         if host_api::patch_ccusage_wrapper(&ctx).is_err() {
-            return error_output(plugin, "ccusage wrapper patch failed".to_string());
+            return ProbeResult {
+                output: error_output(plugin, "ccusage wrapper patch failed".to_string()),
+                subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
+            };
         }
         if host_api::inject_utils(&ctx).is_err() {
-            return error_output(plugin, "utils injection failed".to_string());
+            return ProbeResult {
+                output: error_output(plugin, "utils injection failed".to_string()),
+                subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
+            };
         }
 
         if ctx.eval::<(), _>(entry_script.as_bytes()).is_err() {
-            return error_output(plugin, "script eval failed".to_string());
+            return ProbeResult {
+                output: error_output(plugin, "script eval failed".to_string()),
+                subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
+            };
         }
 
         if let Err(err) = apply_plugin_override(&ctx, &plugin_id, override_script.as_ref()) {
-            return error_output(plugin, format!("plugin override failed: {}", err));
+            return ProbeResult {
+                output: error_output(plugin, format!("plugin override failed: {}", err)),
+                subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
+            };
         }
 
         let globals = ctx.globals();
         let plugin_obj: Object = match globals.get("__openusage_plugin") {
             Ok(obj) => obj,
-            Err(_) => return error_output(plugin, "missing __openusage_plugin".to_string()),
+            Err(_) => {
+                return ProbeResult {
+                    output: error_output(plugin, "missing __openusage_plugin".to_string()),
+                    subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
+                };
+            }
         };
 
         let probe_fn: rquickjs::Function = match plugin_obj.get("probe") {
             Ok(f) => f,
-            Err(_) => return error_output(plugin, "missing probe()".to_string()),
+            Err(_) => {
+                return ProbeResult {
+                    output: error_output(plugin, "missing probe()".to_string()),
+                    subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
+                };
+            }
         };
 
         let probe_ctx: Value = globals
@@ -140,26 +200,53 @@ pub fn run_probe(
 
         let result_value: Value = match probe_fn.call((probe_ctx,)) {
             Ok(r) => r,
-            Err(_) => return error_output(plugin, extract_error_string(&ctx)),
+            Err(_) => {
+                return ProbeResult {
+                    output: error_output(plugin, extract_error_string(&ctx)),
+                    subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
+                };
+            }
         };
         let result: Object = if result_value.is_promise() {
             let promise: Promise = match result_value.into_promise() {
                 Some(promise) => promise,
                 None => {
-                    return error_output(plugin, "probe() returned invalid promise".to_string());
+                    return ProbeResult {
+                        output: error_output(
+                            plugin,
+                            "probe() returned invalid promise".to_string(),
+                        ),
+                        subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
+                    };
                 }
             };
             match promise.finish::<Object>() {
                 Ok(obj) => obj,
                 Err(Error::WouldBlock) => {
-                    return error_output(plugin, "probe() returned unresolved promise".to_string());
+                    return ProbeResult {
+                        output: error_output(
+                            plugin,
+                            "probe() returned unresolved promise".to_string(),
+                        ),
+                        subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
+                    };
                 }
-                Err(_) => return error_output(plugin, extract_error_string(&ctx)),
+                Err(_) => {
+                    return ProbeResult {
+                        output: error_output(plugin, extract_error_string(&ctx)),
+                        subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
+                    };
+                }
             }
         } else {
             match result_value.into_object() {
                 Some(obj) => obj,
-                None => return error_output(plugin, "probe() returned non-object".to_string()),
+                None => {
+                    return ProbeResult {
+                        output: error_output(plugin, "probe() returned non-object".to_string()),
+                        subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
+                    };
+                }
             }
         };
 
@@ -174,12 +261,15 @@ pub fn run_probe(
             Err(msg) => vec![error_line(msg)],
         };
 
-        PluginOutput {
-            provider_id: plugin_id,
-            display_name,
-            plan,
-            lines,
-            icon_url,
+        ProbeResult {
+            output: PluginOutput {
+                provider_id: plugin_id,
+                display_name,
+                plan,
+                lines,
+                icon_url,
+            },
+            subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
         }
     })
 }
@@ -671,7 +761,7 @@ mod tests {
         std::env::temp_dir().join(format!("openusage-test-{}-{}", label, nanos))
     }
 
-    fn error_text(output: PluginOutput) -> String {
+    fn error_text(output: &PluginOutput) -> String {
         match output.lines.first() {
             Some(MetricLine::Badge { text, .. }) => text.clone(),
             other => panic!("expected error badge, got {:?}", other),
@@ -689,8 +779,8 @@ mod tests {
             };
             "#,
         );
-        let output = run_probe(&plugin, &temp_app_dir("sync"), "0.0.0", None);
-        assert_eq!(error_text(output), "boom");
+        let result = run_probe(&plugin, &temp_app_dir("sync"), "0.0.0", None);
+        assert_eq!(error_text(&result.output), "boom");
     }
 
     #[test]
@@ -704,8 +794,8 @@ mod tests {
             };
             "#,
         );
-        let output = run_probe(&plugin, &temp_app_dir("async"), "0.0.0", None);
-        assert_eq!(error_text(output), "boom");
+        let result = run_probe(&plugin, &temp_app_dir("async"), "0.0.0", None);
+        assert_eq!(error_text(&result.output), "boom");
     }
 
     #[test]
@@ -741,14 +831,14 @@ mod tests {
         )
         .expect("write override script");
 
-        let output = run_probe(
+        let result = run_probe(
             &plugin,
             &app_data_dir,
             "0.0.0",
             Some(overrides_dir.as_path()),
         );
 
-        let has_override_badge = output.lines.iter().any(|line| {
+        let has_override_badge = result.output.lines.iter().any(|line| {
             matches!(
                 line,
                 MetricLine::Badge { label, text, .. }
@@ -779,6 +869,293 @@ mod tests {
         assert!(
             obj.get("resets_at").is_none(),
             "did not expect resets_at key"
+        );
+    }
+
+    #[test]
+    fn run_probe_collects_subscriptions_from_subscribe_file() {
+        let plugin = test_plugin(
+            r#"
+            globalThis.__openusage_plugin = {
+                probe(ctx) {
+                    ctx.host.fs.subscribeFile("/tmp/test-dep-a.json");
+                    ctx.host.fs.subscribeFile("/tmp/test-dep-b.json");
+                    return {
+                        lines: [ctx.line.text({ label: "Status", value: "ok" })]
+                    };
+                }
+            };
+            "#,
+        );
+        let result = run_probe(&plugin, &temp_app_dir("subs"), "0.0.0", None);
+
+        // Should have collected the two subscriptions.
+        assert_eq!(result.subscriptions.len(), 2, "expected 2 subscriptions");
+        let paths: Vec<String> = result
+            .subscriptions
+            .iter()
+            .map(|p| p.path.to_string_lossy().to_string())
+            .collect();
+        assert!(paths.iter().any(|p| p.ends_with("test-dep-a.json")));
+        assert!(paths.iter().any(|p| p.ends_with("test-dep-b.json")));
+
+        // Output should be the normal success result.
+        assert_eq!(result.output.lines.len(), 1);
+    }
+
+    #[test]
+    fn run_probe_subscriptions_are_empty_when_no_subscribe_file() {
+        let plugin = test_plugin(
+            r#"
+            globalThis.__openusage_plugin = {
+                probe(ctx) {
+                    return {
+                        lines: [ctx.line.text({ label: "Status", value: "ok" })]
+                    };
+                }
+            };
+            "#,
+        );
+        let result = run_probe(&plugin, &temp_app_dir("no-subs"), "0.0.0", None);
+        assert!(
+            result.subscriptions.is_empty(),
+            "expected no subscriptions when subscribeFile is never called"
+        );
+        assert_eq!(result.output.lines.len(), 1);
+        assert_eq!(result.output.lines.len(), 1);
+    }
+
+    #[test]
+    fn run_probe_collects_subscriptions_from_entry_script_before_probe() {
+        // Subscriptions declared during entry script evaluation (before
+        // probe() is called) must be collected in the result.
+        let plugin = test_plugin(
+            r#"
+            // Declare dependency at module level, before probe is defined.
+            var ctx = globalThis.__openusage_ctx;
+            ctx.host.fs.subscribeFile("/tmp/entry-dep.json");
+
+            globalThis.__openusage_plugin = {
+                probe(ctx) {
+                    // Also declare one during probe.
+                    ctx.host.fs.subscribeFile("/tmp/probe-dep.json");
+                    return {
+                        lines: [ctx.line.text({ label: "Status", value: "ok" })]
+                    };
+                }
+            };
+            "#,
+        );
+        let result = run_probe(&plugin, &temp_app_dir("entry-subs"), "0.0.0", None);
+
+        // Should have collected subscriptions from both entry script and probe.
+        assert_eq!(result.subscriptions.len(), 2, "expected 2 subscriptions");
+        let paths: Vec<String> = result
+            .subscriptions
+            .iter()
+            .map(|p| p.path.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            paths.iter().any(|p| p.ends_with("entry-dep.json")),
+            "expected entry-dep.json in subscriptions"
+        );
+        assert!(
+            paths.iter().any(|p| p.ends_with("probe-dep.json")),
+            "expected probe-dep.json in subscriptions"
+        );
+
+        // Output should be the normal success result.
+        assert_eq!(result.output.lines.len(), 1);
+    }
+
+    #[test]
+    fn run_probe_retains_subscriptions_when_probe_throws_sync() {
+        // When probe() throws synchronously, subscriptions collected before
+        // the throw must still be present in ProbeResult.
+        let plugin = test_plugin(
+            r#"
+            globalThis.__openusage_plugin = {
+                probe(ctx) {
+                    ctx.host.fs.subscribeFile("/tmp/error-dep.json");
+                    throw "sync-error";
+                }
+            };
+            "#,
+        );
+        let result = run_probe(&plugin, &temp_app_dir("error-sync"), "0.0.0", None);
+
+        // Should have collected the subscription despite the error.
+        assert_eq!(result.subscriptions.len(), 1, "expected 1 subscription");
+        assert!(
+            result.subscriptions[0]
+                .path
+                .to_string_lossy()
+                .ends_with("error-dep.json"),
+            "expected error-dep.json in subscriptions"
+        );
+
+        // Output should be an error badge.
+        assert_eq!(result.output.lines.len(), 1);
+        match &result.output.lines[0] {
+            MetricLine::Badge { label, text, .. } => {
+                assert_eq!(label, "Error");
+                assert_eq!(text, "sync-error");
+            }
+            other => panic!("expected error badge, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn run_probe_retains_subscriptions_when_probe_throws_async() {
+        // When probe() rejects asynchronously, subscriptions collected before
+        // the throw must still be present in ProbeResult.
+        let plugin = test_plugin(
+            r#"
+            globalThis.__openusage_plugin = {
+                probe: async function(ctx) {
+                    ctx.host.fs.subscribeFile("/tmp/async-error-dep.json");
+                    throw "async-error";
+                }
+            };
+            "#,
+        );
+        let result = run_probe(&plugin, &temp_app_dir("error-async"), "0.0.0", None);
+
+        // Should have collected the subscription despite the error.
+        assert_eq!(result.subscriptions.len(), 1, "expected 1 subscription");
+        assert!(
+            result.subscriptions[0]
+                .path
+                .to_string_lossy()
+                .ends_with("async-error-dep.json"),
+            "expected async-error-dep.json in subscriptions"
+        );
+
+        // Output should be an error badge.
+        assert_eq!(result.output.lines.len(), 1);
+        match &result.output.lines[0] {
+            MetricLine::Badge { label, text, .. } => {
+                assert_eq!(label, "Error");
+                assert_eq!(text, "async-error");
+            }
+            other => panic!("expected error badge, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn run_probe_collects_subscriptions_from_entry_script_and_override() {
+        // When both the entry script and the override declare dependencies,
+        // the result must contain subscriptions from both sources.
+        let plugin = test_plugin(
+            r#"
+            // Entry script declares a dependency.
+            var ctx = globalThis.__openusage_ctx;
+            ctx.host.fs.subscribeFile("/tmp/entry-dep.json");
+
+            globalThis.__openusage_plugin = {
+                probe(ctx) {
+                    ctx.host.fs.subscribeFile("/tmp/probe-dep.json");
+                    return {
+                        lines: [ctx.line.text({ label: "Status", value: "ok" })]
+                    };
+                }
+            };
+            "#,
+        );
+
+        let app_data_dir = temp_app_dir("entry-override-subs");
+        let overrides_dir = temp_app_dir("entry-override-dir");
+        std::fs::create_dir_all(&overrides_dir).expect("create overrides dir");
+        std::fs::write(
+            overrides_dir.join("test.js"),
+            r#"
+            // Override declares a dependency before wrapping.
+            globalThis.__openusage_ctx.host.fs.subscribeFile("/tmp/override-dep.json");
+
+            globalThis.__openusage_override.wrapProbe(function(ctx, currentProbe, originalProbe) {
+                return originalProbe(ctx);
+            });
+            "#,
+        )
+        .expect("write override script");
+
+        let result = run_probe(
+            &plugin,
+            &app_data_dir,
+            "0.0.0",
+            Some(overrides_dir.as_path()),
+        );
+
+        // Should have collected subscriptions from entry script, probe, and override.
+        assert_eq!(result.subscriptions.len(), 3, "expected 3 subscriptions");
+        let paths: Vec<String> = result
+            .subscriptions
+            .iter()
+            .map(|p| p.path.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            paths.iter().any(|p| p.ends_with("entry-dep.json")),
+            "expected entry-dep.json"
+        );
+        assert!(
+            paths.iter().any(|p| p.ends_with("probe-dep.json")),
+            "expected probe-dep.json"
+        );
+        assert!(
+            paths.iter().any(|p| p.ends_with("override-dep.json")),
+            "expected override-dep.json"
+        );
+
+        // Output should be the normal success result.
+        assert_eq!(result.output.lines.len(), 1);
+    }
+
+    #[test]
+    fn run_probe_collects_subscriptions_with_existence_metadata() {
+        // Use a temp directory with one explicitly created file and one
+        // missing sibling.  Assert both true and false metadata values.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let existing_path = tmp.path().join("present.json");
+        std::fs::write(&existing_path, "data").expect("write");
+        let missing_path = tmp.path().join("absent.json");
+
+        let plugin = test_plugin(&format!(
+            r#"
+            globalThis.__openusage_plugin = {{
+                probe(ctx) {{
+                    ctx.host.fs.subscribeFile("{}");
+                    ctx.host.fs.subscribeFile("{}");
+                    return {{
+                        lines: [ctx.line.text({{ label: "Status", value: "ok" }})]
+                    }};
+                }}
+            }};
+            "#,
+            existing_path.to_string_lossy().replace("\\", "\\\\"),
+            missing_path.to_string_lossy().replace("\\", "\\\\"),
+        ));
+        let result = run_probe(&plugin, &temp_app_dir("existence-meta"), "0.0.0", None);
+
+        assert_eq!(result.subscriptions.len(), 2, "expected 2 subscriptions");
+
+        let existing_sub = result
+            .subscriptions
+            .iter()
+            .find(|s| s.path == existing_path)
+            .expect("expected present.json subscription");
+        assert!(
+            existing_sub.existed_at_declaration,
+            "present.json exists, so existed_at_declaration should be true"
+        );
+
+        let missing_sub = result
+            .subscriptions
+            .iter()
+            .find(|s| s.path == missing_path)
+            .expect("expected absent.json subscription");
+        assert!(
+            !missing_sub.existed_at_declaration,
+            "absent.json does not exist, so existed_at_declaration should be false"
         );
     }
 }

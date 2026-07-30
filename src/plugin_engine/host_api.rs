@@ -9,6 +9,7 @@ use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 const WHITELISTED_ENV_VARS: [&str; 16] = [
     "CODEX_HOME",
@@ -455,6 +456,7 @@ pub fn inject_host_api<'js>(
     plugin_id: &str,
     app_data_dir: &Path,
     app_version: &str,
+    subscription_collector: Arc<std::sync::Mutex<Vec<crate::restart_watcher::FileSubscription>>>,
 ) -> rquickjs::Result<()> {
     let globals = ctx.globals();
     let probe_ctx = Object::new(ctx.clone())?;
@@ -481,7 +483,7 @@ pub fn inject_host_api<'js>(
 
     let host = Object::new(ctx.clone())?;
     inject_log(ctx, &host, plugin_id)?;
-    inject_fs(ctx, &host)?;
+    inject_fs(ctx, &host, subscription_collector)?;
     inject_crypto(ctx, &host)?;
     inject_env(ctx, &host, plugin_id)?;
     inject_http(ctx, &host, plugin_id)?;
@@ -527,7 +529,11 @@ fn inject_log<'js>(ctx: &Ctx<'js>, host: &Object<'js>, plugin_id: &str) -> rquic
     Ok(())
 }
 
-fn inject_fs<'js>(ctx: &Ctx<'js>, host: &Object<'js>) -> rquickjs::Result<()> {
+fn inject_fs<'js>(
+    ctx: &Ctx<'js>,
+    host: &Object<'js>,
+    subscription_collector: Arc<std::sync::Mutex<Vec<crate::restart_watcher::FileSubscription>>>,
+) -> rquickjs::Result<()> {
     let fs_obj = Object::new(ctx.clone())?;
 
     fs_obj.set(
@@ -587,6 +593,40 @@ fn inject_fs<'js>(ctx: &Ctx<'js>, host: &Object<'js>) -> rquickjs::Result<()> {
                 Ok(names)
             },
         )?,
+    )?;
+
+    // subscribeFile: register an exact file dependency for the current probe.
+    // Returns true when the path is accepted (non-empty, valid), false otherwise.
+    // The path has its tilde prefix expanded; further normalization to an
+    // absolute lexical path is performed by the monitor actor. Deduplication
+    // is by lexical path.  The file's existence at declaration time is
+    // recorded so the actor can detect declaration-to-install races.
+    let collector = subscription_collector;
+    fs_obj.set(
+        "subscribeFile",
+        Function::new(ctx.clone(), move |path: String| -> bool {
+            let trimmed = path.trim();
+            if trimmed.is_empty() {
+                return false;
+            }
+            let expanded = expand_path(trimmed);
+            let pb = std::path::PathBuf::from(&expanded);
+            if pb.as_os_str().is_empty() || pb.parent().is_none() {
+                return false;
+            }
+            let existed = pb.exists();
+            let mut subs = collector.lock().unwrap();
+            if !subs
+                .iter()
+                .any(|s: &crate::restart_watcher::FileSubscription| s.path == pb)
+            {
+                subs.push(crate::restart_watcher::FileSubscription {
+                    path: pb,
+                    existed_at_declaration: existed,
+                });
+            }
+            true
+        })?,
     )?;
 
     host.set("fs", fs_obj)?;
@@ -2367,7 +2407,7 @@ fn expand_path(path: &str) -> String {
 mod tests {
     use super::*;
     use rquickjs::{Context, Function, Object, Runtime};
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
 
     fn env_test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -2480,7 +2520,14 @@ mod tests {
         let ctx = Context::full(&rt).expect("context");
         ctx.with(|ctx| {
             let app_data = std::env::temp_dir();
-            inject_host_api(&ctx, "test", &app_data, "0.0.0").expect("inject host api");
+            inject_host_api(
+                &ctx,
+                "test",
+                &app_data,
+                "0.0.0",
+                Arc::new(Mutex::new(Vec::new())),
+            )
+            .expect("inject host api");
             let globals = ctx.globals();
             let probe_ctx: Object = globals.get("__openusage_ctx").expect("probe ctx");
             let host: Object = probe_ctx.get("host").expect("host");
@@ -2497,7 +2544,14 @@ mod tests {
         let ctx = Context::full(&rt).expect("context");
         ctx.with(|ctx| {
             let app_data = std::env::temp_dir();
-            inject_host_api(&ctx, "test", &app_data, "0.0.0").expect("inject host api");
+            inject_host_api(
+                &ctx,
+                "test",
+                &app_data,
+                "0.0.0",
+                Arc::new(Mutex::new(Vec::new())),
+            )
+            .expect("inject host api");
             let js_expr = format!(
                 r#"__openusage_ctx.host.crypto.decryptAes256Gcm("{}", "{}")"#,
                 envelope, key_b64
@@ -2513,7 +2567,14 @@ mod tests {
         let ctx = Context::full(&rt).expect("context");
         ctx.with(|ctx| {
             let app_data = std::env::temp_dir();
-            inject_host_api(&ctx, "test", &app_data, "0.0.0").expect("inject host api");
+            inject_host_api(
+                &ctx,
+                "test",
+                &app_data,
+                "0.0.0",
+                Arc::new(Mutex::new(Vec::new())),
+            )
+            .expect("inject host api");
             let globals = ctx.globals();
             let probe_ctx: Object = globals.get("__openusage_ctx").expect("probe ctx");
             let host: Object = probe_ctx.get("host").expect("host");
@@ -2559,7 +2620,14 @@ mod tests {
         let ctx = Context::full(&rt).expect("context");
         ctx.with(|ctx| {
             let app_data = std::env::temp_dir();
-            inject_host_api(&ctx, "test", &app_data, "0.0.0").expect("inject host api");
+            inject_host_api(
+                &ctx,
+                "test",
+                &app_data,
+                "0.0.0",
+                Arc::new(Mutex::new(Vec::new())),
+            )
+            .expect("inject host api");
             let globals = ctx.globals();
             let probe_ctx: Object = globals.get("__openusage_ctx").expect("probe ctx");
             let host: Object = probe_ctx.get("host").expect("host");
@@ -2629,7 +2697,14 @@ mod tests {
         let ctx = Context::full(&rt).expect("context");
         ctx.with(|ctx| {
             let app_data = std::env::temp_dir();
-            inject_host_api(&ctx, "test", &app_data, "0.0.0").expect("inject host api");
+            inject_host_api(
+                &ctx,
+                "test",
+                &app_data,
+                "0.0.0",
+                Arc::new(Mutex::new(Vec::new())),
+            )
+            .expect("inject host api");
             let globals = ctx.globals();
             let probe_ctx: Object = globals.get("__openusage_ctx").expect("probe ctx");
             let host: Object = probe_ctx.get("host").expect("host");
@@ -3454,5 +3529,175 @@ Saved lockfile
     fn collect_ccusage_runners_returns_empty_when_none_available() {
         let runners = collect_ccusage_runners_with(|_| None);
         assert!(runners.is_empty());
+    }
+
+    // ---------------------------------------------------------------------------
+    // subscribeFile behavioural tests
+    // ---------------------------------------------------------------------------
+
+    fn run_subscribe_test(js_code: &str) -> (bool, Vec<PathBuf>) {
+        let rt = Runtime::new().expect("runtime");
+        let subs: Arc<Mutex<Vec<crate::restart_watcher::FileSubscription>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let ctx = Context::full(&rt).expect("context");
+        let result = ctx.with(|ctx| {
+            let app_data = std::env::temp_dir();
+            inject_host_api(&ctx, "test", &app_data, "0.0.0", Arc::clone(&subs))
+                .expect("inject host api");
+
+            let globals = ctx.globals();
+            let probe_ctx: Object = globals.get("__openusage_ctx").expect("probe ctx");
+            let host: Object = probe_ctx.get("host").expect("host");
+            let _fs: Object = host.get("fs").expect("fs");
+
+            let result: bool = ctx
+                .eval::<bool, _>(js_code.as_bytes())
+                .unwrap_or_else(|e| panic!("JS eval failed: {}", e));
+            result
+        });
+        let collected: Vec<PathBuf> = subs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.path.clone())
+            .collect();
+        (result, collected)
+    }
+
+    #[test]
+    fn subscribe_file_accepts_valid_path_and_returns_true() {
+        let js = r#"
+            (function() {
+                return __openusage_ctx.host.fs.subscribeFile("/tmp/test-file.json");
+            })();
+        "#;
+        let (result, collected) = run_subscribe_test(js);
+        assert!(result, "subscribeFile should return true for valid path");
+        assert_eq!(collected.len(), 1);
+        assert!(collected[0].ends_with("test-file.json"));
+    }
+
+    #[test]
+    fn subscribe_file_rejects_empty_path() {
+        let js = r#"
+            (function() {
+                return __openusage_ctx.host.fs.subscribeFile("");
+            })();
+        "#;
+        let (result, collected) = run_subscribe_test(js);
+        assert!(!result, "subscribeFile should return false for empty path");
+        assert_eq!(collected.len(), 0);
+    }
+
+    #[test]
+    fn subscribe_file_rejects_whitespace_only_path() {
+        let js = r#"
+            (function() {
+                return __openusage_ctx.host.fs.subscribeFile("   ");
+            })();
+        "#;
+        let (result, collected) = run_subscribe_test(js);
+        assert!(
+            !result,
+            "subscribeFile should return false for whitespace-only path"
+        );
+        assert_eq!(collected.len(), 0);
+    }
+
+    #[test]
+    fn subscribe_file_deduplicates_identical_paths() {
+        let js = r#"
+            (function() {
+                var r1 = __openusage_ctx.host.fs.subscribeFile("/tmp/test.json");
+                var r2 = __openusage_ctx.host.fs.subscribeFile("/tmp/test.json");
+                return r1 && r2;
+            })();
+        "#;
+        let (result, collected) = run_subscribe_test(js);
+        assert!(result);
+        assert_eq!(collected.len(), 1, "duplicate paths should be deduplicated");
+    }
+
+    #[test]
+    fn subscribe_file_expands_tilde_path() {
+        let js = r#"
+            (function() {
+                return __openusage_ctx.host.fs.subscribeFile("~/.config/test.json");
+            })();
+        "#;
+        let (result, collected) = run_subscribe_test(js);
+        assert!(result, "subscribeFile should accept tilde paths");
+        assert_eq!(collected.len(), 1);
+        let p_str = collected[0].to_string_lossy();
+        assert!(
+            p_str.starts_with("/home/") || p_str.starts_with("/root/"),
+            "expected expanded tilde path, got: {}",
+            p_str
+        );
+    }
+    #[test]
+    fn subscribe_file_records_existed_at_declaration() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let existing_path = tmp.path().join("present.txt");
+        std::fs::write(&existing_path, "hello").expect("write");
+        let missing_path = tmp.path().join("absent.txt");
+
+        let js = format!(
+            r#"
+            (function() {{
+                const r1 = __openusage_ctx.host.fs.subscribeFile("{}");
+                const r2 = __openusage_ctx.host.fs.subscribeFile("{}");
+                return r1 && r2;
+            }})();
+            "#,
+            existing_path.to_string_lossy().replace("\\", "\\\\"),
+            missing_path.to_string_lossy().replace("\\", "\\\\"),
+        );
+
+        let rt = Runtime::new().expect("runtime");
+        let subs: std::sync::Arc<std::sync::Mutex<Vec<crate::restart_watcher::FileSubscription>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ctx = Context::full(&rt).expect("context");
+        let result = ctx.with(|ctx| {
+            let app_data = std::env::temp_dir();
+            inject_host_api(
+                &ctx,
+                "test",
+                &app_data,
+                "0.0.0",
+                std::sync::Arc::clone(&subs),
+            )
+            .expect("inject host api");
+
+            let globals = ctx.globals();
+            let probe_ctx: Object = globals.get("__openusage_ctx").expect("probe ctx");
+            let host: Object = probe_ctx.get("host").expect("host");
+            let _fs: Object = host.get("fs").expect("fs");
+
+            ctx.eval::<bool, _>(js.as_bytes())
+                .unwrap_or_else(|e| panic!("JS eval failed: {}", e))
+        });
+        assert!(result, "both subscribeFile calls should succeed");
+
+        let collected = subs.lock().unwrap();
+        assert_eq!(collected.len(), 2, "should collect two subscriptions");
+
+        let existing_sub = collected
+            .iter()
+            .find(|s| s.path == existing_path)
+            .expect("existing path should be subscribed");
+        assert!(
+            existing_sub.existed_at_declaration,
+            "existing file should have existed_at_declaration=true"
+        );
+
+        let missing_sub = collected
+            .iter()
+            .find(|s| s.path == missing_path)
+            .expect("missing path should be subscribed");
+        assert!(
+            !missing_sub.existed_at_declaration,
+            "missing file should have existed_at_declaration=false"
+        );
     }
 }

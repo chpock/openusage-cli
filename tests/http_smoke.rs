@@ -31,6 +31,7 @@ async fn http_api_smoke_for_plugins_and_usage_refresh() {
         tmp.path().to_path_buf(),
         "0.1.0-test".to_string(),
         None,
+        None,
     ));
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

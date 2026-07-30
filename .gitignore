@@ -25,3 +25,6 @@ target
 
 # Local compact CI logs
 /.ci-logs/
+
+# Local deepwork progress state
+.slim/deepwork/
