@@ -29,8 +29,13 @@ fn mock_plugin_runs_in_real_runtime() {
 
     let tmp = tempfile::tempdir().expect("temp dir");
     let output = runtime::run_probe(&plugin, tmp.path(), "0.1.0-test", None);
-    assert_eq!(output.output.provider_id, "mock");
-    assert!(output.output.lines.len() > 5);
+    assert_eq!(output.outputs[0].provider_id, "mock");
+    assert!(output.outputs[0].lines.len() > 5);
+    assert_eq!(
+        output.outputs[0].account,
+        runtime::AccountRef::default_account(),
+        "mock plugin runtime output must carry the default account"
+    );
 }
 
 #[test]
@@ -53,6 +58,91 @@ fn all_vendored_plugins_register_and_probe_with_stub_ctx() {
             );
         }
     }
+}
+
+#[test]
+fn all_vendored_plugins_probe_with_production_shaped_context() {
+    // Vendored plugins must probe successfully with a production-shaped
+    // inherited context containing an immutable default account, not a
+    // flat base context.
+    let plugins = manifest::load_plugins_from_dir(&vendor_plugins_dir());
+    for plugin in &plugins {
+        let result = run_probe_with_production_ctx(plugin)
+            .unwrap_or_else(|e| panic!("plugin {} setup failed: {}", plugin.manifest.id, e));
+
+        if let Some(msg) = result {
+            let lower = msg.to_lowercase();
+            assert!(
+                !lower.contains("not a function")
+                    && !lower.contains("cannot read")
+                    && !lower.contains("undefined")
+                    && !lower.contains("typeerror"),
+                "plugin {} failed with production-shaped context: {}",
+                plugin.manifest.id,
+                msg
+            );
+        }
+    }
+}
+
+fn run_probe_with_production_ctx(
+    plugin: &manifest::LoadedPlugin,
+) -> Result<Option<String>, String> {
+    use rquickjs::object::Property;
+    use rquickjs::{Context, Object, Runtime, Value};
+
+    let rt = Runtime::new().map_err(|e| e.to_string())?;
+    let ctx = Context::full(&rt).map_err(|e| e.to_string())?;
+
+    ctx.with(|ctx| {
+        // Install the base stub context FIRST, matching runtime injection order.
+        ctx.eval::<(), _>(STUB_CTX_SCRIPT.as_bytes())
+            .map_err(|_| extract_error_string(&ctx))?;
+
+        // Evaluate the plugin entry script after the stub is installed.
+        ctx.eval::<(), _>(plugin.entry_script.as_bytes())
+            .map_err(|_| extract_error_string(&ctx))?;
+
+        let globals = ctx.globals();
+        let plugin_obj: Object = globals
+            .get("__openusage_plugin")
+            .map_err(|_| "missing __openusage_plugin".to_string())?;
+        let probe_fn: Function = plugin_obj
+            .get("probe")
+            .map_err(|_| "missing probe()".to_string())?;
+
+        // The stub context is now at __compat_ctx.
+        let base_ctx: Value = globals
+            .get("__compat_ctx")
+            .map_err(|_| "missing __compat_ctx".to_string())?;
+
+        // Create a production-shaped child context with immutable default account.
+        let child = Object::new(ctx.clone()).map_err(|_| "failed to create child".to_string())?;
+        let base_obj = base_ctx
+            .clone()
+            .into_object()
+            .ok_or_else(|| "base ctx not object".to_string())?;
+        child
+            .set_prototype(Some(&base_obj))
+            .map_err(|_| "failed to set prototype".to_string())?;
+
+        // Create immutable default account object.
+        let acct = Object::new(ctx.clone()).map_err(|_| "failed to create acct".to_string())?;
+        acct.prop("id", Property::from("default").enumerable())
+            .map_err(|_| "failed to set id".to_string())?;
+        acct.prop("displayName", Property::from("default").enumerable())
+            .map_err(|_| "failed to set displayName".to_string())?;
+        child
+            .prop("account", Property::from(acct).enumerable())
+            .map_err(|_| "failed to set account".to_string())?;
+
+        // Only the probe call itself may produce Ok(Some(message)).
+        // All setup failures propagate as Err.
+        match probe_fn.call::<_, Value>((child,)) {
+            Ok(_) => Ok(None),
+            Err(_) => Ok(Some(extract_error_string(&ctx))),
+        }
+    })
 }
 
 fn run_probe_with_stub_ctx(entry_script: &str) -> Result<Option<String>, String> {

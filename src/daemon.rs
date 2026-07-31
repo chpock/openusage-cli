@@ -44,6 +44,7 @@ pub struct CachedPluginSnapshot {
     pub plan: Option<String>,
     pub lines: Vec<MetricLine>,
     pub fetched_at: String,
+    pub account: crate::plugin_engine::runtime::AccountRef,
 }
 
 impl CachedPluginSnapshot {
@@ -54,6 +55,7 @@ impl CachedPluginSnapshot {
             plan: output.plan,
             lines: output.lines,
             fetched_at: now_iso(),
+            account: output.account,
         }
     }
 }
@@ -63,7 +65,7 @@ pub struct DaemonState {
     app_data_dir: PathBuf,
     app_version: String,
     plugin_overrides_dir: Option<PathBuf>,
-    cache: RwLock<HashMap<String, CachedPluginSnapshot>>,
+    cache: RwLock<HashMap<String, Vec<CachedPluginSnapshot>>>,
     refresh_lock: Mutex<()>,
     /// Optional command sender for the provider file-monitor actor.
     /// When set, ClearProvider/ReplaceProvider are sent around each probe.
@@ -135,15 +137,44 @@ impl DaemonState {
     pub async fn cached(&self, plugin_ids: Option<&[String]>) -> Vec<CachedPluginSnapshot> {
         let cache = self.cache.read().await;
         let selected_ids = self.resolve_plugin_ids(plugin_ids);
-        selected_ids
-            .iter()
-            .filter_map(|id| cache.get(id).cloned())
-            .collect()
+        let mut results = Vec::new();
+        for id in &selected_ids {
+            if let Some(snapshots) = cache.get(id) {
+                results.extend(snapshots.iter().cloned());
+            }
+        }
+        results
     }
 
     pub async fn cached_one(&self, plugin_id: &str) -> Option<CachedPluginSnapshot> {
         let cache = self.cache.read().await;
-        cache.get(plugin_id).cloned()
+        let snapshots = cache.get(plugin_id)?;
+
+        // Prefer the default account when present.
+        if let Some(snapshot) = snapshots.iter().find(|s| s.account.id == "default") {
+            return Some(snapshot.clone());
+        }
+
+        // No default account: return the sole snapshot if exactly one exists.
+        // Multiple non-default accounts means selection is deferred.
+        if snapshots.len() == 1 {
+            return Some(snapshots[0].clone());
+        }
+
+        None
+    }
+
+    /// Atomically replace one provider's entire cache vector.
+    /// Accepts an empty vector to clear stale accounts from a valid empty
+    /// discovery result. This is the single-provider production operation
+    /// used by `refresh`.
+    async fn replace_provider_cache(
+        &self,
+        provider_id: &str,
+        snapshots: Vec<CachedPluginSnapshot>,
+    ) {
+        let mut cache = self.cache.write().await;
+        cache.insert(provider_id.to_string(), snapshots);
     }
 
     pub async fn refresh(
@@ -163,6 +194,7 @@ impl DaemonState {
         );
 
         let mut snapshots = Vec::with_capacity(selected.len());
+        let mut refreshed_providers: Vec<String> = Vec::with_capacity(selected.len());
 
         for plugin in selected {
             let plugin_id = plugin.manifest.id.clone();
@@ -207,19 +239,33 @@ impl DaemonState {
             .await
             .map_err(|err| anyhow!("plugin probe join error: {err}"))?;
 
+            let n_outputs = probe_result.outputs.len();
             log::debug!(
-                "probe finished for plugin {}: lines={}, subscriptions={}",
-                probe_result.output.provider_id,
-                probe_result.output.lines.len(),
+                "probe finished for plugin {}: outputs={}, subscriptions={}",
+                probe_result
+                    .outputs
+                    .first()
+                    .map(|o| o.provider_id.as_str())
+                    .unwrap_or(&plugin_id),
+                n_outputs,
                 probe_result.subscriptions.len(),
             );
+
+            // Provider ID from the first output (all share the same provider).
+            let provider_id = probe_result
+                .outputs
+                .first()
+                .map(|o| o.provider_id.clone())
+                .unwrap_or_else(|| plugin_id.clone());
+
+            refreshed_providers.push(provider_id.clone());
 
             // --- Provider file-monitor: replace subscriptions after probe ---
             if let Some(cmd_tx) = &self.monitor_cmd_tx {
                 let (ack, rx) = oneshot::channel();
                 if cmd_tx
                     .send(ProviderWatchCommand::ReplaceProvider {
-                        provider_id: probe_result.output.provider_id.clone(),
+                        provider_id: provider_id.clone(),
                         files: probe_result.subscriptions.clone(),
                         ack,
                     })
@@ -227,31 +273,43 @@ impl DaemonState {
                 {
                     log::warn!(
                         "[daemon] monitor channel closed before replace for {}",
-                        probe_result.output.provider_id
+                        provider_id
                     );
                 } else {
                     if rx.await.is_err() {
                         log::warn!(
                             "[daemon] {} acknowledgement canceled for {}",
                             "replace",
-                            probe_result.output.provider_id
+                            provider_id
                         );
                     }
                 }
             }
 
-            snapshots.push(CachedPluginSnapshot::from_output(probe_result.output));
+            for output in probe_result.outputs {
+                snapshots.push(CachedPluginSnapshot::from_output(output));
+            }
         }
 
-        let mut cache = self.cache.write().await;
-        for snapshot in &snapshots {
-            cache.insert(snapshot.provider_id.clone(), snapshot.clone());
+        // Atomically replace each selected provider's cache vector,
+        // even for providers with zero outputs (valid empty discovery).
+        // Uses the production single-provider operation.
+        {
+            for provider_id in &refreshed_providers {
+                let provider_snapshots: Vec<CachedPluginSnapshot> = snapshots
+                    .iter()
+                    .filter(|s| s.provider_id == *provider_id)
+                    .cloned()
+                    .collect();
+                self.replace_provider_cache(provider_id, provider_snapshots)
+                    .await;
+            }
         }
 
         log::debug!(
             "refresh finished: updated_snapshots={}, cache_size={}",
             snapshots.len(),
-            cache.len()
+            self.cache.read().await.len()
         );
 
         Ok(snapshots)
@@ -260,7 +318,9 @@ impl DaemonState {
     pub async fn has_cached_for(&self, plugin_ids: Option<&[String]>) -> bool {
         let cache = self.cache.read().await;
         let selected_ids = self.resolve_plugin_ids(plugin_ids);
-        selected_ids.iter().all(|id| cache.contains_key(id))
+        selected_ids
+            .iter()
+            .all(|id| cache.contains_key(id) && !cache[id].is_empty())
     }
 
     /// Calculates the duration until the next limit reset across all cached snapshots.
@@ -282,26 +342,29 @@ impl DaemonState {
         let now = time::OffsetDateTime::now_utc();
         let mut next_reset: Option<(time::OffsetDateTime, String)> = None;
 
-        for snapshot in cache.values() {
-            for line in &snapshot.lines {
-                if let MetricLine::Progress {
-                    resets_at: Some(resets_at_str),
-                    ..
-                } = line
-                    && let Ok(reset_time) = time::OffsetDateTime::parse(
-                        resets_at_str,
-                        &time::format_description::well_known::Rfc3339,
-                    )
-                {
-                    // Add margin to the reset time
-                    let effective_reset = reset_time + time::Duration::seconds(margin_secs as i64);
-                    if effective_reset > now {
-                        let should_update = match &next_reset {
-                            None => true,
-                            Some((earliest, _)) => effective_reset < *earliest,
-                        };
-                        if should_update {
-                            next_reset = Some((effective_reset, resets_at_str.clone()));
+        for snapshots in cache.values() {
+            for snapshot in snapshots {
+                for line in &snapshot.lines {
+                    if let MetricLine::Progress {
+                        resets_at: Some(resets_at_str),
+                        ..
+                    } = line
+                        && let Ok(reset_time) = time::OffsetDateTime::parse(
+                            resets_at_str,
+                            &time::format_description::well_known::Rfc3339,
+                        )
+                    {
+                        // Add margin to the reset time
+                        let effective_reset =
+                            reset_time + time::Duration::seconds(margin_secs as i64);
+                        if effective_reset > now {
+                            let should_update = match &next_reset {
+                                None => true,
+                                Some((earliest, _)) => effective_reset < *earliest,
+                            };
+                            if should_update {
+                                next_reset = Some((effective_reset, resets_at_str.clone()));
+                            }
                         }
                     }
                 }
@@ -331,28 +394,29 @@ impl DaemonState {
         let now = time::OffsetDateTime::now_utc();
         let mut provider_ids = Vec::new();
 
-        for snapshot in cache.values() {
-            let mut has_past_reset = false;
-            for line in &snapshot.lines {
-                if let MetricLine::Progress {
-                    resets_at: Some(resets_at_str),
-                    ..
-                } = line
-                    && let Ok(reset_time) = time::OffsetDateTime::parse(
-                        resets_at_str,
-                        &time::format_description::well_known::Rfc3339,
-                    )
-                {
-                    let effective_reset = reset_time + time::Duration::seconds(margin_secs as i64);
-                    if effective_reset <= now {
-                        has_past_reset = true;
-                        break;
+        for (provider_id, snapshots) in cache.iter() {
+            let has_past_reset = snapshots.iter().any(|snapshot| {
+                snapshot.lines.iter().any(|line| {
+                    if let MetricLine::Progress {
+                        resets_at: Some(resets_at_str),
+                        ..
+                    } = line
+                        && let Ok(reset_time) = time::OffsetDateTime::parse(
+                            resets_at_str,
+                            &time::format_description::well_known::Rfc3339,
+                        )
+                    {
+                        let effective_reset =
+                            reset_time + time::Duration::seconds(margin_secs as i64);
+                        effective_reset <= now
+                    } else {
+                        false
                     }
-                }
-            }
+                })
+            });
 
             if has_past_reset {
-                provider_ids.push(snapshot.provider_id.clone());
+                provider_ids.push(provider_id.clone());
             }
         }
 
@@ -393,6 +457,12 @@ impl DaemonState {
             })
             .collect()
     }
+
+    #[cfg(test)]
+    /// Replace the plugins list (test-only, no concurrent access).
+    pub fn set_plugins(&mut self, plugins: Vec<LoadedPlugin>) {
+        self.plugins = plugins;
+    }
 }
 
 fn map_line(line: &ManifestLine) -> ManifestLineDto {
@@ -432,6 +502,7 @@ fn now_iso() -> String {
 mod tests {
     use super::*;
     use crate::plugin_engine::manifest::{LoadedPlugin, PluginManifest};
+    use crate::plugin_engine::runtime::AccountRef;
     use crate::plugin_engine::runtime::ProgressFormat;
     use std::sync::Arc;
     use tokio::sync::mpsc;
@@ -489,6 +560,7 @@ mod tests {
             plan: None,
             lines,
             fetched_at: now_iso(),
+            account: crate::plugin_engine::runtime::AccountRef::default_account(),
         }
     }
 
@@ -502,7 +574,51 @@ mod tests {
         );
         let mut cache = state.cache.write().await;
         for item in snapshots {
-            cache.insert(item.provider_id.clone(), item);
+            cache
+                .entry(item.provider_id.clone())
+                .or_default()
+                .push(item);
+        }
+        drop(cache);
+        state
+    }
+
+    async fn state_with_plugins_and_cache(
+        plugin_ids: Vec<&str>,
+        snapshots: Vec<CachedPluginSnapshot>,
+    ) -> DaemonState {
+        let plugins: Vec<LoadedPlugin> = plugin_ids
+            .into_iter()
+            .map(|id| LoadedPlugin {
+                manifest: PluginManifest {
+                    schema_version: 1,
+                    id: id.to_string(),
+                    name: id.to_string(),
+                    version: "0.0.0".to_string(),
+                    entry: "plugin.js".to_string(),
+                    icon: "icon.svg".to_string(),
+                    brand_color: None,
+                    lines: vec![],
+                    links: vec![],
+                },
+                plugin_dir: PathBuf::from("."),
+                entry_script: String::new(),
+                icon_data_url: "data:image/svg+xml;base64,".to_string(),
+            })
+            .collect();
+        let state = DaemonState::new(
+            plugins,
+            PathBuf::from("."),
+            "0.0.0-test".to_string(),
+            None,
+            None,
+        );
+        let mut cache = state.cache.write().await;
+        for item in snapshots {
+            cache
+                .entry(item.provider_id.clone())
+                .or_default()
+                .push(item);
         }
         drop(cache);
         state
@@ -921,5 +1037,703 @@ mod tests {
             .await
             .expect("refresh task panicked")
             .expect("refresh failed");
+    }
+
+    #[tokio::test]
+    async fn refresh_preserves_custom_account_from_plugin() {
+        let plugin = test_plugin(
+            r#"
+            globalThis.__openusage_plugin = {
+                probe(ctx) {
+                    return {
+                        account: { id: "custom-id", displayName: "Custom Name" },
+                        lines: [ctx.line.text({ label: "Status", value: "ok" })]
+                    };
+                }
+            };
+            "#,
+        );
+
+        let app_data = std::env::temp_dir().join("daemon-custom-account-test");
+        std::fs::create_dir_all(&app_data).ok();
+
+        let state = Arc::new(DaemonState::new(
+            vec![plugin],
+            app_data,
+            "0.0.0-test".to_string(),
+            None,
+            None,
+        ));
+
+        let snapshots = state.refresh(None).await.expect("refresh should succeed");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].provider_id, "test");
+        assert_eq!(
+            snapshots[0].account,
+            AccountRef {
+                id: "custom-id".to_string(),
+                display_name: "Custom Name".to_string(),
+            },
+            "refresh must preserve custom account from plugin"
+        );
+
+        // Verify the cached snapshot also has the custom account.
+        let cached = state.cached(Some(&["test".to_string()])).await;
+        assert_eq!(cached.len(), 1, "snapshot should be cached");
+        assert_eq!(
+            cached[0].account,
+            AccountRef {
+                id: "custom-id".to_string(),
+                display_name: "Custom Name".to_string(),
+            },
+            "cached snapshot must preserve custom account"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_replacement_removes_stale_account() {
+        let state = DaemonState::new(
+            Vec::new(),
+            PathBuf::from("."),
+            "0.0.0-test".to_string(),
+            None,
+            None,
+        );
+
+        // Insert two snapshots for the same provider (simulating two accounts).
+        {
+            let mut cache = state.cache.write().await;
+            cache.insert(
+                "test-provider".to_string(),
+                vec![
+                    CachedPluginSnapshot {
+                        provider_id: "test-provider".to_string(),
+                        display_name: "Test".to_string(),
+                        plan: None,
+                        lines: vec![text_line()],
+                        fetched_at: now_iso(),
+                        account: AccountRef::default_account(),
+                    },
+                    CachedPluginSnapshot {
+                        provider_id: "test-provider".to_string(),
+                        display_name: "Test".to_string(),
+                        plan: None,
+                        lines: vec![text_line()],
+                        fetched_at: now_iso(),
+                        account: AccountRef {
+                            id: "secondary".to_string(),
+                            display_name: "Secondary".to_string(),
+                        },
+                    },
+                ],
+            );
+        }
+
+        // Verify two snapshots exist.
+        {
+            let cache = state.cache.read().await;
+            assert_eq!(
+                cache.get("test-provider").map(|v| v.len()),
+                Some(2),
+                "should have two account snapshots before replacement"
+            );
+        }
+
+        // Replace with a single snapshot using the single-provider operation.
+        state
+            .replace_provider_cache(
+                "test-provider",
+                vec![CachedPluginSnapshot {
+                    provider_id: "test-provider".to_string(),
+                    display_name: "Test".to_string(),
+                    plan: None,
+                    lines: vec![text_line()],
+                    fetched_at: now_iso(),
+                    account: AccountRef::default_account(),
+                }],
+            )
+            .await;
+
+        // Verify only one snapshot remains (stale account removed).
+        {
+            let cache = state.cache.read().await;
+            let snapshots = cache.get("test-provider").expect("should have entry");
+            assert_eq!(
+                snapshots.len(),
+                1,
+                "stale account should be removed after replacement"
+            );
+            assert_eq!(snapshots[0].account.id, "default");
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_flattened_collection_respects_plugin_order_then_stored_account_order() {
+        // Provider order contract: cached() returns items in the order of
+        // selected/resolved plugin IDs (loaded order when no filter is given),
+        // then in the order stored in each provider's account vector.
+        let state = state_with_plugins_and_cache(
+            vec!["alpha", "beta"],
+            vec![
+                CachedPluginSnapshot {
+                    provider_id: "alpha".to_string(),
+                    display_name: "Alpha".to_string(),
+                    plan: None,
+                    lines: vec![text_line()],
+                    fetched_at: now_iso(),
+                    account: AccountRef::default_account(),
+                },
+                CachedPluginSnapshot {
+                    provider_id: "alpha".to_string(),
+                    display_name: "Alpha".to_string(),
+                    plan: None,
+                    lines: vec![text_line()],
+                    fetched_at: now_iso(),
+                    account: AccountRef {
+                        id: "secondary".to_string(),
+                        display_name: "Secondary".to_string(),
+                    },
+                },
+                CachedPluginSnapshot {
+                    provider_id: "beta".to_string(),
+                    display_name: "Beta".to_string(),
+                    plan: None,
+                    lines: vec![text_line()],
+                    fetched_at: now_iso(),
+                    account: AccountRef::default_account(),
+                },
+            ],
+        )
+        .await;
+
+        // Use the production cached() method with no filter.
+        let cached = state.cached(None).await;
+
+        assert_eq!(cached.len(), 3, "should have 3 total snapshots");
+        // Provider order: alpha (loaded first), then beta (loaded second).
+        assert_eq!(cached[0].provider_id, "alpha");
+        assert_eq!(cached[1].provider_id, "alpha");
+        assert_eq!(cached[2].provider_id, "beta");
+        // Account order within alpha: stored order = default, then secondary.
+        assert_eq!(cached[0].account.id, "default");
+        assert_eq!(cached[1].account.id, "secondary");
+    }
+
+    #[tokio::test]
+    async fn cached_with_provider_filter_returns_only_that_providers_accounts() {
+        // Provider-scoped filtering: cached(Some(["alpha"])) must return only
+        // alpha's account snapshots in stored order, without beta.
+        let state = state_with_plugins_and_cache(
+            vec!["alpha", "beta"],
+            vec![
+                CachedPluginSnapshot {
+                    provider_id: "alpha".to_string(),
+                    display_name: "Alpha".to_string(),
+                    plan: None,
+                    lines: vec![text_line()],
+                    fetched_at: now_iso(),
+                    account: AccountRef::default_account(),
+                },
+                CachedPluginSnapshot {
+                    provider_id: "alpha".to_string(),
+                    display_name: "Alpha".to_string(),
+                    plan: None,
+                    lines: vec![text_line()],
+                    fetched_at: now_iso(),
+                    account: AccountRef {
+                        id: "secondary".to_string(),
+                        display_name: "Secondary".to_string(),
+                    },
+                },
+                CachedPluginSnapshot {
+                    provider_id: "beta".to_string(),
+                    display_name: "Beta".to_string(),
+                    plan: None,
+                    lines: vec![text_line()],
+                    fetched_at: now_iso(),
+                    account: AccountRef::default_account(),
+                },
+            ],
+        )
+        .await;
+
+        let alpha_only = state.cached(Some(&["alpha".to_string()])).await;
+
+        assert_eq!(
+            alpha_only.len(),
+            2,
+            "should return both alpha accounts, not beta"
+        );
+        assert_eq!(alpha_only[0].provider_id, "alpha");
+        assert_eq!(alpha_only[1].provider_id, "alpha");
+        // Stored account order: default, then secondary.
+        assert_eq!(alpha_only[0].account.id, "default");
+        assert_eq!(alpha_only[1].account.id, "secondary");
+    }
+
+    #[tokio::test]
+    async fn cached_one_selects_default_irrespective_of_vector_order() {
+        let state = DaemonState::new(
+            Vec::new(),
+            PathBuf::from("."),
+            "0.0.0-test".to_string(),
+            None,
+            None,
+        );
+
+        // Insert with non-default account first, default second.
+        {
+            let mut cache = state.cache.write().await;
+            cache.insert(
+                "test-provider".to_string(),
+                vec![
+                    CachedPluginSnapshot {
+                        provider_id: "test-provider".to_string(),
+                        display_name: "Test".to_string(),
+                        plan: None,
+                        lines: vec![text_line()],
+                        fetched_at: now_iso(),
+                        account: AccountRef {
+                            id: "secondary".to_string(),
+                            display_name: "Secondary".to_string(),
+                        },
+                    },
+                    CachedPluginSnapshot {
+                        provider_id: "test-provider".to_string(),
+                        display_name: "Test".to_string(),
+                        plan: None,
+                        lines: vec![text_line()],
+                        fetched_at: now_iso(),
+                        account: AccountRef::default_account(),
+                    },
+                ],
+            );
+        }
+
+        let result = state.cached_one("test-provider").await;
+        assert!(result.is_some(), "cached_one should find a snapshot");
+        assert_eq!(
+            result.unwrap().account.id,
+            "default",
+            "should select default account regardless of vector position"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_one_returns_sole_non_default_account() {
+        let state = DaemonState::new(
+            Vec::new(),
+            PathBuf::from("."),
+            "0.0.0-test".to_string(),
+            None,
+            None,
+        );
+
+        // Single non-default account snapshot.
+        {
+            let mut cache = state.cache.write().await;
+            cache.insert(
+                "custom-provider".to_string(),
+                vec![CachedPluginSnapshot {
+                    provider_id: "custom-provider".to_string(),
+                    display_name: "Custom".to_string(),
+                    plan: None,
+                    lines: vec![text_line()],
+                    fetched_at: now_iso(),
+                    account: AccountRef {
+                        id: "custom-account".to_string(),
+                        display_name: "Custom Account".to_string(),
+                    },
+                }],
+            );
+        }
+
+        let result = state.cached_one("custom-provider").await;
+        assert!(
+            result.is_some(),
+            "cached_one should return the sole non-default snapshot"
+        );
+        assert_eq!(result.unwrap().account.id, "custom-account");
+    }
+
+    #[tokio::test]
+    async fn cached_one_returns_none_for_multiple_non_default_accounts() {
+        let state = DaemonState::new(
+            Vec::new(),
+            PathBuf::from("."),
+            "0.0.0-test".to_string(),
+            None,
+            None,
+        );
+
+        // Two non-default account snapshots.
+        {
+            let mut cache = state.cache.write().await;
+            cache.insert(
+                "multi-provider".to_string(),
+                vec![
+                    CachedPluginSnapshot {
+                        provider_id: "multi-provider".to_string(),
+                        display_name: "Multi".to_string(),
+                        plan: None,
+                        lines: vec![text_line()],
+                        fetched_at: now_iso(),
+                        account: AccountRef {
+                            id: "account-a".to_string(),
+                            display_name: "Account A".to_string(),
+                        },
+                    },
+                    CachedPluginSnapshot {
+                        provider_id: "multi-provider".to_string(),
+                        display_name: "Multi".to_string(),
+                        plan: None,
+                        lines: vec![text_line()],
+                        fetched_at: now_iso(),
+                        account: AccountRef {
+                            id: "account-b".to_string(),
+                            display_name: "Account B".to_string(),
+                        },
+                    },
+                ],
+            );
+        }
+
+        let result = state.cached_one("multi-provider").await;
+        assert!(
+            result.is_none(),
+            "cached_one should return None for multiple non-default accounts"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_one_default_preferred_over_sole_non_default() {
+        // When both default and non-default exist, default is preferred.
+        let state = state_with_cache(vec![
+            CachedPluginSnapshot {
+                provider_id: "mixed".to_string(),
+                display_name: "Mixed".to_string(),
+                plan: None,
+                lines: vec![text_line()],
+                fetched_at: now_iso(),
+                account: AccountRef {
+                    id: "other".to_string(),
+                    display_name: "Other".to_string(),
+                },
+            },
+            CachedPluginSnapshot {
+                provider_id: "mixed".to_string(),
+                display_name: "Mixed".to_string(),
+                plan: None,
+                lines: vec![text_line()],
+                fetched_at: now_iso(),
+                account: AccountRef::default_account(),
+            },
+        ])
+        .await;
+
+        let result = state.cached_one("mixed").await;
+        assert!(result.is_some(), "cached_one should find default");
+        assert_eq!(result.unwrap().account.id, "default");
+    }
+
+    #[tokio::test]
+    async fn reset_sees_all_accounts_and_deduplicates_provider() {
+        let state = state_with_cache(vec![
+            CachedPluginSnapshot {
+                provider_id: "stale-provider".to_string(),
+                display_name: "Stale".to_string(),
+                plan: None,
+                lines: vec![progress_line(Some(iso_from_now(-20)))],
+                fetched_at: now_iso(),
+                account: AccountRef::default_account(),
+            },
+            CachedPluginSnapshot {
+                provider_id: "stale-provider".to_string(),
+                display_name: "Stale".to_string(),
+                plan: None,
+                lines: vec![progress_line(Some(iso_from_now(-10)))],
+                fetched_at: now_iso(),
+                account: AccountRef {
+                    id: "secondary".to_string(),
+                    display_name: "Secondary".to_string(),
+                },
+            },
+            CachedPluginSnapshot {
+                provider_id: "fresh-provider".to_string(),
+                display_name: "Fresh".to_string(),
+                plan: None,
+                lines: vec![progress_line(Some(iso_from_now(120)))],
+                fetched_at: now_iso(),
+                account: AccountRef::default_account(),
+            },
+        ])
+        .await;
+
+        let stale_ids = state.provider_ids_with_past_resets(5).await;
+        assert_eq!(
+            stale_ids,
+            vec!["stale-provider".to_string()],
+            "should return each stale provider once, not per-account"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_with_discovery_stores_two_accounts_then_empty_discovery_clears() {
+        // Same-state regression: first refresh discovers two accounts;
+        // after changing only the plugin script, a second refresh with
+        // valid empty discovery clears that exact provider cache.
+        // No fresh DaemonState or direct map mutation is substituted.
+        let plugin = test_plugin(
+            r#"
+            globalThis.__openusage_plugin = {
+                probe(ctx) {
+                    return { lines: [ctx.line.text({ label: "Account", value: ctx.account.id })] };
+                },
+                discoverAccounts(ctx) {
+                    return [
+                        { id: "work", displayName: "Work" },
+                        { id: "personal", displayName: "Personal" }
+                    ];
+                }
+            };
+            "#,
+        );
+
+        let app_data = std::env::temp_dir().join("daemon-discovery-same-state-test");
+        std::fs::create_dir_all(&app_data).ok();
+
+        let mut state = Arc::new(DaemonState::new(
+            vec![plugin],
+            app_data,
+            "0.0.0-test".to_string(),
+            None,
+            None,
+        ));
+
+        // First refresh: two accounts discovered.
+        let snapshots = state
+            .refresh(None)
+            .await
+            .expect("first refresh should succeed");
+        assert_eq!(snapshots.len(), 2, "should have two account snapshots");
+        assert_eq!(snapshots[0].account.id, "work");
+        assert_eq!(snapshots[1].account.id, "personal");
+
+        // Verify cache has two entries.
+        let cached = state.cached(None).await;
+        assert_eq!(cached.len(), 2);
+
+        // Mutate the plugin on the same state to return empty discovery.
+        // Only the test fixture input changes — same DaemonState, same cache.
+        let empty_plugin = test_plugin(
+            r#"
+            globalThis.__openusage_plugin = {
+                probe(ctx) {
+                    return { lines: [ctx.line.text({ label: "Status", value: "ok" })] };
+                },
+                discoverAccounts(ctx) {
+                    return [];
+                }
+            };
+            "#,
+        );
+        // Replace the plugin in-place on the same state via test-only setter.
+        // SAFETY: test-only; no concurrent access during this sequential test.
+        let state_mut = Arc::get_mut(&mut state).expect("unique Arc ref in test");
+        state_mut.set_plugins(vec![empty_plugin]);
+
+        // Second refresh on the same state: empty discovery clears the provider.
+        let snapshots2 = state
+            .refresh(None)
+            .await
+            .expect("empty refresh should succeed");
+        assert!(
+            snapshots2.is_empty(),
+            "empty discovery should produce zero snapshots"
+        );
+
+        // Cache should be empty for this provider on the same state.
+        let cached2 = state.cached(None).await;
+        assert!(
+            cached2.is_empty(),
+            "cache should be empty after empty discovery on same state"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_monitor_lifecycle_unions_discovery_and_account_subscriptions() {
+        // Monitor lifecycle: one ClearProvider/ReplaceProvider pair per provider,
+        // with subscriptions from both discovery and account probes unioned.
+        let plugin = test_plugin(
+            r#"
+            globalThis.__openusage_plugin = {
+                probe(ctx) {
+                    ctx.host.fs.subscribeFile("/tmp/probe-" + ctx.account.id + ".json");
+                    return { lines: [ctx.line.text({ label: "Status", value: "ok" })] };
+                },
+                discoverAccounts(ctx) {
+                    ctx.host.fs.subscribeFile("/tmp/discovery-dep.json");
+                    return [
+                        { id: "a", displayName: "A" },
+                        { id: "b", displayName: "B" }
+                    ];
+                }
+            };
+            "#,
+        );
+
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let app_data = std::env::temp_dir().join("daemon-monitor-discovery-test");
+        std::fs::create_dir_all(&app_data).ok();
+
+        let state = Arc::new(DaemonState::new(
+            vec![plugin],
+            app_data,
+            "0.0.0-test".to_string(),
+            None,
+            Some(cmd_tx),
+        ));
+
+        let state_clone = Arc::clone(&state);
+        let refresh_handle = tokio::spawn(async move { state_clone.refresh(None).await });
+
+        // 1) ClearProvider
+        let clear_cmd = tokio::time::timeout(Duration::from_secs(5), cmd_rx.recv())
+            .await
+            .expect("timeout waiting for ClearProvider")
+            .expect("channel closed");
+        match &clear_cmd {
+            ProviderWatchCommand::ClearProvider {
+                provider_id,
+                ack: _,
+            } => {
+                assert_eq!(provider_id, "test");
+            }
+            other => panic!("expected ClearProvider, got {:?}", other),
+        }
+        if let ProviderWatchCommand::ClearProvider { ack, .. } = clear_cmd {
+            let _ = ack.send(());
+        }
+
+        // 2) ReplaceProvider with unioned subscriptions
+        // (discovery-dep.json + probe-a.json + probe-b.json)
+        let replace_cmd = tokio::time::timeout(Duration::from_secs(5), cmd_rx.recv())
+            .await
+            .expect("timeout waiting for ReplaceProvider")
+            .expect("channel closed");
+
+        match &replace_cmd {
+            ProviderWatchCommand::ReplaceProvider {
+                provider_id,
+                files,
+                ack: _,
+            } => {
+                assert_eq!(provider_id, "test");
+                assert_eq!(files.len(), 3, "expected 3 unioned subscriptions");
+                let paths: Vec<String> = files
+                    .iter()
+                    .map(|f| f.path.to_string_lossy().to_string())
+                    .collect();
+                assert!(paths.iter().any(|p| p.ends_with("discovery-dep.json")));
+                assert!(paths.iter().any(|p| p.ends_with("probe-a.json")));
+                assert!(paths.iter().any(|p| p.ends_with("probe-b.json")));
+            }
+            other => panic!("expected ReplaceProvider, got {:?}", other),
+        }
+        if let ProviderWatchCommand::ReplaceProvider { ack, .. } = replace_cmd {
+            let _ = ack.send(());
+        }
+
+        let snapshots = refresh_handle
+            .await
+            .expect("refresh task panicked")
+            .expect("refresh failed");
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].account.id, "a");
+        assert_eq!(snapshots[1].account.id, "b");
+    }
+
+    #[tokio::test]
+    async fn refresh_with_discovery_exception_replaces_two_accounts_with_provider_error() {
+        // Same DaemonState: two discovered snapshots then a discovery
+        // exception replaces them with exactly one default-account
+        // provider error snapshot.
+        let plugin = test_plugin(
+            r#"
+            globalThis.__openusage_plugin = {
+                probe(ctx) {
+                    return { lines: [ctx.line.text({ label: "Account", value: ctx.account.id })] };
+                },
+                discoverAccounts(ctx) {
+                    return [
+                        { id: "work", displayName: "Work" },
+                        { id: "personal", displayName: "Personal" }
+                    ];
+                }
+            };
+            "#,
+        );
+
+        let app_data = std::env::temp_dir().join("daemon-discovery-exception-test");
+        std::fs::create_dir_all(&app_data).ok();
+
+        let mut state = Arc::new(DaemonState::new(
+            vec![plugin],
+            app_data,
+            "0.0.0-test".to_string(),
+            None,
+            None,
+        ));
+
+        // First refresh: two accounts discovered.
+        let snapshots = state.refresh(None).await.expect("first refresh");
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].account.id, "work");
+        assert_eq!(snapshots[1].account.id, "personal");
+        let cached = state.cached(None).await;
+        assert_eq!(cached.len(), 2);
+
+        // Replace with a plugin that throws in discoverAccounts.
+        let broken_plugin = test_plugin(
+            r#"
+            globalThis.__openusage_plugin = {
+                probe(ctx) {
+                    return { lines: [ctx.line.text({ label: "Status", value: "ok" })] };
+                },
+                discoverAccounts(ctx) {
+                    throw "discovery-exception";
+                }
+            };
+            "#,
+        );
+        let state_mut = Arc::get_mut(&mut state).expect("unique Arc ref");
+        state_mut.set_plugins(vec![broken_plugin]);
+
+        // Second refresh: discovery exception produces one provider error.
+        let snapshots2 = state
+            .refresh(None)
+            .await
+            .expect("exception refresh should succeed");
+        assert_eq!(
+            snapshots2.len(),
+            1,
+            "exception should produce one error output"
+        );
+        assert_eq!(
+            snapshots2[0].account,
+            AccountRef::default_account(),
+            "discovery exception must carry default account"
+        );
+        assert!(
+            snapshots2[0].lines[0]
+                .to_string()
+                .contains("discovery-exception"),
+            "error output must mention the exception"
+        );
+
+        // Cache must be replaced with exactly one error snapshot.
+        let cached2 = state.cached(None).await;
+        assert_eq!(cached2.len(), 1, "cache should have one error snapshot");
+        assert_eq!(cached2[0].account, AccountRef::default_account());
     }
 }

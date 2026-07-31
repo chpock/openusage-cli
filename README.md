@@ -29,7 +29,9 @@ That one thing is reliable data collection from AI providers, so other tools can
 ### `run-daemon` mode
 
 - Best for frequent reads and low-latency consumers
-- Keeps plugin runtime initialized and refreshes snapshots in the background
+- Keeps daemon process running and cache populated; a QuickJS runtime is
+  created per provider refresh and shared only by discovery and sequential
+  probe calls within that refresh
 - Data is then available immediately through REST API or `openusage-cli query`
 
 See [docs/daemon-modes.md](docs/daemon-modes.md) for mode behavior, tradeoffs, and operational guidance.

@@ -1910,7 +1910,7 @@ mod tests {
             )))
             .expect("send");
 
-        // Wait for debounce (3s) + margin.
+        // Wait for debounce (100ms) + margin.
         let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
             .await
             .expect("timeout")
@@ -2285,7 +2285,7 @@ mod tests {
         std::fs::write(&tmp, "updated").expect("write tmp");
         std::fs::rename(&tmp, &watched_file).expect("atomic rename");
 
-        // Wait for the debounced action (100ms debounce + margin).
+        // Wait for the debounced action (1s debounce + margin).
         let action = tokio::time::timeout(Duration::from_secs(4), action_rx.recv())
             .await
             .expect("timeout waiting for WatchAction — watcher likely dropped early")
@@ -3234,7 +3234,7 @@ mod tests {
 
         // Rapidly delete the parent directory and recreate it at the same
         // path, before the actor handles the remove event.  The actor's
-        // debounce timer will fire after 3s, by which time both the delete
+        // debounce timer will fire after 100ms, by which time both the delete
         // and the recreate have already happened.
         std::fs::remove_dir_all(&parent).expect("remove parent");
         // Immediately recreate the parent and target.

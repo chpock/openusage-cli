@@ -34,3 +34,17 @@ For predictability and safety, `openusage-cli` treats the daemon process environ
   restart).  The monitor actor is independent of the static restart watcher.
 
 For detailed documentation, see [Provider file monitoring](provider-file-monitoring.md).
+
+## Multi-account discovery
+
+- **Upstream `openusage` behavior**: no account discovery mechanism exists.
+  Each plugin runs one probe per refresh and produces a single result.
+- **`openusage-cli` behavior**: extends the plugin API with an optional
+  `discoverAccounts(ctx)` export. When present, the runtime calls it to
+  obtain an array of account descriptors, then probes each account
+  sequentially with an inherited context containing an immutable `account`
+  identity. Override scripts can intercept, replace, wrap, or reset
+  discovery via `globalThis.__openusage_override` helpers.
+
+For detailed documentation, see [Usage](usage.md) (multi-account discovery
+section) and [Plugin Overrides](plugin-overrides.md).
