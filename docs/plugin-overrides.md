@@ -42,7 +42,7 @@ context (without `ctx.account`). Account descriptors are returned in
 array order; that order is preserved throughout probing and cache
 storage. The function may return a Promise for async discovery.
 
-The core stores only public account identity (`id` and `origin`).
+The core stores only public account identity (`id`, `origin`, optional `name`).
 It never stores credentials, provider-specific metadata, or internal
 discovery fields such as `errorPolicy`.
 
@@ -69,15 +69,33 @@ immutable.
 Account descriptors returned by `discoverAccounts` support the following
 fields:
 
-- `id` (required, non-empty string) — unique account identifier within the
-  provider.
+- `id` (required, non-empty string) — probe-time account identifier exposed as
+  `ctx.account.id`.
 - `origin` (optional string) — identifies the credential source. If absent,
   the runtime assigns `"native"` as the default. Known values:
   - `"native"` — credentials supplied by the original plugin (no override active).
   - `"opencode"` — OpenCode auth file credentials (Codex/Copilot overrides).
   - Future releases may introduce additional identifiers.
+- `name` (optional string) — display label propagated to output
+  `account.name`.
+- `stableSubjectKey` (optional string) — stable identity key for host
+  canonicalization when descriptor ids collide.
+- `sourceRef` (optional string) — normalized source hint used for host
+  canonicalization when descriptor ids collide.
+- `originNamespace` (optional string) — additional canonicalization namespace
+  (default: `"default"`).
 - `errorPolicy` (optional string) — controls error suppression behavior
   (see [Discovery error policy](#discovery-error-policy)).
+
+Output identity rules:
+
+- If discovered descriptor ids are already unique, output `account.id` is
+  preserved as-is.
+- If descriptor ids collide, the runtime emits deterministic host-generated
+  output ids (`acc_v1_<hash>`) to keep output ids unique while preserving
+  probe-time `ctx.account.id`.
+- If output ids still collide after normalization, the runtime returns a
+  provider-level duplicate-output-id error.
 
 ### Discovery error policy
 
@@ -118,8 +136,10 @@ available.
 - If `discoverAccounts` throws or returns a non-array, the runtime
   produces a single provider-level error output.
 - If `discoverAccounts` returns descriptors with missing/empty id,
-  duplicate ids, invalid errorPolicy, or exceeds 32 entries, the runtime
-  produces a single provider-level error output.
+  invalid errorPolicy, or exceeds 32 entries, the runtime produces a
+  single provider-level error output.
+- If normalized output account ids collide, the runtime produces a single
+  provider-level duplicate-output-id error.
 - A valid empty array produces zero outputs (no probe calls).
 - Per-account probe failures produce an error snapshot carrying that
   account's identity; other accounts are unaffected. When a discovery

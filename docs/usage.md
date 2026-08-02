@@ -121,10 +121,19 @@ http://127.0.0.1:6738
   }
   ```
 
-  The `account` object is present on every usage snapshot. Account IDs are
-  provider-scoped — each provider defines its own account namespace. Most
-  providers return only `"id": "default"`. The bundled Codex and Copilot
-  overrides may additionally return stable `"opencode-<path-index>"` accounts.
+  The `account` object is present on every usage snapshot. Most providers
+  return only `"id": "default"`.
+
+  `account.id` is a provider-scoped unique identifier in output. For current
+  bundled plugins, explicit discovery ids are preserved when they are already
+  unique. When discovery returns colliding ids, the runtime emits a
+  deterministic host-generated id (`acc_v1_<hash>`) to keep output ids unique.
+
+  `account.name` is optional and intended for display labels from discovery.
+  It does not participate in routing or identity checks.
+
+  `ctx.account.id` used inside plugin/override probe logic may remain the
+  descriptor id even when output `account.id` is canonicalized for uniqueness.
 
   **`origin` field:** Every account object carries an `origin` string that
   identifies the credential source:
@@ -194,13 +203,16 @@ http://127.0.0.1:6738
   similarly immutable.
 
   **Validation:** The returned array must contain 0–32 items. Each item
-  must be an object with a non-empty string `id` (unique within the array).
+  must be an object with a non-empty string `id`.
   An optional `errorPolicy` field may be set to `"hide-if-other-account"`
   (see [Discovery error policy](plugin-overrides.md#discovery-error-policy)). An
   optional `origin` string may be provided; if absent, the runtime assigns
-  `"native"` as the default. Violations (non-array, missing or empty id,
-  duplicate ids, invalid errorPolicy, over 32 items, or an exception)
-  produce a single provider-level error output with the default account.
+  `"native"` as the default. Optional descriptor fields `name`,
+  `stableSubjectKey`, and `sourceRef` may also be provided. Violations
+  (non-array, missing or empty id, invalid errorPolicy, over 32 items, or an
+  exception) produce a single provider-level error output with the default
+  account. If effective output ids still collide after host normalization, the
+  runtime returns a provider-level duplicate-output-id error.
 
   **Empty list:** A valid empty array produces zero outputs for that
   provider, clearing any previously cached snapshots.
@@ -230,8 +242,8 @@ http://127.0.0.1:6738
   bundled Codex and Copilot overrides add it. Alongside `default`, they inspect
   these OpenCode auth candidates in stable path-index order:
 
-  1. `~/.local/share/opencode/auth.json` → `opencode-0`
-  2. `~/.config/opencode/auth.json` → `opencode-1`
+  1. `~/.local/share/opencode/auth.json` (candidate 0)
+  2. `~/.config/opencode/auth.json` (candidate 1)
 
   A missing candidate file or provider key omits that account. An unreadable or
   malformed candidate produces an account-specific error. Only `default` has
@@ -240,7 +252,7 @@ http://127.0.0.1:6738
   different OpenCode file or native credentials.
 
   Future multi-account providers will add additional items with the same
-  `providerId` and a distinct account `id`. The collection remains a flat
+  `providerId` and a distinct output account `id`. The collection remains a flat
   array — no nesting or grouping changes. Provider filters (e.g.
   `pluginIds=codex`) remain provider-scoped; there is no account selector
   yet.

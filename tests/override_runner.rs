@@ -1410,6 +1410,7 @@ fn discovery_empty_id_is_error() {
 #[test]
 fn discovery_duplicate_id_is_error() {
     // discoverAccounts returns descriptors with duplicate ids.
+    // Current contract: duplicate discovery ids are invalid.
     let outcome = run_provider_probe(&ProviderSpec {
         plugin_id: "dup-id",
         plugin_name: "",
@@ -1434,8 +1435,8 @@ fn discovery_duplicate_id_is_error() {
             assert_eq!(result.outputs.len(), 1, "expected 1 error output");
             let line_str = format!("{}", result.outputs[0].lines[0]);
             assert!(
-                line_str.contains("duplicate"),
-                "expected duplicate id error, got: {}",
+                line_str.contains("duplicate output account id"),
+                "expected duplicate output id error, got: {}",
                 line_str
             );
         }

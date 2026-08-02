@@ -4,6 +4,7 @@ use crate::plugin_engine::override_lifecycle;
 use rquickjs::object::Property;
 use rquickjs::{Array, Context, Ctx, Error, Object, Runtime, Value};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -68,6 +69,8 @@ impl fmt::Display for MetricLine {
 pub struct AccountRef {
     pub id: String,
     pub origin: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 impl AccountRef {
@@ -76,6 +79,7 @@ impl AccountRef {
         Self {
             id: "default".to_string(),
             origin: "native".to_string(),
+            name: None,
         }
     }
 }
@@ -561,14 +565,67 @@ fn run_discovery_mode<'js>(
         };
     }
 
+    // Precompute probe-id multiplicity to preserve compatibility when ids are unique,
+    // and to deterministically canonicalize collisions.
+    let mut probe_id_counts: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    for descriptor in &descriptors {
+        *probe_id_counts
+            .entry(descriptor.probe_id.as_str())
+            .or_insert(0) += 1;
+    }
+
+    // Ensure selected output IDs are unique before probing.
+    let mut seen_output_ids = std::collections::HashSet::new();
+    for descriptor in &descriptors {
+        let duplicate_probe_id_exists = probe_id_counts
+            .get(descriptor.probe_id.as_str())
+            .copied()
+            .unwrap_or(0)
+            > 1;
+        let output_id = if should_use_canonical_id(duplicate_probe_id_exists) {
+            canonical_discovery_account_id(plugin_id, descriptor)
+        } else {
+            descriptor.probe_id.clone()
+        };
+        if !seen_output_ids.insert(output_id.clone()) {
+            return ProbeResult {
+                outputs: vec![error_output(
+                    plugin,
+                    format!(
+                        "discoverAccounts produced duplicate output account id '{}'",
+                        output_id
+                    ),
+                )],
+                subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
+            };
+        }
+    }
+
     // Probe each discovered account sequentially.
     let mut outputs: Vec<(usize, PluginOutput)> = Vec::with_capacity(descriptors.len());
     for (desc_idx, descriptor) in descriptors.iter().enumerate() {
-        let account_ref = AccountRef {
-            id: descriptor.id.clone(),
-            origin: descriptor.origin.clone(),
+        let duplicate_probe_id_exists = probe_id_counts
+            .get(descriptor.probe_id.as_str())
+            .copied()
+            .unwrap_or(0)
+            > 1;
+        let output_id = if should_use_canonical_id(duplicate_probe_id_exists) {
+            canonical_discovery_account_id(plugin_id, descriptor)
+        } else {
+            descriptor.probe_id.clone()
         };
-        let account_ctx = match create_account_context(ctx, &account_ref, base_ctx) {
+        let output_account = AccountRef {
+            id: output_id,
+            origin: descriptor.origin.clone(),
+            name: descriptor.name.clone(),
+        };
+        let probe_account = AccountRef {
+            id: descriptor.probe_id.clone(),
+            origin: descriptor.origin.clone(),
+            name: None,
+        };
+        let account_ctx = match create_account_context(ctx, &probe_account, base_ctx) {
             Ok(c) => c,
             Err(_) => {
                 outputs.push((
@@ -576,7 +633,7 @@ fn run_discovery_mode<'js>(
                     error_output_with_account(
                         plugin,
                         "failed to create account context".to_string(),
-                        &account_ref,
+                        &output_account,
                     ),
                 ));
                 continue;
@@ -588,7 +645,7 @@ fn run_discovery_mode<'js>(
             Err(_) => {
                 outputs.push((
                     desc_idx,
-                    error_output_with_account(plugin, extract_error_string(ctx), &account_ref),
+                    error_output_with_account(plugin, extract_error_string(ctx), &output_account),
                 ));
                 continue;
             }
@@ -599,7 +656,7 @@ fn run_discovery_mode<'js>(
             Err(msg) => {
                 outputs.push((
                     desc_idx,
-                    error_output_with_account(plugin, msg, &account_ref),
+                    error_output_with_account(plugin, msg, &output_account),
                 ));
                 continue;
             }
@@ -611,7 +668,7 @@ fn run_discovery_mode<'js>(
             plugin_id,
             display_name,
             icon_url,
-            Some(&account_ref),
+            Some(&output_account),
         );
         outputs.push((desc_idx, output));
     }
@@ -691,8 +748,12 @@ fn create_account_context<'js>(
 /// Private discovery descriptor with error policy (not serialized).
 #[derive(Debug, Clone)]
 struct DiscoveryDescriptor {
-    id: String,
+    probe_id: String,
     origin: String,
+    name: Option<String>,
+    origin_namespace: String,
+    stable_subject_key: Option<String>,
+    source_ref: Option<String>,
     error_policy: ErrorPolicy,
 }
 
@@ -703,7 +764,7 @@ enum ErrorPolicy {
 }
 
 /// Parse and validate a discovery result array.
-/// Returns up to 32 account descriptors with unique non-empty ids.
+/// Returns up to 32 account descriptors with non-empty ids.
 /// Each descriptor carries id, origin, and private errorPolicy.
 /// No displayName handling.
 fn parse_discovery_accounts(array: &Array) -> Result<Vec<DiscoveryDescriptor>, String> {
@@ -716,7 +777,6 @@ fn parse_discovery_accounts(array: &Array) -> Result<Vec<DiscoveryDescriptor>, S
     }
 
     let mut accounts = Vec::with_capacity(len);
-    let mut seen_ids = std::collections::HashSet::new();
 
     for idx in 0..len {
         let elem: Value = array
@@ -730,15 +790,43 @@ fn parse_discovery_accounts(array: &Array) -> Result<Vec<DiscoveryDescriptor>, S
             )
         })?;
 
-        let id: String = obj
+        let probe_id: String = obj
             .get("id")
             .map_err(|_| format!("discoverAccounts: element at index {} missing id", idx))?;
-        if id.trim().is_empty() {
+        if probe_id.trim().is_empty() {
             return Err(format!(
                 "discoverAccounts: element at index {} has empty id",
                 idx
             ));
         }
+
+        let name: Option<String> = match obj.get::<_, rquickjs::Value>("name") {
+            Ok(val) => {
+                if val.is_null() || val.is_undefined() {
+                    None
+                } else if let Some(s) = val.as_string() {
+                    let raw = s.to_string().unwrap_or_default();
+                    if raw.trim().is_empty() {
+                        return Err(format!(
+                            "discoverAccounts: element at index {} has empty name",
+                            idx
+                        ));
+                    }
+                    Some(raw)
+                } else {
+                    return Err(format!(
+                        "discoverAccounts: element at index {} has non-string name",
+                        idx
+                    ));
+                }
+            }
+            Err(_) => {
+                return Err(format!(
+                    "discoverAccounts: element at index {} has invalid name (accessor threw)",
+                    idx
+                ));
+            }
+        };
 
         // origin: absent/null => "native"; empty/non-string/accessor => error
         let origin: String = match obj.get::<_, rquickjs::Value>("origin") {
@@ -764,6 +852,92 @@ fn parse_discovery_accounts(array: &Array) -> Result<Vec<DiscoveryDescriptor>, S
             Err(_) => {
                 return Err(format!(
                     "discoverAccounts: element at index {} has invalid origin (accessor threw)",
+                    idx
+                ));
+            }
+        };
+
+        let origin_namespace: String = match obj.get::<_, rquickjs::Value>("originNamespace") {
+            Ok(val) => {
+                if val.is_null() || val.is_undefined() {
+                    "default".to_string()
+                } else if let Some(s) = val.as_string() {
+                    let raw = s.to_string().unwrap_or_default();
+                    if raw.trim().is_empty() {
+                        return Err(format!(
+                            "discoverAccounts: element at index {} has empty originNamespace",
+                            idx
+                        ));
+                    }
+                    raw
+                } else {
+                    return Err(format!(
+                        "discoverAccounts: element at index {} has non-string originNamespace",
+                        idx
+                    ));
+                }
+            }
+            Err(_) => {
+                return Err(format!(
+                    "discoverAccounts: element at index {} has invalid originNamespace (accessor threw)",
+                    idx
+                ));
+            }
+        };
+
+        let stable_subject_key: Option<String> = match obj
+            .get::<_, rquickjs::Value>("stableSubjectKey")
+        {
+            Ok(val) => {
+                if val.is_null() || val.is_undefined() {
+                    None
+                } else if let Some(s) = val.as_string() {
+                    let raw = s.to_string().unwrap_or_default();
+                    if raw.trim().is_empty() {
+                        return Err(format!(
+                            "discoverAccounts: element at index {} has empty stableSubjectKey",
+                            idx
+                        ));
+                    }
+                    Some(raw)
+                } else {
+                    return Err(format!(
+                        "discoverAccounts: element at index {} has non-string stableSubjectKey",
+                        idx
+                    ));
+                }
+            }
+            Err(_) => {
+                return Err(format!(
+                    "discoverAccounts: element at index {} has invalid stableSubjectKey (accessor threw)",
+                    idx
+                ));
+            }
+        };
+
+        let source_ref: Option<String> = match obj.get::<_, rquickjs::Value>("sourceRef") {
+            Ok(val) => {
+                if val.is_null() || val.is_undefined() {
+                    None
+                } else if let Some(s) = val.as_string() {
+                    let raw = s.to_string().unwrap_or_default();
+                    if raw.trim().is_empty() {
+                        return Err(format!(
+                            "discoverAccounts: element at index {} has empty sourceRef",
+                            idx
+                        ));
+                    }
+                    Some(raw)
+                } else {
+                    return Err(format!(
+                        "discoverAccounts: element at index {} has non-string sourceRef",
+                        idx
+                    ));
+                }
+            }
+            Err(_) => {
+                return Err(format!(
+                    "discoverAccounts: element at index {} has invalid sourceRef (accessor threw)",
                     idx
                 ));
             }
@@ -802,21 +976,49 @@ fn parse_discovery_accounts(array: &Array) -> Result<Vec<DiscoveryDescriptor>, S
             }
         };
 
-        if !seen_ids.insert(id.clone()) {
-            return Err(format!(
-                "discoverAccounts: duplicate account id '{}' at index {}",
-                id, idx
-            ));
-        }
-
         accounts.push(DiscoveryDescriptor {
-            id,
+            probe_id,
             origin,
+            name,
+            origin_namespace,
+            stable_subject_key,
+            source_ref,
             error_policy,
         });
     }
 
     Ok(accounts)
+}
+
+fn canonical_discovery_account_id(provider_id: &str, descriptor: &DiscoveryDescriptor) -> String {
+    if descriptor.probe_id == "default" && descriptor.origin == "native" {
+        return "default".to_string();
+    }
+
+    let subject = descriptor
+        .stable_subject_key
+        .as_deref()
+        .unwrap_or(descriptor.probe_id.as_str());
+    let source = descriptor.source_ref.as_deref().unwrap_or("");
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"acc_v1|");
+    hasher.update(provider_id.as_bytes());
+    hasher.update(b"|");
+    hasher.update(descriptor.origin.as_bytes());
+    hasher.update(b"|");
+    hasher.update(descriptor.origin_namespace.as_bytes());
+    hasher.update(b"|");
+    hasher.update(subject.as_bytes());
+    hasher.update(b"|");
+    hasher.update(source.as_bytes());
+    let digest = hasher.finalize();
+    let hex = format!("{:x}", digest);
+    format!("acc_v1_{}", &hex[..24])
+}
+
+fn should_use_canonical_id(duplicate_probe_id_exists: bool) -> bool {
+    duplicate_probe_id_exists
 }
 
 /// Resolve a JS value that may be a sync result or a Promise.
@@ -1815,6 +2017,24 @@ mod tests {
         assert!(
             obj.get("display_name").is_none(),
             "should not have snake_case key"
+        );
+        assert!(obj.get("name").is_none(), "default account has no name");
+    }
+
+    #[test]
+    fn account_name_serializes_when_present() {
+        let account = AccountRef {
+            id: "acc_v1_test".to_string(),
+            origin: "opencode".to_string(),
+            name: Some("Work Profile".to_string()),
+        };
+        let json: JsonValue = serde_json::to_value(&account).expect("serialize");
+        let obj = json.as_object().expect("object");
+        assert_eq!(obj.get("id").and_then(|v| v.as_str()), Some("acc_v1_test"));
+        assert_eq!(obj.get("origin").and_then(|v| v.as_str()), Some("opencode"));
+        assert_eq!(
+            obj.get("name").and_then(|v| v.as_str()),
+            Some("Work Profile")
         );
     }
 
@@ -2822,7 +3042,96 @@ mod tests {
         let result = run_probe(&plugin, &temp_app_dir("dup-ids"), "0.0.0", None);
         assert_eq!(result.outputs.len(), 1);
         assert_eq!(result.outputs[0].account, AccountRef::default_account());
-        assert!(error_text(&result.outputs[0]).contains("duplicate"));
+        assert!(error_text(&result.outputs[0]).contains("duplicate output account id"));
+    }
+
+    #[test]
+    fn discovery_duplicate_probe_ids_with_names_have_stable_unique_output_ids() {
+        let plugin = test_plugin(
+            r#"
+            globalThis.__openusage_plugin = {
+                probe(ctx) {
+                    return { lines: [ctx.line.text({ label: "Account", value: ctx.account.id })] };
+                },
+                discoverAccounts(ctx) {
+                    return [
+                        { id: "opencode-0", origin: "opencode", originNamespace: "vendor.codex", sourceRef: "vendor:path-a", stableSubjectKey: "u-1", name: "Primary" },
+                        { id: "opencode-0", origin: "opencode", originNamespace: "override.codex", sourceRef: "override:path-b", stableSubjectKey: "u-2", name: "Secondary" }
+                    ];
+                }
+            };
+            "#,
+        );
+
+        let result = run_probe(
+            &plugin,
+            &temp_app_dir("dup-probe-id-canonical"),
+            "0.0.0",
+            None,
+        );
+        assert_eq!(result.outputs.len(), 2);
+        assert_ne!(result.outputs[0].account.id, result.outputs[1].account.id);
+        for output in &result.outputs {
+            assert!(output.account.id.starts_with("acc_v1_"));
+            assert_eq!(output.account.origin, "opencode");
+            assert!(output.account.name.is_some());
+        }
+
+        // Context id remains discover id for plugin internals.
+        let line0 = result.outputs[0]
+            .lines
+            .iter()
+            .find_map(|l| match l {
+                MetricLine::Text { label, value, .. } if label == "Account" => Some(value),
+                _ => None,
+            })
+            .expect("account line");
+        let line1 = result.outputs[1]
+            .lines
+            .iter()
+            .find_map(|l| match l {
+                MetricLine::Text { label, value, .. } if label == "Account" => Some(value),
+                _ => None,
+            })
+            .expect("account line");
+        assert_eq!(line0, "opencode-0");
+        assert_eq!(line1, "opencode-0");
+    }
+
+    #[test]
+    fn discovery_name_defaults_to_absent_and_rejects_empty() {
+        let ok_plugin = test_plugin(
+            r#"
+            globalThis.__openusage_plugin = {
+                probe(ctx) {
+                    return { lines: [ctx.line.text({ label: "Status", value: "ok" })] };
+                },
+                discoverAccounts(ctx) {
+                    return [{ id: "named", name: "Team A" }];
+                }
+            };
+            "#,
+        );
+        let ok = run_probe(&ok_plugin, &temp_app_dir("name-present"), "0.0.0", None);
+        assert_eq!(ok.outputs.len(), 1);
+        assert_eq!(ok.outputs[0].account.id, "named");
+        assert_eq!(ok.outputs[0].account.name.as_deref(), Some("Team A"));
+
+        let bad_plugin = test_plugin(
+            r#"
+            globalThis.__openusage_plugin = {
+                probe(ctx) {
+                    return { lines: [ctx.line.text({ label: "Status", value: "ok" })] };
+                },
+                discoverAccounts(ctx) {
+                    return [{ id: "bad", name: "" }];
+                }
+            };
+            "#,
+        );
+        let bad = run_probe(&bad_plugin, &temp_app_dir("name-empty"), "0.0.0", None);
+        assert_eq!(bad.outputs.len(), 1);
+        assert!(error_text(&bad.outputs[0]).contains("empty name"));
     }
 
     #[test]

@@ -77,6 +77,19 @@ function discoverAccounts(ctx, originalDiscoverAccounts) {
 
   var fs = ctx && ctx.host && ctx.host.fs;
 
+  function buildAccountDescriptor(index, stableSubjectKey) {
+    var d = {
+      id: "opencode-" + index,
+      origin: "opencode",
+      name: "OpenCode " + (index + 1),
+      sourceRef: "opencode-auth:path-index-" + index
+    };
+    if (stableSubjectKey && typeof stableSubjectKey === "string") {
+      d.stableSubjectKey = stableSubjectKey;
+    }
+    return d;
+  }
+
   for (var i = 0; i < OPENCODE_AUTH_PATHS.length; i++) {
     var path = OPENCODE_AUTH_PATHS[i];
     var accountId = "opencode-" + i;
@@ -95,7 +108,7 @@ function discoverAccounts(ctx, originalDiscoverAccounts) {
       }
     } catch (e) {
       ROUTE_REGISTRY[accountId] = { path: path, token: null, error: "Failed to check auth file: " + String(e) };
-      accounts.push({ id: accountId, origin: "opencode" });
+      accounts.push(buildAccountDescriptor(i));
       continue;
     }
 
@@ -108,7 +121,7 @@ function discoverAccounts(ctx, originalDiscoverAccounts) {
       text = fs.readText(path);
     } catch (e) {
       ROUTE_REGISTRY[accountId] = { path: path, token: null, error: "Failed to read auth file: " + String(e) };
-      accounts.push({ id: accountId, origin: "opencode" });
+      accounts.push(buildAccountDescriptor(i));
       continue;
     }
 
@@ -119,7 +132,7 @@ function discoverAccounts(ctx, originalDiscoverAccounts) {
     var doc = parseJsonLoose(text);
     if (!doc || typeof doc !== "object" || Array.isArray(doc)) {
       ROUTE_REGISTRY[accountId] = { path: path, token: null, error: "Invalid auth file" };
-      accounts.push({ id: accountId, origin: "opencode" });
+      accounts.push(buildAccountDescriptor(i));
       continue;
     }
 
@@ -131,14 +144,14 @@ function discoverAccounts(ctx, originalDiscoverAccounts) {
     if (!copilot || typeof copilot !== "object" || Array.isArray(copilot)) {
       // Provider key exists but is not a valid object — error account
       ROUTE_REGISTRY[accountId] = { path: path, token: null, error: "Invalid github-copilot credentials" };
-      accounts.push({ id: accountId, origin: "opencode" });
+      accounts.push(buildAccountDescriptor(i));
       continue;
     }
 
     var token = isNonEmptyString(copilot.access) ? copilot.access.trim() : "";
     if (!token) {
       ROUTE_REGISTRY[accountId] = { path: path, token: null, error: "Invalid github-copilot credentials" };
-      accounts.push({ id: accountId, origin: "opencode" });
+      accounts.push(buildAccountDescriptor(i));
       continue;
     }
 
@@ -148,7 +161,7 @@ function discoverAccounts(ctx, originalDiscoverAccounts) {
       error: null
     };
 
-    accounts.push({ id: accountId, origin: "opencode" });
+    accounts.push(buildAccountDescriptor(i, accountId));
   }
 
   return accounts;

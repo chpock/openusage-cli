@@ -1119,6 +1119,7 @@ mod tests {
                         account: AccountRef {
                             id: "secondary".to_string(),
                             origin: "native".to_string(),
+                            name: None,
                         },
                     },
                 ],
@@ -1188,6 +1189,7 @@ mod tests {
                     account: AccountRef {
                         id: "secondary".to_string(),
                         origin: "native".to_string(),
+                        name: None,
                     },
                 },
                 CachedPluginSnapshot {
@@ -1239,6 +1241,7 @@ mod tests {
                     account: AccountRef {
                         id: "secondary".to_string(),
                         origin: "native".to_string(),
+                        name: None,
                     },
                 },
                 CachedPluginSnapshot {
@@ -1292,6 +1295,7 @@ mod tests {
                         account: AccountRef {
                             id: "secondary".to_string(),
                             origin: "native".to_string(),
+                            name: None,
                         },
                     },
                     CachedPluginSnapshot {
@@ -1339,6 +1343,7 @@ mod tests {
                     account: AccountRef {
                         id: "custom-account".to_string(),
                         origin: "native".to_string(),
+                        name: None,
                     },
                 }],
             );
@@ -1377,6 +1382,7 @@ mod tests {
                         account: AccountRef {
                             id: "account-a".to_string(),
                             origin: "native".to_string(),
+                            name: None,
                         },
                     },
                     CachedPluginSnapshot {
@@ -1388,6 +1394,7 @@ mod tests {
                         account: AccountRef {
                             id: "account-b".to_string(),
                             origin: "native".to_string(),
+                            name: None,
                         },
                     },
                 ],
@@ -1414,6 +1421,7 @@ mod tests {
                 account: AccountRef {
                     id: "other".to_string(),
                     origin: "native".to_string(),
+                    name: None,
                 },
             },
             CachedPluginSnapshot {
@@ -1452,6 +1460,7 @@ mod tests {
                 account: AccountRef {
                     id: "secondary".to_string(),
                     origin: "native".to_string(),
+                    name: None,
                 },
             },
             CachedPluginSnapshot {

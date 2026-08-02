@@ -95,6 +95,19 @@ function discoverAccounts(ctx, originalDiscoverAccounts) {
 
   var fs = ctx && ctx.host && ctx.host.fs;
 
+  function buildAccountDescriptor(index, stableSubjectKey) {
+    var d = {
+      id: "opencode-" + index,
+      origin: "opencode",
+      name: "OpenCode " + (index + 1),
+      sourceRef: "opencode-auth:path-index-" + index
+    };
+    if (stableSubjectKey && typeof stableSubjectKey === "string") {
+      d.stableSubjectKey = stableSubjectKey;
+    }
+    return d;
+  }
+
   for (var i = 0; i < OPENCODE_AUTH_PATHS.length; i++) {
     var path = OPENCODE_AUTH_PATHS[i];
     var accountId = "opencode-" + i;
@@ -115,7 +128,7 @@ function discoverAccounts(ctx, originalDiscoverAccounts) {
     } catch (e) {
       // exists() threw — treat as error route
       routes[accountId] = { type: "error", error: "Failed to check auth file: " + String(e) };
-      accounts.push({ id: accountId, origin: "opencode" });
+      accounts.push(buildAccountDescriptor(i));
       continue;
     }
 
@@ -130,7 +143,7 @@ function discoverAccounts(ctx, originalDiscoverAccounts) {
     } catch (e) {
       // File exists but read failed — error route
       routes[accountId] = { type: "error", error: "Failed to read auth file: " + String(e) };
-      accounts.push({ id: accountId, origin: "opencode" });
+      accounts.push(buildAccountDescriptor(i));
       continue;
     }
 
@@ -143,13 +156,13 @@ function discoverAccounts(ctx, originalDiscoverAccounts) {
       doc = JSON.parse(text);
     } catch (e) {
       routes[accountId] = { type: "error", error: "Invalid JSON: " + String(e) };
-      accounts.push({ id: accountId, origin: "opencode" });
+      accounts.push(buildAccountDescriptor(i));
       continue;
     }
 
     if (!doc || typeof doc !== "object" || Array.isArray(doc)) {
       routes[accountId] = { type: "error", error: "Auth file is not valid JSON" };
-      accounts.push({ id: accountId, origin: "opencode" });
+      accounts.push(buildAccountDescriptor(i));
       continue;
     }
 
@@ -169,7 +182,7 @@ function discoverAccounts(ctx, originalDiscoverAccounts) {
       // Provider block exists but is not an object — error account
       if (!block || typeof block !== "object" || Array.isArray(block)) {
         routes[accountId] = { type: "error", error: "Provider block is not an object" };
-        accounts.push({ id: accountId, origin: "opencode" });
+        accounts.push(buildAccountDescriptor(i));
         found = true;
         break;
       }
@@ -178,7 +191,7 @@ function discoverAccounts(ctx, originalDiscoverAccounts) {
       if (!accessToken) {
         // Provider block exists but no access token — error account
         routes[accountId] = { type: "error", error: "Provider block has no access token" };
-        accounts.push({ id: accountId, origin: "opencode" });
+        accounts.push(buildAccountDescriptor(i));
         found = true;
         break;
       }
@@ -199,7 +212,7 @@ function discoverAccounts(ctx, originalDiscoverAccounts) {
         persistFailed: false
       };
 
-      accounts.push({ id: accountId, origin: "opencode" });
+      accounts.push(buildAccountDescriptor(i, accountIdFromBlock || accountId));
       found = true;
       break;
     }
