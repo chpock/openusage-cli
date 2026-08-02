@@ -69,8 +69,14 @@ impl fmt::Display for MetricLine {
 pub struct AccountRef {
     pub id: String,
     pub origin: String,
+    #[serde(default = "account_active_default")]
+    pub is_active: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+}
+
+fn account_active_default() -> bool {
+    true
 }
 
 impl AccountRef {
@@ -79,6 +85,7 @@ impl AccountRef {
         Self {
             id: "default".to_string(),
             origin: "native".to_string(),
+            is_active: true,
             name: None,
         }
     }
@@ -618,11 +625,13 @@ fn run_discovery_mode<'js>(
         let output_account = AccountRef {
             id: output_id,
             origin: descriptor.origin.clone(),
+            is_active: descriptor.is_active,
             name: descriptor.name.clone(),
         };
         let probe_account = AccountRef {
             id: descriptor.probe_id.clone(),
             origin: descriptor.origin.clone(),
+            is_active: descriptor.is_active,
             name: None,
         };
         let account_ctx = match create_account_context(ctx, &probe_account, base_ctx) {
@@ -750,6 +759,7 @@ fn create_account_context<'js>(
 struct DiscoveryDescriptor {
     probe_id: String,
     origin: String,
+    is_active: bool,
     name: Option<String>,
     origin_namespace: String,
     stable_subject_key: Option<String>,
@@ -852,6 +862,27 @@ fn parse_discovery_accounts(array: &Array) -> Result<Vec<DiscoveryDescriptor>, S
             Err(_) => {
                 return Err(format!(
                     "discoverAccounts: element at index {} has invalid origin (accessor threw)",
+                    idx
+                ));
+            }
+        };
+
+        let is_active: bool = match obj.get::<_, rquickjs::Value>("isActive") {
+            Ok(val) => {
+                if val.is_null() || val.is_undefined() {
+                    true
+                } else if let Some(b) = val.as_bool() {
+                    b
+                } else {
+                    return Err(format!(
+                        "discoverAccounts: element at index {} has non-boolean isActive",
+                        idx
+                    ));
+                }
+            }
+            Err(_) => {
+                return Err(format!(
+                    "discoverAccounts: element at index {} has invalid isActive (accessor threw)",
                     idx
                 ));
             }
@@ -979,6 +1010,7 @@ fn parse_discovery_accounts(array: &Array) -> Result<Vec<DiscoveryDescriptor>, S
         accounts.push(DiscoveryDescriptor {
             probe_id,
             origin,
+            is_active,
             name,
             origin_namespace,
             stable_subject_key,
@@ -2010,6 +2042,7 @@ mod tests {
         let obj = json.as_object().expect("object");
         assert_eq!(obj.get("id").and_then(|v| v.as_str()), Some("default"));
         assert_eq!(obj.get("origin").and_then(|v| v.as_str()), Some("native"));
+        assert_eq!(obj.get("isActive").and_then(|v| v.as_bool()), Some(true));
         assert!(
             obj.get("displayName").is_none(),
             "should not have displayName key"
@@ -2026,12 +2059,14 @@ mod tests {
         let account = AccountRef {
             id: "acc_v1_test".to_string(),
             origin: "opencode".to_string(),
+            is_active: false,
             name: Some("Work Profile".to_string()),
         };
         let json: JsonValue = serde_json::to_value(&account).expect("serialize");
         let obj = json.as_object().expect("object");
         assert_eq!(obj.get("id").and_then(|v| v.as_str()), Some("acc_v1_test"));
         assert_eq!(obj.get("origin").and_then(|v| v.as_str()), Some("opencode"));
+        assert_eq!(obj.get("isActive").and_then(|v| v.as_bool()), Some(false));
         assert_eq!(
             obj.get("name").and_then(|v| v.as_str()),
             Some("Work Profile")
@@ -2093,6 +2128,17 @@ mod tests {
             serde_json::from_str(json).expect("deserialize pre-account json");
         assert_eq!(output.account, AccountRef::default_account());
         assert_eq!(output.provider_id, "test-provider");
+    }
+
+    #[test]
+    fn account_ref_deserializes_missing_is_active_as_true() {
+        let json = r#"{
+            "id": "acc-1",
+            "origin": "opencode",
+            "name": "Work"
+        }"#;
+        let account: AccountRef = serde_json::from_str(json).expect("deserialize account");
+        assert!(account.is_active, "missing isActive must default to true");
     }
 
     #[test]

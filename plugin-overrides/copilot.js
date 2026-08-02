@@ -95,6 +95,7 @@ function discoverAccounts(ctx, originalDiscoverAccounts) {
     var d = {
       id: id,
       origin: "opencode",
+      isActive: true,
       name: label,
       sourceRef: "opencode-auth:" + id
     };
@@ -364,6 +365,7 @@ function discoverAccounts(ctx, originalDiscoverAccounts) {
       };
 
       accounts.push(buildAccountDescriptor(routeId, declaredAccountId, declaredAccountId));
+      accounts[accounts.length - 1].isActive = isActive;
     }
   }
 

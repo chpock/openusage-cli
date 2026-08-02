@@ -77,6 +77,14 @@ fn account_origin<'a>(result: &'a ProbeResult, account_id: &str) -> Option<&'a s
         .map(|output| output.account.origin.as_str())
 }
 
+fn account_is_active(result: &ProbeResult, account_id: &str) -> Option<bool> {
+    result
+        .outputs
+        .iter()
+        .find(|output| output.account.id == account_id)
+        .map(|output| output.account.is_active)
+}
+
 fn assert_opencode_origin(result: &ProbeResult, account_id: &str) {
     let origin = account_origin(result, account_id);
     assert_eq!(
@@ -132,6 +140,7 @@ fn copilot_override_native_default_source() {
 
     assert!(!result.outputs.is_empty());
     assert_eq!(result.outputs[0].provider_id, "copilot");
+    assert!(result.outputs[0].account.is_active);
 
     // Default account has no origin
     assert_default_origin(&result);
@@ -174,6 +183,7 @@ fn copilot_override_uses_opencode_fallback_auth_when_primary_auth_missing() {
 
     assert!(!result.outputs.is_empty());
     assert_eq!(result.outputs[0].provider_id, "copilot");
+    assert_eq!(account_is_active(&result, "opencode-0"), Some(true));
 
     // OpenCode error account has origin: opencode
     assert_opencode_origin(&result, "opencode-0");
@@ -250,6 +260,7 @@ fn copilot_override_accounts_json_inactive_entry_uses_entry_credentials() {
     assert!(!result.outputs.is_empty());
     assert_eq!(result.outputs[0].provider_id, "copilot");
     assert_opencode_origin(&result, "account-name-1");
+    assert_eq!(account_is_active(&result, "account-name-1"), Some(false));
 }
 
 #[test]

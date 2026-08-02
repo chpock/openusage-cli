@@ -1119,6 +1119,7 @@ mod tests {
                         account: AccountRef {
                             id: "secondary".to_string(),
                             origin: "native".to_string(),
+                            is_active: true,
                             name: None,
                         },
                     },
@@ -1189,6 +1190,7 @@ mod tests {
                     account: AccountRef {
                         id: "secondary".to_string(),
                         origin: "native".to_string(),
+                        is_active: true,
                         name: None,
                     },
                 },
@@ -1241,6 +1243,7 @@ mod tests {
                     account: AccountRef {
                         id: "secondary".to_string(),
                         origin: "native".to_string(),
+                        is_active: true,
                         name: None,
                     },
                 },
@@ -1295,6 +1298,7 @@ mod tests {
                         account: AccountRef {
                             id: "secondary".to_string(),
                             origin: "native".to_string(),
+                            is_active: true,
                             name: None,
                         },
                     },
@@ -1343,6 +1347,7 @@ mod tests {
                     account: AccountRef {
                         id: "custom-account".to_string(),
                         origin: "native".to_string(),
+                        is_active: true,
                         name: None,
                     },
                 }],
@@ -1382,6 +1387,7 @@ mod tests {
                         account: AccountRef {
                             id: "account-a".to_string(),
                             origin: "native".to_string(),
+                            is_active: true,
                             name: None,
                         },
                     },
@@ -1394,6 +1400,7 @@ mod tests {
                         account: AccountRef {
                             id: "account-b".to_string(),
                             origin: "native".to_string(),
+                            is_active: true,
                             name: None,
                         },
                     },
@@ -1421,6 +1428,7 @@ mod tests {
                 account: AccountRef {
                     id: "other".to_string(),
                     origin: "native".to_string(),
+                    is_active: true,
                     name: None,
                 },
             },
@@ -1460,6 +1468,7 @@ mod tests {
                 account: AccountRef {
                     id: "secondary".to_string(),
                     origin: "native".to_string(),
+                    is_active: true,
                     name: None,
                 },
             },

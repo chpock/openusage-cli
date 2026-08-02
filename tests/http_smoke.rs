@@ -136,7 +136,7 @@ async fn http_api_smoke_for_plugins_and_usage_refresh() {
     assert!(usage_array[0].get("fetchedAt").is_some());
     assert_eq!(
         usage_array[0]["account"],
-        serde_json::json!({ "id": "default", "origin": "native" }),
+        serde_json::json!({ "id": "default", "origin": "native", "isActive": true }),
         "every usage snapshot must carry the default account"
     );
 
@@ -152,7 +152,7 @@ async fn http_api_smoke_for_plugins_and_usage_refresh() {
     assert_eq!(filtered_array.len(), 1, "filtered to mock only");
     assert_eq!(
         filtered_array[0]["account"],
-        serde_json::json!({ "id": "default", "origin": "native" }),
+        serde_json::json!({ "id": "default", "origin": "native", "isActive": true }),
         "filtered response must carry the default account"
     );
 
@@ -166,7 +166,7 @@ async fn http_api_smoke_for_plugins_and_usage_refresh() {
     assert_eq!(single_json["providerId"], "mock");
     assert_eq!(
         single_json["account"],
-        serde_json::json!({ "id": "default", "origin": "native" }),
+        serde_json::json!({ "id": "default", "origin": "native", "isActive": true }),
         "single provider response must carry the default account"
     );
 
@@ -182,7 +182,7 @@ async fn http_api_smoke_for_plugins_and_usage_refresh() {
     assert!(!probe_array.is_empty(), "probe should return snapshots");
     assert_eq!(
         probe_array[0]["account"],
-        serde_json::json!({ "id": "default", "origin": "native" }),
+        serde_json::json!({ "id": "default", "origin": "native", "isActive": true }),
         "probe response must carry the default account"
     );
 
@@ -386,7 +386,7 @@ async fn single_provider_returns_sole_custom_account() {
     let single_json: Value = single_resp.json().await.expect("single json");
     assert_eq!(
         single_json["account"],
-        serde_json::json!({ "id": "default", "origin": "native" }),
+        serde_json::json!({ "id": "default", "origin": "native", "isActive": true }),
         "single-account mode must return default account (probe result.account ignored)"
     );
 

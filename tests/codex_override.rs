@@ -85,6 +85,14 @@ fn first_request_account_id(obs: &Value) -> String {
         .unwrap_or_default()
 }
 
+fn account_is_active(result: &ProbeResult, account_id: &str) -> Option<bool> {
+    result
+        .outputs
+        .iter()
+        .find(|o| o.account.id == account_id)
+        .map(|o| o.account.is_active)
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Test suite
 // ═══════════════════════════════════════════════════════════════════════
@@ -128,6 +136,7 @@ fn codex_override_native_default_source() {
     assert!(!result.outputs.is_empty(), "expected at least one output");
     assert_eq!(result.outputs[0].provider_id, "codex");
     assert_eq!(result.outputs[0].display_name, "Codex");
+    assert!(result.outputs[0].account.is_active);
     assert_eq!(
         result.outputs[0].account.origin, "native",
         "default account origin should be native"
@@ -174,6 +183,7 @@ fn codex_override_uses_opencode_fallback_auth_when_primary_auth_missing() {
     // Probe metadata from typed runner.
     assert!(!result.outputs.is_empty());
     assert_eq!(result.outputs[0].provider_id, "codex");
+    assert_eq!(account_is_active(&result, "opencode-0"), Some(true));
     assert_eq!(
         result.outputs[0].account.origin, "opencode",
         "opencode account origin should be opencode"
@@ -257,6 +267,7 @@ fn codex_override_accounts_json_inactive_entry_uses_entry_credentials() {
         .expect("expected output for account-name-1");
     assert_eq!(account_output.provider_id, "codex");
     assert_eq!(account_output.account.origin, "opencode");
+    assert!(!account_output.account.is_active);
 }
 
 #[test]
