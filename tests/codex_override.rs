@@ -115,7 +115,9 @@ fn codex_override_native_default_source() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
 
@@ -160,7 +162,9 @@ fn codex_override_uses_opencode_fallback_auth_when_primary_auth_missing() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
 
@@ -173,6 +177,362 @@ fn codex_override_uses_opencode_fallback_auth_when_primary_auth_missing() {
     assert_eq!(
         result.outputs[0].account.origin, "opencode",
         "opencode account origin should be opencode"
+    );
+}
+
+#[test]
+fn codex_override_accounts_json_inactive_entry_uses_entry_credentials() {
+    let (result, obs) = run_codex_probe(
+        r#"
+        __test_state.account = "account-name-1";
+        __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({
+          google: {
+            type: "oauth",
+            refresh: "auth-refresh",
+            access: "auth-access",
+            expires: 1776806966592,
+            accountId: "auth-account"
+          }
+        });
+        __test_state.files["~/.local/share/opencode/accounts.json"] = JSON.stringify({
+          openai: [
+            {
+              accountId: "active-main",
+              isActive: true
+            },
+            {
+              accountId: "account-name-1",
+              isActive: false,
+              data: {
+                type: "oauth",
+                refresh: "inactive-refresh",
+                access: "inactive-access",
+                expires: 1776806966592,
+                accountId: "account-name-1"
+              }
+            }
+          ]
+        });
+        __test_state.responses.usage.push({
+          status: 200,
+          headers: {},
+          bodyText: JSON.stringify({})
+        });
+        "#,
+    );
+
+    let obs = obs.expect("assertion should produce state");
+
+    assert_subscriptions(
+        &obs,
+        &[
+            "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
+            "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
+        ],
+    );
+
+    let matching_request = obs["requests"]
+        .as_array()
+        .and_then(|reqs| {
+            reqs.iter().find(|r| {
+                r["accountId"]
+                    .as_str()
+                    .map(|s| s == "account-name-1")
+                    .unwrap_or(false)
+            })
+        })
+        .cloned()
+        .expect("expected request for account-name-1");
+    assert_eq!(
+        matching_request["authorization"],
+        Value::String("Bearer inactive-access".to_string())
+    );
+
+    let account_output = result
+        .outputs
+        .iter()
+        .find(|o| o.account.id == "account-name-1")
+        .expect("expected output for account-name-1");
+    assert_eq!(account_output.provider_id, "codex");
+    assert_eq!(account_output.account.origin, "opencode");
+}
+
+#[test]
+fn codex_override_accounts_json_provider_key_not_array_creates_error_account() {
+    let (result, obs) = run_codex_probe(
+        r#"
+        __test_state.files["~/.local/share/opencode/accounts.json"] = JSON.stringify({
+          openai: {
+            accountId: "broken"
+          }
+        });
+        "#,
+    );
+
+    let obs = obs.expect("assertion should produce state");
+
+    assert_subscriptions(
+        &obs,
+        &[
+            "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
+            "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
+        ],
+    );
+
+    assert!(!result.outputs.is_empty(), "expected probe outputs");
+    assert_eq!(result.outputs[0].provider_id, "codex");
+    assert_eq!(result.outputs[0].account.origin, "opencode");
+    let error_text: String = result.outputs[0]
+        .lines
+        .iter()
+        .map(|l| format!("{}", l))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        error_text.contains("must be a list of account entries"),
+        "expected array validation error, got: {}",
+        error_text
+    );
+}
+
+#[test]
+fn codex_override_accounts_json_without_active_creates_single_error_account() {
+    let (result, obs) = run_codex_probe(
+        r#"
+        __test_state.files["~/.local/share/opencode/accounts.json"] = JSON.stringify({
+          openai: [
+            {
+              accountId: "account-name-1",
+              isActive: false,
+              data: {
+                type: "oauth",
+                refresh: "inactive-refresh",
+                expires: 1776806966592
+              }
+            }
+          ]
+        });
+        "#,
+    );
+
+    let obs = obs.expect("assertion should produce state");
+
+    assert_subscriptions(
+        &obs,
+        &[
+            "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
+            "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
+        ],
+    );
+
+    assert!(!result.outputs.is_empty(), "expected probe outputs");
+    assert_eq!(result.outputs[0].provider_id, "codex");
+    assert_eq!(
+        result.outputs.len(),
+        1,
+        "expected exactly one error account"
+    );
+    assert_eq!(result.outputs[0].account.id, "opencode-0");
+    assert_eq!(result.outputs[0].account.origin, "opencode");
+    let error_text: String = result.outputs[0]
+        .lines
+        .iter()
+        .map(|l| format!("{}", l))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        error_text.contains("no active account selected"),
+        "expected no-active validation error, got: {}",
+        error_text
+    );
+}
+
+#[test]
+fn codex_override_accounts_json_multiple_active_creates_single_error_account() {
+    let (result, obs) = run_codex_probe(
+        r#"
+        __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({
+          openai: {
+            type: "oauth",
+            refresh: "auth-refresh",
+            access: "auth-access",
+            expires: 1776806966592,
+            accountId: "auth-account"
+          }
+        });
+        __test_state.files["~/.local/share/opencode/accounts.json"] = JSON.stringify({
+          openai: [
+            { accountId: "a1", isActive: true },
+            { accountId: "a2", isActive: true }
+          ]
+        });
+        "#,
+    );
+
+    let obs = obs.expect("assertion should produce state");
+    assert_subscriptions(
+        &obs,
+        &[
+            "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
+            "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
+        ],
+    );
+
+    assert_eq!(
+        result.outputs.len(),
+        1,
+        "expected exactly one error account"
+    );
+    assert_eq!(result.outputs[0].account.id, "opencode-0");
+    let error_text: String = result.outputs[0]
+        .lines
+        .iter()
+        .map(|l| format!("{}", l))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        error_text.contains("multiple active accounts selected"),
+        "expected multiple-active validation error, got: {}",
+        error_text
+    );
+}
+
+#[test]
+fn codex_override_accounts_json_active_entry_uses_auth_and_errors_when_auth_invalid() {
+    let (result, obs) = run_codex_probe(
+        r#"
+        __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({
+          google: {
+            type: "oauth",
+            access: "google-access",
+            refresh: "google-refresh",
+            expires: 1776806966592
+          }
+        });
+        __test_state.files["~/.local/share/opencode/accounts.json"] = JSON.stringify({
+          openai: [
+            {
+              accountId: "account-name-2",
+              isActive: true
+            }
+          ]
+        });
+        "#,
+    );
+
+    let obs = obs.expect("assertion should produce state");
+
+    assert_subscriptions(
+        &obs,
+        &[
+            "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
+            "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
+        ],
+    );
+
+    assert!(!result.outputs.is_empty(), "expected probe outputs");
+    assert_eq!(result.outputs[0].provider_id, "codex");
+    assert_eq!(result.outputs[0].account.id, "account-name-2");
+    assert_eq!(result.outputs[0].account.origin, "opencode");
+    let error_text: String = result.outputs[0]
+        .lines
+        .iter()
+        .map(|l| format!("{}", l))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        error_text.contains("access") || error_text.contains("Provider block"),
+        "expected auth.json-derived credential error, got: {}",
+        error_text
+    );
+}
+
+#[test]
+fn codex_override_accounts_json_duplicate_account_id_creates_error_route() {
+    let (result, obs) = run_codex_probe(
+        r#"
+        __test_state.files["~/.local/share/opencode/accounts.json"] = JSON.stringify({
+          openai: [
+            { accountId: "active-main", isActive: true },
+            {
+              accountId: "account-dup",
+              isActive: false,
+              data: {
+                type: "oauth",
+                refresh: "refresh-2",
+                access: "access-2",
+                expires: 1776806966592,
+                accountId: "account-dup"
+              }
+            },
+            {
+              accountId: "account-dup",
+              isActive: false,
+              data: {
+                type: "oauth",
+                refresh: "refresh-3",
+                access: "access-3",
+                expires: 1776806966592,
+                accountId: "account-dup"
+              }
+            }
+          ]
+        });
+        __test_state.responses.usage.push({
+          status: 200,
+          headers: {},
+          bodyText: JSON.stringify({})
+        });
+        "#,
+    );
+
+    let obs = obs.expect("assertion should produce state");
+
+    assert_subscriptions(
+        &obs,
+        &[
+            "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
+            "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
+        ],
+    );
+
+    assert_eq!(
+        result.outputs.len(),
+        1,
+        "expected exactly one error account"
+    );
+    assert_eq!(result.outputs[0].account.id, "opencode-0");
+
+    let duplicate_error = result.outputs.iter().any(|output| {
+        output
+            .lines
+            .iter()
+            .map(|line| format!("{}", line))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+            .contains("duplicate account name")
+    });
+    assert!(
+        duplicate_error,
+        "expected duplicate-account error output, got: {:?}",
+        result
+            .outputs
+            .iter()
+            .map(|o| (&o.account.id, &o.lines))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -209,7 +569,9 @@ fn codex_override_preserves_original_auth_path_priority() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
 
@@ -264,7 +626,9 @@ fn codex_override_persists_refresh_back_to_opencode_auth_file() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
 
@@ -315,6 +679,121 @@ fn codex_override_persists_refresh_back_to_opencode_auth_file() {
         result.outputs[0].account.origin, "opencode",
         "opencode account origin should be opencode"
     );
+}
+
+#[test]
+fn codex_override_persists_refresh_back_to_accounts_json_for_inactive_entry() {
+    let (result, obs) = run_codex_probe(
+        r#"
+        __test_state.account = "account-name-1";
+        __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({
+          google: {
+            type: "oauth",
+            refresh: "auth-refresh",
+            access: "auth-access",
+            expires: 1776806966592,
+            accountId: "auth-account"
+          }
+        });
+        __test_state.files["~/.local/share/opencode/accounts.json"] = JSON.stringify({
+          openai: [
+            {
+              accountId: "active-main",
+              isActive: true
+            },
+            {
+              accountId: "account-name-1",
+              isActive: false,
+              data: {
+                type: "oauth",
+                refresh: "old-refresh",
+                access: "old-access",
+                expires: 1776806966592,
+                accountId: "account-name-1"
+              }
+            }
+          ]
+        });
+        __test_state.responses.usage.push({
+          status: 401,
+          headers: {},
+          bodyText: JSON.stringify({ error: "expired" })
+        });
+        __test_state.responses.refresh.push({
+          status: 200,
+          headers: {},
+          bodyText: JSON.stringify({
+            access_token: "new-access-from-refresh",
+            refresh_token: "new-refresh-from-refresh"
+          })
+        });
+        __test_state.responses.usage.push({
+          status: 200,
+          headers: {},
+          bodyText: JSON.stringify({})
+        });
+        "#,
+    );
+
+    let obs = obs.expect("assertion should produce state");
+
+    assert_subscriptions(
+        &obs,
+        &[
+            "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
+            "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
+        ],
+    );
+
+    let requests = obs["requests"].as_array().expect("requests array");
+    assert!(
+        requests.iter().any(|req| req["url"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("oauth/token")),
+        "refresh request should be executed"
+    );
+
+    let updated_accounts_text = obs["files"]["~/.local/share/opencode/accounts.json"]
+        .as_str()
+        .expect("updated accounts file text");
+    let updated_accounts: Value =
+        serde_json::from_str(updated_accounts_text).expect("updated accounts json");
+    assert_eq!(
+        updated_accounts["openai"][1]["data"]["access"],
+        Value::String("new-access-from-refresh".to_string())
+    );
+    assert_eq!(
+        updated_accounts["openai"][1]["data"]["refresh"],
+        Value::String("new-refresh-from-refresh".to_string())
+    );
+    assert_eq!(
+        updated_accounts["openai"][1]["accountId"],
+        Value::String("account-name-1".to_string())
+    );
+
+    let updated_auth_text = obs["files"]["~/.local/share/opencode/auth.json"]
+        .as_str()
+        .expect("auth file text");
+    let updated_auth: Value = serde_json::from_str(updated_auth_text).expect("auth json");
+    assert_eq!(
+        updated_auth["google"]["access"],
+        Value::String("auth-access".to_string())
+    );
+    assert_eq!(
+        updated_auth["google"]["refresh"],
+        Value::String("auth-refresh".to_string())
+    );
+
+    let account_output = result
+        .outputs
+        .iter()
+        .find(|o| o.account.id == "account-name-1")
+        .expect("expected output for account-name-1");
+    assert_eq!(account_output.provider_id, "codex");
+    assert_eq!(account_output.account.origin, "opencode");
 }
 
 #[test]
@@ -369,7 +848,9 @@ fn codex_override_reloads_opencode_auth_before_refresh() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
 
@@ -452,7 +933,9 @@ fn codex_override_preserves_other_providers_when_persisting_refresh() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
 
@@ -518,7 +1001,9 @@ fn codex_override_tries_multiple_opencode_auth_paths() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
 
@@ -547,7 +1032,9 @@ fn codex_override_keeps_not_logged_in_error_without_valid_fallback_payload() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
 
@@ -641,7 +1128,9 @@ fn codex_override_stable_path_index_ids() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
 
@@ -689,7 +1178,9 @@ fn codex_override_no_cross_source_native_fallback() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
 
@@ -726,7 +1217,9 @@ fn codex_override_empty_source_no_account() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
     // Only default account — no error descriptor for empty source.
@@ -753,7 +1246,9 @@ fn codex_override_unreadable_source_creates_error_account() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
     // Error account with read error descriptor visible.
@@ -792,7 +1287,9 @@ fn codex_override_missing_provider_key_omits_candidate() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
     // Only default account — missing key creates no extra account.
@@ -816,7 +1313,9 @@ fn codex_override_malformed_provider_block_null_error() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
     // Null provider block creates a visible error for that candidate.
@@ -851,7 +1350,9 @@ fn codex_override_malformed_provider_block_array_error() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
     assert!(!result.outputs.is_empty(), "expected probe outputs");
@@ -889,7 +1390,9 @@ fn codex_override_missing_access_token_error() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
     assert!(!result.outputs.is_empty(), "expected probe outputs");
@@ -924,7 +1427,9 @@ fn codex_override_default_native_error_visible_when_alone() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
     assert!(!result.outputs.is_empty(), "expected probe outputs");
@@ -956,7 +1461,9 @@ fn codex_override_default_suppressed_when_opencode_descriptor_exists() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
     // Only opencode-0 error account visible, default suppressed.
@@ -985,7 +1492,9 @@ fn codex_override_no_cross_source_fallback() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
     // Native token ignored for opencode account
@@ -1012,7 +1521,9 @@ fn codex_override_refresh_error_propagation() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
     assert!(!result.outputs.is_empty(), "expected probe outputs");
@@ -1052,7 +1563,9 @@ fn codex_override_persistence_failure_visible() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
     assert!(!result.outputs.is_empty(), "expected probe outputs");

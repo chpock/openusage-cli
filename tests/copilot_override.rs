@@ -122,7 +122,9 @@ fn copilot_override_native_default_source() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
 
@@ -162,7 +164,9 @@ fn copilot_override_uses_opencode_fallback_auth_when_primary_auth_missing() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
 
@@ -173,6 +177,407 @@ fn copilot_override_uses_opencode_fallback_auth_when_primary_auth_missing() {
 
     // OpenCode error account has origin: opencode
     assert_opencode_origin(&result, "opencode-0");
+}
+
+#[test]
+fn copilot_override_accounts_json_inactive_entry_uses_entry_credentials() {
+    let (result, obs) = run_copilot_probe(
+        r#"
+        __test_state.account = "account-name-1";
+        __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({
+          google: {
+            type: "oauth",
+            refresh: "auth-refresh",
+            access: "auth-access",
+            expires: 0
+          }
+        });
+        __test_state.files["~/.local/share/opencode/accounts.json"] = JSON.stringify({
+          "github-copilot": [
+            {
+              accountId: "active-main",
+              isActive: true
+            },
+            {
+              accountId: "account-name-1",
+              isActive: false,
+              data: {
+                type: "oauth",
+                refresh: "inactive-refresh",
+                access: "inactive-access",
+                expires: 0
+              }
+            }
+          ]
+        });
+        __test_state.responses.usage.push({
+          status: 200,
+          headers: {},
+          bodyText: JSON.stringify({})
+        });
+        "#,
+    );
+
+    let obs = obs.expect("assertion should produce state");
+
+    assert_subscriptions(
+        &obs,
+        &[
+            "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
+            "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
+        ],
+    );
+
+    let matching_request = obs["requests"]
+        .as_array()
+        .and_then(|reqs| {
+            reqs.iter().find(|r| {
+                r["authorization"]
+                    .as_str()
+                    .map(|s| s == "token inactive-access")
+                    .unwrap_or(false)
+            })
+        })
+        .cloned()
+        .expect("expected request with inactive token");
+    assert_eq!(
+        matching_request["authorization"],
+        Value::String("token inactive-access".to_string())
+    );
+
+    assert!(!result.outputs.is_empty());
+    assert_eq!(result.outputs[0].provider_id, "copilot");
+    assert_opencode_origin(&result, "account-name-1");
+}
+
+#[test]
+fn copilot_override_accounts_json_active_entry_uses_auth_json_credentials() {
+    let (result, obs) = run_copilot_probe(
+        r#"
+        __test_state.account = "account-name-2";
+        __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({
+          "github-copilot": {
+            type: "oauth",
+            refresh: "auth-refresh",
+            access: "auth-access",
+            expires: 0
+          }
+        });
+        __test_state.files["~/.local/share/opencode/accounts.json"] = JSON.stringify({
+          "github-copilot": [
+            {
+              accountId: "account-name-2",
+              isActive: true,
+              data: {
+                type: "oauth",
+                refresh: "inactive-refresh",
+                access: "inactive-access",
+                expires: 0
+              }
+            }
+          ]
+        });
+        __test_state.responses.usage.push({
+          status: 200,
+          headers: {},
+          bodyText: JSON.stringify({})
+        });
+        "#,
+    );
+
+    let obs = obs.expect("assertion should produce state");
+
+    assert_subscriptions(
+        &obs,
+        &[
+            "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
+            "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
+        ],
+    );
+
+    assert_eq!(first_request_auth(&obs), "token auth-access");
+
+    assert!(!result.outputs.is_empty());
+    assert_eq!(result.outputs[0].provider_id, "copilot");
+    assert_opencode_origin(&result, "account-name-2");
+}
+
+#[test]
+fn copilot_override_accounts_json_provider_key_not_array_creates_error_account() {
+    let (result, obs) = run_copilot_probe(
+        r#"
+        __test_state.files["~/.local/share/opencode/accounts.json"] = JSON.stringify({
+          "github-copilot": {
+            accountId: "broken"
+          }
+        });
+        "#,
+    );
+
+    let obs = obs.expect("assertion should produce state");
+
+    assert_subscriptions(
+        &obs,
+        &[
+            "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
+            "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
+        ],
+    );
+
+    assert!(!result.outputs.is_empty(), "expected probe outputs");
+    assert_eq!(result.outputs[0].provider_id, "copilot");
+    assert_eq!(result.outputs[0].account.origin, "opencode");
+    let error_text: String = result.outputs[0]
+        .lines
+        .iter()
+        .map(|l| format!("{}", l))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        error_text.contains("must be a list of account entries"),
+        "expected array validation error, got: {}",
+        error_text
+    );
+}
+
+#[test]
+fn copilot_override_accounts_json_without_active_creates_single_error_account() {
+    let (result, obs) = run_copilot_probe(
+        r#"
+        __test_state.files["~/.local/share/opencode/accounts.json"] = JSON.stringify({
+          "github-copilot": [
+            {
+              accountId: "account-name-1",
+              isActive: false,
+              data: {
+                type: "oauth",
+                refresh: "inactive-refresh",
+                expires: 0
+              }
+            }
+          ]
+        });
+        "#,
+    );
+
+    let obs = obs.expect("assertion should produce state");
+
+    assert_subscriptions(
+        &obs,
+        &[
+            "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
+            "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
+        ],
+    );
+
+    assert!(!result.outputs.is_empty(), "expected probe outputs");
+    assert_eq!(result.outputs[0].provider_id, "copilot");
+    assert_eq!(
+        result.outputs.len(),
+        1,
+        "expected exactly one error account"
+    );
+    assert_eq!(result.outputs[0].account.id, "opencode-0");
+    assert_eq!(result.outputs[0].account.origin, "opencode");
+    let error_text: String = result.outputs[0]
+        .lines
+        .iter()
+        .map(|l| format!("{}", l))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        error_text.contains("no active account selected"),
+        "expected no-active validation error, got: {}",
+        error_text
+    );
+}
+
+#[test]
+fn copilot_override_accounts_json_multiple_active_creates_single_error_account() {
+    let (result, obs) = run_copilot_probe(
+        r#"
+        __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({
+          "github-copilot": {
+            type: "oauth",
+            refresh: "auth-refresh",
+            access: "auth-access",
+            expires: 0
+          }
+        });
+        __test_state.files["~/.local/share/opencode/accounts.json"] = JSON.stringify({
+          "github-copilot": [
+            { accountId: "a1", isActive: true },
+            { accountId: "a2", isActive: true }
+          ]
+        });
+        "#,
+    );
+
+    let obs = obs.expect("assertion should produce state");
+    assert_subscriptions(
+        &obs,
+        &[
+            "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
+            "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
+        ],
+    );
+
+    assert_eq!(
+        result.outputs.len(),
+        1,
+        "expected exactly one error account"
+    );
+    assert_eq!(result.outputs[0].account.id, "opencode-0");
+    let error_text: String = result.outputs[0]
+        .lines
+        .iter()
+        .map(|l| format!("{}", l))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        error_text.contains("multiple active accounts selected"),
+        "expected multiple-active validation error, got: {}",
+        error_text
+    );
+}
+
+#[test]
+fn copilot_override_accounts_json_active_entry_uses_auth_and_errors_when_auth_invalid() {
+    let (result, obs) = run_copilot_probe(
+        r#"
+        __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({
+          google: {
+            type: "oauth",
+            access: "google-access",
+            refresh: "google-refresh",
+            expires: 1
+          }
+        });
+        __test_state.files["~/.local/share/opencode/accounts.json"] = JSON.stringify({
+          "github-copilot": [
+            {
+              accountId: "account-name-2",
+              isActive: true
+            }
+          ]
+        });
+        "#,
+    );
+
+    let obs = obs.expect("assertion should produce state");
+
+    assert_subscriptions(
+        &obs,
+        &[
+            "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
+            "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
+        ],
+    );
+
+    assert!(!result.outputs.is_empty(), "expected probe outputs");
+    assert_eq!(result.outputs[0].provider_id, "copilot");
+    assert_eq!(result.outputs[0].account.id, "account-name-2");
+    assert_eq!(result.outputs[0].account.origin, "opencode");
+    let error_text: String = result.outputs[0]
+        .lines
+        .iter()
+        .map(|l| format!("{}", l))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        error_text.contains("Invalid") || error_text.contains("credentials"),
+        "expected auth.json-derived credential error, got: {}",
+        error_text
+    );
+}
+
+#[test]
+fn copilot_override_accounts_json_duplicate_account_id_creates_error_route() {
+    let (result, obs) = run_copilot_probe(
+        r#"
+        __test_state.files["~/.local/share/opencode/accounts.json"] = JSON.stringify({
+          "github-copilot": [
+            { accountId: "active-main", isActive: true },
+            {
+              accountId: "account-dup",
+              isActive: false,
+              data: {
+                type: "oauth",
+                refresh: "refresh-2",
+                access: "access-2",
+                expires: 0
+              }
+            },
+            {
+              accountId: "account-dup",
+              isActive: false,
+              data: {
+                type: "oauth",
+                refresh: "refresh-3",
+                access: "access-3",
+                expires: 0
+              }
+            }
+          ]
+        });
+        __test_state.responses.usage.push({
+          status: 200,
+          headers: {},
+          bodyText: JSON.stringify({})
+        });
+        "#,
+    );
+
+    let obs = obs.expect("assertion should produce state");
+
+    assert_subscriptions(
+        &obs,
+        &[
+            "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
+            "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
+        ],
+    );
+
+    assert_eq!(
+        result.outputs.len(),
+        1,
+        "expected exactly one error account"
+    );
+    assert_eq!(result.outputs[0].account.id, "opencode-0");
+
+    let duplicate_error = result.outputs.iter().any(|output| {
+        output
+            .lines
+            .iter()
+            .map(|line| format!("{}", line))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+            .contains("duplicate account name")
+    });
+    assert!(
+        duplicate_error,
+        "expected duplicate-account error output, got: {:?}",
+        result
+            .outputs
+            .iter()
+            .map(|o| (&o.account.id, &o.lines))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -204,7 +609,9 @@ fn copilot_override_preserves_original_auth_priority() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
 
@@ -252,7 +659,9 @@ fn copilot_override_tries_multiple_opencode_auth_paths() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
 
@@ -279,7 +688,9 @@ fn copilot_override_keeps_not_logged_in_error_without_valid_fallback_payload() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
 
@@ -331,7 +742,9 @@ fn copilot_override_exact_token_request_source() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
 
@@ -391,7 +804,9 @@ fn copilot_override_empty_source_no_account() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
     assert!(!result.outputs.is_empty());
@@ -415,7 +830,9 @@ fn copilot_override_unreadable_source_creates_error_account() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
     assert!(!result.outputs.is_empty());
@@ -449,7 +866,9 @@ fn copilot_override_missing_provider_key_omits_candidate() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
     assert!(!result.outputs.is_empty());
@@ -472,7 +891,9 @@ fn copilot_override_malformed_provider_block_null_error() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
     assert!(!result.outputs.is_empty());
@@ -506,7 +927,9 @@ fn copilot_override_malformed_provider_block_array_error() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
     assert!(!result.outputs.is_empty());
@@ -540,7 +963,9 @@ fn copilot_override_missing_access_token_error() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
     assert!(!result.outputs.is_empty());
@@ -573,7 +998,9 @@ fn copilot_override_default_native_error_visible_when_alone() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
     assert!(!result.outputs.is_empty());
@@ -608,7 +1035,9 @@ fn copilot_override_default_suppressed_when_opencode_exists() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
     assert!(!result.outputs.is_empty());
@@ -633,7 +1062,9 @@ fn copilot_override_no_cross_source_fallback() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
     assert!(!result.outputs.is_empty());
@@ -658,7 +1089,9 @@ fn copilot_override_two_valid_files_stable_ids() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
     let accounts: Vec<String> = result
@@ -692,7 +1125,9 @@ fn copilot_override_first_missing_second_valid_opencode_1() {
         &obs,
         &[
             "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
             "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
         ],
     );
     let accounts: Vec<String> = result

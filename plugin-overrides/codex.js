@@ -1,7 +1,7 @@
 // ── Codex override: account discovery + source routing ────────────
-// This override adds opencode-<path-index> accounts to the Codex plugin.
+// This override adds opencode-* accounts to the Codex plugin.
 // It patches loadAuth, saveAuth, and refreshToken to route through
-// exact selected auth files with no cross-file or native fallback.
+// exact selected credential sources with no cross-file or native fallback.
 
 globalThis.__openusage_ast_patch = {
   functions: [
@@ -23,6 +23,10 @@ function isNonEmptyString(v) {
   return typeof v === "string" && v.length > 0;
 }
 
+function isPlainObject(v) {
+  return !!v && typeof v === "object" && !Array.isArray(v);
+}
+
 function logWarn(ctx, msg) {
   try {
     if (ctx && ctx.host && typeof ctx.host.log === "function") {
@@ -31,12 +35,39 @@ function logWarn(ctx, msg) {
   } catch (_) {}
 }
 
+function parseJsonStrict(text) {
+  if (!isNonEmptyString(text)) return null;
+  return JSON.parse(text);
+}
+
+function parseCredentialObject(block) {
+  if (!isPlainObject(block)) {
+    return { error: "Provider block is not an object" };
+  }
+
+  var accessToken = isNonEmptyString(block.access) ? block.access.trim() : "";
+  if (!accessToken) {
+    return { error: "Provider block has no access token" };
+  }
+
+  var refreshToken = isNonEmptyString(block.refresh) ? block.refresh.trim() : "";
+  var accountIdFromBlock = isNonEmptyString(block.accountId) ? block.accountId.trim() : "";
+
+  return {
+    credential: {
+      access_token: accessToken,
+      refresh_token: refreshToken
+    },
+    accountIdFromBlock: accountIdFromBlock
+  };
+}
+
 function buildAuthStateFromCredential(cred, route) {
   var auth = {
     last_refresh: new Date().toISOString(),
     tokens: {
       access_token: cred.access_token || "",
-      refresh_token: cred.refresh_token || "",
+      refresh_token: cred.refresh_token || ""
     }
   };
   if (route.accountId) {
@@ -55,25 +86,29 @@ function buildAuthStateFromCredential(cred, route) {
 var routes = {};
 
 // ── discoverAccounts ──────────────────────────────────────────────
-// Scans OPENCODE_AUTH_PATHS for valid auth files and yields one
-// account per candidate. Each account is identified by its path index.
+// Scans OpenCode auth/accounts candidates and yields one account
+// per resolved route.
 
-var OPENCODE_AUTH_PATHS = [
-  "~/.local/share/opencode/auth.json",
-  "~/.config/opencode/auth.json"
+var OPENCODE_SOURCES = [
+  {
+    authPath: "~/.local/share/opencode/auth.json",
+    accountsPath: "~/.local/share/opencode/accounts.json"
+  },
+  {
+    authPath: "~/.config/opencode/auth.json",
+    accountsPath: "~/.config/opencode/accounts.json"
+  }
 ];
 var OPENAI_PROVIDER_KEY = "openai";
 
 function discoverAccounts(ctx, originalDiscoverAccounts) {
-  // Reset routes on each discovery
   var keys = Object.keys(routes);
-  for (var i = 0; i < keys.length; i++) {
-    delete routes[keys[i]];
+  for (var k = 0; k < keys.length; k++) {
+    delete routes[keys[k]];
   }
 
   var accounts = [];
 
-  // Include original plugin accounts first
   if (typeof originalDiscoverAccounts === "function") {
     try {
       var origAccounts = originalDiscoverAccounts(ctx);
@@ -84,9 +119,6 @@ function discoverAccounts(ctx, originalDiscoverAccounts) {
       }
     } catch (_) {}
   } else {
-    // No original discoverAccounts — add a default account with
-    // hide-if-other-account policy so errors are suppressed when
-    // opencode accounts exist.
     accounts.push({
       id: "default",
       errorPolicy: "hide-if-other-account"
@@ -94,13 +126,16 @@ function discoverAccounts(ctx, originalDiscoverAccounts) {
   }
 
   var fs = ctx && ctx.host && ctx.host.fs;
+  if (!fs || typeof fs.readText !== "function") {
+    return accounts;
+  }
 
-  function buildAccountDescriptor(index, stableSubjectKey) {
+  function buildAccountDescriptor(id, label, stableSubjectKey) {
     var d = {
-      id: "opencode-" + index,
+      id: id,
       origin: "opencode",
-      name: "OpenCode " + (index + 1),
-      sourceRef: "opencode-auth:path-index-" + index
+      name: label,
+      sourceRef: "opencode-auth:" + id
     };
     if (stableSubjectKey && typeof stableSubjectKey === "string") {
       d.stableSubjectKey = stableSubjectKey;
@@ -108,117 +143,283 @@ function discoverAccounts(ctx, originalDiscoverAccounts) {
     return d;
   }
 
-  for (var i = 0; i < OPENCODE_AUTH_PATHS.length; i++) {
-    var path = OPENCODE_AUTH_PATHS[i];
-    var accountId = "opencode-" + i;
+  var opencodeRouteCounter = 0;
+  var usedRouteIds = {};
 
-    if (!fs || typeof fs.readText !== "function") {
-      continue;
+  for (var bi = 0; bi < accounts.length; bi++) {
+    if (accounts[bi] && isNonEmptyString(accounts[bi].id)) {
+      usedRouteIds[accounts[bi].id] = true;
     }
+  }
 
-    // Check existence first to distinguish missing from unreadable.
+  function reserveRouteId(preferred) {
+    if (isNonEmptyString(preferred) && !usedRouteIds[preferred]) {
+      usedRouteIds[preferred] = true;
+      return preferred;
+    }
+    return nextRouteId();
+  }
+
+  function nextRouteId() {
+    var id;
+    do {
+      id = "opencode-" + String(opencodeRouteCounter);
+      opencodeRouteCounter += 1;
+    } while (usedRouteIds[id]);
+    usedRouteIds[id] = true;
+    return id;
+  }
+
+  function pushErrorRoute(routeId, message, label) {
+    routes[routeId] = { type: "error", error: message };
+    accounts.push(buildAccountDescriptor(routeId, label || routeId));
+  }
+
+  function readJsonFile(path, missingState, kindLabel) {
     var fileExists;
     try {
       if (typeof fs.exists === "function") {
         fileExists = fs.exists(path);
       } else {
-        // No exists API — fall back to try-readText
         fileExists = null;
       }
     } catch (e) {
-      // exists() threw — treat as error route
-      routes[accountId] = { type: "error", error: "Failed to check auth file: " + String(e) };
-      accounts.push(buildAccountDescriptor(i));
-      continue;
+      return { kind: "error", error: "Failed to check " + kindLabel + " file: " + String(e) };
     }
 
     if (fileExists === false) {
-      // File does not exist — omit this account
-      continue;
+      return { kind: missingState };
     }
 
     var text;
     try {
       text = fs.readText(path);
     } catch (e) {
-      // File exists but read failed — error route
-      routes[accountId] = { type: "error", error: "Failed to read auth file: " + String(e) };
-      accounts.push(buildAccountDescriptor(i));
-      continue;
+      if (fileExists === null && String(e).toLowerCase().indexOf("file not found") !== -1) {
+        return { kind: missingState };
+      }
+      return { kind: "error", error: "Failed to read " + kindLabel + " file: " + String(e) };
     }
 
     if (!isNonEmptyString(text)) {
-      continue;
+      return { kind: "empty" };
     }
 
     var doc;
     try {
-      doc = JSON.parse(text);
+      doc = parseJsonStrict(text);
     } catch (e) {
-      routes[accountId] = { type: "error", error: "Invalid JSON: " + String(e) };
-      accounts.push(buildAccountDescriptor(i));
-      continue;
+      return { kind: "error", error: "Invalid JSON in " + kindLabel + " file: " + String(e) };
     }
 
-    if (!doc || typeof doc !== "object" || Array.isArray(doc)) {
-      routes[accountId] = { type: "error", error: "Auth file is not valid JSON" };
-      accounts.push(buildAccountDescriptor(i));
-      continue;
+    if (!isPlainObject(doc)) {
+      return { kind: "error", error: kindLabel + " file is not a valid JSON object" };
     }
 
-    // Find the first provider block with an access token
-    var providerKeys = Object.keys(doc);
-    var found = false;
+    return { kind: "value", doc: doc };
+  }
 
-    for (var j = 0; j < providerKeys.length; j++) {
-      var key = providerKeys[j];
-      var block = doc[key];
+  function readAuthCredential(authPath) {
+    var authResult = readJsonFile(authPath, "missing", "auth");
+    if (authResult.kind !== "value") {
+      if (authResult.kind === "missing" || authResult.kind === "empty") {
+        return { error: "Auth file is missing or empty" };
+      }
+      return { error: authResult.error };
+    }
 
-      // Only accept openai provider blocks
-      if (key !== OPENAI_PROVIDER_KEY) {
+    var block = authResult.doc[OPENAI_PROVIDER_KEY];
+    if (block === undefined) {
+      return { error: "Provider block has no access token" };
+    }
+
+    var parsed = parseCredentialObject(block);
+    if (parsed.error) {
+      return { error: parsed.error };
+    }
+
+    return {
+      credential: parsed.credential,
+      accountIdFromBlock: parsed.accountIdFromBlock
+    };
+  }
+
+  function validateAccountsEntries(entries) {
+    var activeCount = 0;
+    var seenAccountIds = {};
+
+    for (var vi = 0; vi < entries.length; vi++) {
+      var entry = entries[vi];
+      if (!isPlainObject(entry)) {
         continue;
       }
 
-      // Provider block exists but is not an object — error account
-      if (!block || typeof block !== "object" || Array.isArray(block)) {
-        routes[accountId] = { type: "error", error: "Provider block is not an object" };
-        accounts.push(buildAccountDescriptor(i));
-        found = true;
-        break;
+      if (entry.isActive === true) {
+        activeCount += 1;
       }
 
-      var accessToken = isNonEmptyString(block.access) ? block.access.trim() : "";
-      if (!accessToken) {
-        // Provider block exists but no access token — error account
-        routes[accountId] = { type: "error", error: "Provider block has no access token" };
-        accounts.push(buildAccountDescriptor(i));
-        found = true;
-        break;
+      var aid = isNonEmptyString(entry.accountId) ? entry.accountId.trim() : "";
+      if (!aid) {
+        continue;
       }
-
-      var refreshToken = isNonEmptyString(block.refresh) ? block.refresh.trim() : "";
-      var accountIdFromBlock = isNonEmptyString(block.accountId) ? block.accountId : "";
-
-      // Store route for this account
-      routes[accountId] = {
-        path: path,
-        providerKey: key,
-        accountId: accountIdFromBlock,
-        credential: {
-          access_token: accessToken,
-          refresh_token: refreshToken
-        },
-        type: "ready",
-        persistFailed: false
-      };
-
-      accounts.push(buildAccountDescriptor(i, accountIdFromBlock || accountId));
-      found = true;
-      break;
+      if (seenAccountIds[aid]) {
+        return "Accounts configuration error: duplicate account name '" + aid + "'. Each accountId must be unique.";
+      }
+      seenAccountIds[aid] = true;
     }
 
-    if (!found) {
+    if (activeCount === 0) {
+      return "Accounts configuration error: no active account selected. Mark exactly one account with isActive=true.";
+    }
+    if (activeCount > 1) {
+      return "Accounts configuration error: multiple active accounts selected (" + activeCount + "). Mark exactly one account with isActive=true.";
+    }
+
+    return null;
+  }
+
+  function discoverLegacyAuthRoute(source, sourceIndex) {
+    var authPath = source.authPath;
+    var authResult = readJsonFile(authPath, "missing", "auth");
+    if (authResult.kind === "missing" || authResult.kind === "empty") {
+      return;
+    }
+    if (authResult.kind === "error") {
+      var errorId = reserveRouteId("opencode-" + sourceIndex);
+      pushErrorRoute(errorId, authResult.error, errorId);
+      return;
+    }
+
+    var block = authResult.doc[OPENAI_PROVIDER_KEY];
+    if (block === undefined) {
+      return;
+    }
+
+    var parsed = parseCredentialObject(block);
+    var routeId = reserveRouteId("opencode-" + sourceIndex);
+    if (parsed.error) {
+      pushErrorRoute(routeId, parsed.error, routeId);
+      return;
+    }
+
+    var legacyAccountId = parsed.accountIdFromBlock || routeId;
+    routes[routeId] = {
+      path: authPath,
+      providerKey: OPENAI_PROVIDER_KEY,
+      accountId: parsed.accountIdFromBlock,
+      credential: parsed.credential,
+      type: "ready",
+      persistFailed: false,
+      readSource: "auth",
+      persistSource: "auth"
+    };
+    accounts.push(buildAccountDescriptor(routeId, "OpenCode " + (accounts.length + 1), legacyAccountId));
+  }
+
+  for (var i = 0; i < OPENCODE_SOURCES.length; i++) {
+    var source = OPENCODE_SOURCES[i];
+    var authPath = source.authPath;
+    var accountsPath = source.accountsPath;
+
+    var accountsResult = readJsonFile(accountsPath, "missing", "accounts");
+
+    if (accountsResult.kind === "missing" || accountsResult.kind === "empty") {
+      discoverLegacyAuthRoute(source, i);
       continue;
+    }
+
+    if (accountsResult.kind === "error") {
+      var parseErrorId = nextRouteId();
+      pushErrorRoute(parseErrorId, accountsResult.error, parseErrorId);
+      continue;
+    }
+
+    var providerEntries = accountsResult.doc[OPENAI_PROVIDER_KEY];
+    if (providerEntries === undefined) {
+      discoverLegacyAuthRoute(source, i);
+      continue;
+    }
+
+    if (!Array.isArray(providerEntries)) {
+      var badProviderId = nextRouteId();
+      pushErrorRoute(
+        badProviderId,
+        "Accounts configuration error: '" + OPENAI_PROVIDER_KEY + "' must be a list of account entries.",
+        badProviderId
+      );
+      continue;
+    }
+
+    var accountsValidationError = validateAccountsEntries(providerEntries);
+    if (accountsValidationError) {
+      var validationErrorId = reserveRouteId("opencode-" + i);
+      pushErrorRoute(validationErrorId, accountsValidationError, validationErrorId);
+      continue;
+    }
+
+    for (var j = 0; j < providerEntries.length; j++) {
+      var entry = providerEntries[j];
+
+      if (!isPlainObject(entry)) {
+        var routeId = nextRouteId();
+        pushErrorRoute(routeId, "Invalid account entry at index " + j, routeId);
+        continue;
+      }
+
+      var declaredAccountId = isNonEmptyString(entry.accountId) ? entry.accountId.trim() : "";
+      if (!declaredAccountId) {
+        var missingAccountIdRoute = nextRouteId();
+        pushErrorRoute(
+          missingAccountIdRoute,
+          "Invalid account entry at index " + j + ": accountId is required",
+          missingAccountIdRoute
+        );
+        continue;
+      }
+
+      if (usedRouteIds[declaredAccountId]) {
+        var duplicateIdRoute = nextRouteId();
+        pushErrorRoute(
+          duplicateIdRoute,
+          "Duplicate accountId in discovery results: " + declaredAccountId,
+          declaredAccountId
+        );
+        continue;
+      }
+
+      var routeId = reserveRouteId(declaredAccountId);
+
+      var isActive = entry.isActive === true;
+      var parsed;
+
+      if (isActive) {
+        parsed = readAuthCredential(authPath);
+        if (parsed.error) {
+          pushErrorRoute(routeId, parsed.error, declaredAccountId);
+          continue;
+        }
+      } else {
+        parsed = parseCredentialObject(entry.data);
+        if (parsed.error) {
+          pushErrorRoute(routeId, parsed.error, declaredAccountId);
+          continue;
+        }
+      }
+
+      routes[routeId] = {
+        path: authPath,
+        accountsPath: accountsPath,
+        providerKey: OPENAI_PROVIDER_KEY,
+        accountId: declaredAccountId,
+        credential: parsed.credential,
+        type: "ready",
+        persistFailed: false,
+        readSource: isActive ? "auth" : "accounts",
+        persistSource: isActive ? "auth" : "accounts",
+        accountsIndex: j
+      };
+
+      accounts.push(buildAccountDescriptor(routeId, declaredAccountId, declaredAccountId));
     }
   }
 
@@ -283,10 +484,10 @@ function patchSaveAuth(originalSaveAuth, ctx, authState) {
     newTokens.refresh_token = tokens.refresh_token;
   }
 
-  var saved = persistToFile(ctx, route.path, route.providerKey, newTokens);
+  var saved = persistRouteTokens(ctx, route, newTokens);
   if (!saved) {
     route.persistFailed = true;
-    logWarn(ctx, "codex override: failed to persist auth to " + route.path);
+    logWarn(ctx, "codex override: failed to persist auth for account " + accountId);
   } else {
     if (newTokens.access_token) route.credential.access_token = newTokens.access_token;
     if (newTokens.refresh_token) route.credential.refresh_token = newTokens.refresh_token;
@@ -315,32 +516,33 @@ function patchRefreshToken(originalRefreshToken, ctx, authState) {
     throw "Token persistence failed for account " + accountId;
   }
 
-  // Capture in-memory token before exact-source reload
   var priorToken = route.credential && route.credential.access_token;
 
-  var providerBlock = readProviderBlock(ctx, route.path, route.providerKey);
-  if (!providerBlock) {
+  var reloadedCredential = reloadCredentialFromRoute(ctx, route);
+  if (!reloadedCredential) {
     throw "Failed to reload auth file for account " + accountId;
   }
 
-  var currentAccessToken = isNonEmptyString(providerBlock.access)
-    ? providerBlock.access.trim()
+  var currentAccessToken = isNonEmptyString(reloadedCredential.access_token)
+    ? reloadedCredential.access_token.trim()
     : "";
 
-  // If token changed on disk since last load, use it immediately
-  // without OAuth refresh, regardless of last_refresh age.
   if (isNonEmptyString(currentAccessToken) && currentAccessToken !== priorToken) {
     route.credential.access_token = currentAccessToken;
+    if (isNonEmptyString(reloadedCredential.refresh_token)) {
+      route.credential.refresh_token = reloadedCredential.refresh_token;
+    }
     if (authState && authState.auth && authState.auth.tokens) {
       authState.auth.tokens.access_token = currentAccessToken;
+      if (isNonEmptyString(reloadedCredential.refresh_token)) {
+        authState.auth.tokens.refresh_token = reloadedCredential.refresh_token;
+      }
     }
     return currentAccessToken;
   }
 
-  // No changed token — delegate to upstream OAuth refresh.
   var upstreamRefreshResult = originalRefreshToken(ctx, authState);
 
-  // Sync route credential state from the mutated authState after upstream refresh.
   if (authState && authState.auth && authState.auth.tokens) {
     var upstreamAccess = authState.auth.tokens.access_token;
     if (isNonEmptyString(upstreamAccess)) {
@@ -352,8 +554,6 @@ function patchRefreshToken(originalRefreshToken, ctx, authState) {
     }
   }
 
-  // If selected-source save failed earlier, surface it now as an
-  // account-specific error — even though upstream may have succeeded.
   if (route.persistFailed) {
     throw "Token refresh succeeded but persistence failed for account " + accountId;
   }
@@ -391,7 +591,57 @@ function readProviderBlock(ctx, path, providerKey) {
   return block;
 }
 
-function persistToFile(ctx, path, providerKey, tokens) {
+function readAccountsEntryData(ctx, path, providerKey, index) {
+  var fs = ctx && ctx.host && ctx.host.fs;
+  if (!fs || typeof fs.readText !== "function") return null;
+
+  var text;
+  try {
+    text = fs.readText(path);
+  } catch (_) {
+    return null;
+  }
+
+  if (!isNonEmptyString(text)) return null;
+
+  var doc;
+  try {
+    doc = JSON.parse(text);
+  } catch (_) {
+    return null;
+  }
+
+  if (!isPlainObject(doc)) return null;
+
+  var providerEntries = doc[providerKey];
+  if (!Array.isArray(providerEntries)) return null;
+  if (index < 0 || index >= providerEntries.length) return null;
+
+  var entry = providerEntries[index];
+  if (!isPlainObject(entry)) return null;
+
+  return entry.data;
+}
+
+function reloadCredentialFromRoute(ctx, route) {
+  if (route.readSource === "accounts") {
+    var data = readAccountsEntryData(ctx, route.accountsPath, route.providerKey, route.accountsIndex);
+    var parsedData = parseCredentialObject(data);
+    if (parsedData.error) {
+      return null;
+    }
+    return parsedData.credential;
+  }
+
+  var block = readProviderBlock(ctx, route.path, route.providerKey);
+  var parsedBlock = parseCredentialObject(block);
+  if (parsedBlock.error) {
+    return null;
+  }
+  return parsedBlock.credential;
+}
+
+function persistToAuthFile(ctx, path, providerKey, tokens) {
   var fs = ctx && ctx.host && ctx.host.fs;
   if (!fs || typeof fs.readText !== "function" || typeof fs.writeText !== "function") {
     return false;
@@ -417,7 +667,6 @@ function persistToFile(ctx, path, providerKey, tokens) {
 
   var block = doc[providerKey];
   if (!block || typeof block !== "object" || Array.isArray(block)) {
-    // Provider block missing — cannot persist
     return false;
   }
 
@@ -442,8 +691,83 @@ function persistToFile(ctx, path, providerKey, tokens) {
   }
 }
 
+function persistToAccountsFile(ctx, path, providerKey, index, tokens, declaredAccountId) {
+  var fs = ctx && ctx.host && ctx.host.fs;
+  if (!fs || typeof fs.readText !== "function" || typeof fs.writeText !== "function") {
+    return false;
+  }
+
+  var text;
+  try {
+    text = fs.readText(path);
+  } catch (_) {
+    return false;
+  }
+
+  if (!isNonEmptyString(text)) return false;
+
+  var doc;
+  try {
+    doc = JSON.parse(text);
+  } catch (_) {
+    return false;
+  }
+
+  if (!isPlainObject(doc)) return false;
+
+  var providerEntries = doc[providerKey];
+  if (!Array.isArray(providerEntries)) return false;
+  if (index < 0 || index >= providerEntries.length) return false;
+
+  var entry = providerEntries[index];
+  if (!isPlainObject(entry)) return false;
+
+  if (!isPlainObject(entry.data)) {
+    entry.data = {};
+  }
+
+  if (isNonEmptyString(tokens.access_token)) {
+    entry.data.access = tokens.access_token;
+  }
+  if (isNonEmptyString(tokens.refresh_token)) {
+    entry.data.refresh = tokens.refresh_token;
+  }
+  entry.data.type = "oauth";
+  if (typeof entry.data.expires !== "number") {
+    entry.data.expires = 0;
+  }
+  if (isNonEmptyString(declaredAccountId)) {
+    entry.data.accountId = declaredAccountId;
+  }
+
+  providerEntries[index] = entry;
+  doc[providerKey] = providerEntries;
+
+  try {
+    fs.writeText(path, JSON.stringify(doc, null, 2));
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function persistRouteTokens(ctx, route, tokens) {
+  if (route.persistSource === "accounts") {
+    return persistToAccountsFile(
+      ctx,
+      route.accountsPath,
+      route.providerKey,
+      route.accountsIndex,
+      tokens,
+      route.accountId
+    );
+  }
+
+  return persistToAuthFile(ctx, route.path, route.providerKey, tokens);
+}
+
 // ── Subscribe to candidate paths ─────────────────────────────────
-// Subscribe to candidate paths so the monitor knows about them.
-for (var si = 0; si < OPENCODE_AUTH_PATHS.length; si++) {
-  globalThis.__openusage_ctx.host.fs.subscribeFile(OPENCODE_AUTH_PATHS[si]);
+for (var si = 0; si < OPENCODE_SOURCES.length; si++) {
+  globalThis.__openusage_ctx.host.fs.subscribeFile(OPENCODE_SOURCES[si].authPath);
+  globalThis.__openusage_ctx.host.fs.subscribeFile(OPENCODE_SOURCES[si].accountsPath);
 }
