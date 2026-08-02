@@ -43,8 +43,9 @@ For detailed documentation, see [Provider file monitoring](provider-file-monitor
   `discoverAccounts(ctx)` export. When present, the runtime calls it to
   obtain an array of account descriptors, then probes each account
   sequentially with an inherited context containing an immutable `account`
-  identity. Override scripts can intercept, replace, wrap, or reset
-  discovery via `globalThis.__openusage_override` helpers.
+  identity. Override scripts can replace discovery via the declarative
+  `__openusage_function_overrides` manifest (see
+  [Plugin Overrides](plugin-overrides.md#declarative-function-overrides)).
 
 For detailed documentation, see [Usage](usage.md) (multi-account discovery
 section) and [Plugin Overrides](plugin-overrides.md).

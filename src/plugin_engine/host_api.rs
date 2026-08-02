@@ -7,7 +7,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use rquickjs::{Ctx, Exception, Function, Object};
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
@@ -458,6 +458,44 @@ pub fn inject_host_api<'js>(
     app_version: &str,
     subscription_collector: Arc<std::sync::Mutex<Vec<crate::restart_watcher::FileSubscription>>>,
 ) -> rquickjs::Result<()> {
+    inject_host_api_with_filesystem_policy(
+        ctx,
+        plugin_id,
+        app_data_dir,
+        app_version,
+        subscription_collector,
+        FilesystemPolicy::Unrestricted,
+    )
+}
+
+pub(crate) fn inject_host_api_in_sandbox<'js>(
+    ctx: &Ctx<'js>,
+    plugin_id: &str,
+    app_data_dir: &Path,
+    app_version: &str,
+    subscription_collector: Arc<std::sync::Mutex<Vec<crate::restart_watcher::FileSubscription>>>,
+    root: &Path,
+) -> rquickjs::Result<()> {
+    let policy = FilesystemPolicy::sandbox(root)
+        .map_err(|err| Exception::throw_message(ctx, &err.to_string()))?;
+    inject_host_api_with_filesystem_policy(
+        ctx,
+        plugin_id,
+        app_data_dir,
+        app_version,
+        subscription_collector,
+        policy,
+    )
+}
+
+fn inject_host_api_with_filesystem_policy<'js>(
+    ctx: &Ctx<'js>,
+    plugin_id: &str,
+    app_data_dir: &Path,
+    app_version: &str,
+    subscription_collector: Arc<std::sync::Mutex<Vec<crate::restart_watcher::FileSubscription>>>,
+    filesystem_policy: FilesystemPolicy,
+) -> rquickjs::Result<()> {
     let globals = ctx.globals();
     let probe_ctx = Object::new(ctx.clone())?;
 
@@ -482,15 +520,27 @@ pub fn inject_host_api<'js>(
     probe_ctx.set("app", app_obj)?;
 
     let host = Object::new(ctx.clone())?;
+    let sandboxed = matches!(filesystem_policy, FilesystemPolicy::Sandbox { .. });
     inject_log(ctx, &host, plugin_id)?;
-    inject_fs(ctx, &host, subscription_collector)?;
+    inject_fs(
+        ctx,
+        &host,
+        subscription_collector,
+        filesystem_policy.clone(),
+    )?;
     inject_crypto(ctx, &host)?;
     inject_env(ctx, &host, plugin_id)?;
     inject_http(ctx, &host, plugin_id)?;
-    inject_keychain(ctx, &host, plugin_id)?;
-    inject_sqlite(ctx, &host)?;
-    inject_ls(ctx, &host, plugin_id)?;
-    inject_ccusage(ctx, &host, plugin_id)?;
+    if !sandboxed {
+        inject_keychain(ctx, &host, plugin_id)?;
+        inject_ls(ctx, &host, plugin_id)?;
+        inject_ccusage(ctx, &host, plugin_id)?;
+        inject_sqlite(ctx, &host, filesystem_policy)?;
+    } else {
+        inject_disabled_ls(ctx, &host)?;
+        inject_disabled_ccusage(ctx, &host)?;
+        inject_disabled_sqlite(ctx, &host)?;
+    }
 
     probe_ctx.set("host", host)?;
     globals.set("__openusage_ctx", probe_ctx)?;
@@ -529,51 +579,210 @@ fn inject_log<'js>(ctx: &Ctx<'js>, host: &Object<'js>, plugin_id: &str) -> rquic
     Ok(())
 }
 
+#[derive(Clone, Debug)]
+enum FilesystemPolicy {
+    Unrestricted,
+    Sandbox { root: PathBuf },
+}
+
+impl FilesystemPolicy {
+    fn sandbox(root: &Path) -> std::io::Result<Self> {
+        Ok(Self::Sandbox {
+            root: std::fs::canonicalize(root)?,
+        })
+    }
+
+    fn resolve(&self, path: &str, operation: FilesystemOperation) -> Result<PathBuf, String> {
+        let expanded = PathBuf::from(expand_path(path));
+        let Self::Sandbox { root } = self else {
+            return Ok(expanded);
+        };
+
+        if expanded
+            .components()
+            .any(|component| component == Component::ParentDir)
+        {
+            return Err("sandbox denied path traversal outside test root".to_string());
+        }
+
+        let candidate = if expanded.is_absolute() {
+            expanded
+        } else {
+            root.join(expanded)
+        };
+
+        if !candidate.starts_with(root) {
+            return Err(format!(
+                "sandbox denied path outside test root: {}",
+                candidate.display()
+            ));
+        }
+
+        ensure_existing_ancestor_is_inside(&candidate, root)?;
+
+        match operation {
+            FilesystemOperation::Read | FilesystemOperation::List => {
+                let canonical = std::fs::canonicalize(&candidate).map_err(|err| err.to_string())?;
+                if canonical.starts_with(root) {
+                    Ok(canonical)
+                } else {
+                    Err(format!(
+                        "sandbox denied path outside test root: {}",
+                        candidate.display()
+                    ))
+                }
+            }
+            FilesystemOperation::Write => {
+                match std::fs::symlink_metadata(&candidate) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(format!(
+                            "sandbox denied write through symlink: {}",
+                            candidate.display()
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(err.to_string()),
+                }
+
+                let parent = candidate
+                    .parent()
+                    .ok_or_else(|| "sandbox denied path without parent".to_string())?;
+                let canonical_parent =
+                    std::fs::canonicalize(parent).map_err(|err| err.to_string())?;
+                if canonical_parent.starts_with(root) {
+                    Ok(candidate)
+                } else {
+                    Err(format!(
+                        "sandbox denied path outside test root: {}",
+                        candidate.display()
+                    ))
+                }
+            }
+            FilesystemOperation::Subscribe => {
+                if candidate.exists() {
+                    let canonical =
+                        std::fs::canonicalize(&candidate).map_err(|err| err.to_string())?;
+                    if !canonical.starts_with(root) {
+                        return Err(format!(
+                            "sandbox denied path outside test root: {}",
+                            candidate.display()
+                        ));
+                    }
+                }
+                Ok(candidate)
+            }
+            FilesystemOperation::Exists => {
+                if candidate.exists() {
+                    let canonical =
+                        std::fs::canonicalize(&candidate).map_err(|err| err.to_string())?;
+                    if !canonical.starts_with(root) {
+                        return Err(format!(
+                            "sandbox denied path outside test root: {}",
+                            candidate.display()
+                        ));
+                    }
+                }
+                Ok(candidate)
+            }
+        }
+    }
+}
+
+fn ensure_existing_ancestor_is_inside(candidate: &Path, root: &Path) -> Result<(), String> {
+    let mut ancestor = candidate;
+    loop {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(_) => {
+                let canonical = std::fs::canonicalize(ancestor).map_err(|_| {
+                    format!(
+                        "sandbox denied unresolved symlink path: {}",
+                        ancestor.display()
+                    )
+                })?;
+                if canonical.starts_with(root) {
+                    return Ok(());
+                }
+                return Err(format!(
+                    "sandbox denied path outside test root: {}",
+                    candidate.display()
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                ancestor = ancestor
+                    .parent()
+                    .ok_or_else(|| "sandbox denied path without existing ancestor".to_string())?;
+            }
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FilesystemOperation {
+    Exists,
+    Read,
+    Write,
+    List,
+    Subscribe,
+}
+
 fn inject_fs<'js>(
     ctx: &Ctx<'js>,
     host: &Object<'js>,
     subscription_collector: Arc<std::sync::Mutex<Vec<crate::restart_watcher::FileSubscription>>>,
+    policy: FilesystemPolicy,
 ) -> rquickjs::Result<()> {
     let fs_obj = Object::new(ctx.clone())?;
 
     fs_obj.set(
         "exists",
-        Function::new(ctx.clone(), move |path: String| -> bool {
-            let expanded = expand_path(&path);
-            std::path::Path::new(&expanded).exists()
+        Function::new(ctx.clone(), {
+            let policy = policy.clone();
+            move |path: String| -> bool {
+                policy
+                    .resolve(&path, FilesystemOperation::Exists)
+                    .is_ok_and(|expanded| expanded.exists())
+            }
         })?,
     )?;
 
     fs_obj.set(
         "readText",
-        Function::new(
-            ctx.clone(),
+        Function::new(ctx.clone(), {
+            let policy = policy.clone();
             move |ctx_inner: Ctx<'_>, path: String| -> rquickjs::Result<String> {
-                let expanded = expand_path(&path);
+                let expanded = policy
+                    .resolve(&path, FilesystemOperation::Read)
+                    .map_err(|err| Exception::throw_message(&ctx_inner, &err))?;
                 std::fs::read_to_string(&expanded)
                     .map_err(|e| Exception::throw_message(&ctx_inner, &e.to_string()))
-            },
-        )?,
+            }
+        })?,
     )?;
 
     fs_obj.set(
         "writeText",
-        Function::new(
-            ctx.clone(),
+        Function::new(ctx.clone(), {
+            let policy = policy.clone();
             move |ctx_inner: Ctx<'_>, path: String, content: String| -> rquickjs::Result<()> {
-                let expanded = expand_path(&path);
+                let expanded = policy
+                    .resolve(&path, FilesystemOperation::Write)
+                    .map_err(|err| Exception::throw_message(&ctx_inner, &err))?;
                 std::fs::write(&expanded, &content)
                     .map_err(|e| Exception::throw_message(&ctx_inner, &e.to_string()))
-            },
-        )?,
+            }
+        })?,
     )?;
 
     fs_obj.set(
         "listDir",
-        Function::new(
-            ctx.clone(),
+        Function::new(ctx.clone(), {
+            let policy = policy.clone();
             move |ctx_inner: Ctx<'_>, path: String| -> rquickjs::Result<Vec<String>> {
-                let expanded = expand_path(&path);
+                let expanded = policy
+                    .resolve(&path, FilesystemOperation::List)
+                    .map_err(|err| Exception::throw_message(&ctx_inner, &err))?;
                 let entries = std::fs::read_dir(&expanded)
                     .map_err(|e| Exception::throw_message(&ctx_inner, &e.to_string()))?;
 
@@ -591,8 +800,8 @@ fn inject_fs<'js>(
                 }
                 names.sort();
                 Ok(names)
-            },
-        )?,
+            }
+        })?,
     )?;
 
     // subscribeFile: register an exact file dependency for the current probe.
@@ -609,8 +818,9 @@ fn inject_fs<'js>(
             if trimmed.is_empty() {
                 return false;
             }
-            let expanded = expand_path(trimmed);
-            let pb = std::path::PathBuf::from(&expanded);
+            let Ok(pb) = policy.resolve(trimmed, FilesystemOperation::Subscribe) else {
+                return false;
+            };
             if pb.as_os_str().is_empty() || pb.parent().is_none() {
                 return false;
             }
@@ -1381,6 +1591,58 @@ fn inject_ls<'js>(ctx: &Ctx<'js>, host: &Object<'js>, plugin_id: &str) -> rquick
     )?;
 
     host.set("ls", ls_obj)?;
+    Ok(())
+}
+
+fn inject_disabled_ls<'js>(ctx: &Ctx<'js>, host: &Object<'js>) -> rquickjs::Result<()> {
+    let ls_obj = Object::new(ctx.clone())?;
+    ls_obj.set(
+        "_discoverRaw",
+        Function::new(ctx.clone(), move |_opts_json: String| "null".to_string())?,
+    )?;
+    host.set("ls", ls_obj)?;
+    Ok(())
+}
+
+fn inject_disabled_ccusage<'js>(ctx: &Ctx<'js>, host: &Object<'js>) -> rquickjs::Result<()> {
+    let ccusage_obj = Object::new(ctx.clone())?;
+    ccusage_obj.set(
+        "_queryRaw",
+        Function::new(ctx.clone(), move |_opts_json: String| {
+            serde_json::json!({ "status": "disabled_in_test_sandbox" }).to_string()
+        })?,
+    )?;
+    host.set("ccusage", ccusage_obj)?;
+    Ok(())
+}
+
+fn inject_disabled_sqlite<'js>(ctx: &Ctx<'js>, host: &Object<'js>) -> rquickjs::Result<()> {
+    let sqlite_obj = Object::new(ctx.clone())?;
+    sqlite_obj.set(
+        "query",
+        Function::new(
+            ctx.clone(),
+            move |ctx_inner: Ctx<'_>, _db_path: String, _sql: String| -> rquickjs::Result<String> {
+                Err(Exception::throw_message(
+                    &ctx_inner,
+                    "sqlite is disabled in the hermetic test sandbox",
+                ))
+            },
+        )?,
+    )?;
+    sqlite_obj.set(
+        "exec",
+        Function::new(
+            ctx.clone(),
+            move |ctx_inner: Ctx<'_>, _db_path: String, _sql: String| -> rquickjs::Result<()> {
+                Err(Exception::throw_message(
+                    &ctx_inner,
+                    "sqlite is disabled in the hermetic test sandbox",
+                ))
+            },
+        )?,
+    )?;
+    host.set("sqlite", sqlite_obj)?;
     Ok(())
 }
 
@@ -2280,13 +2542,17 @@ fn inject_keychain<'js>(
     Ok(())
 }
 
-fn inject_sqlite<'js>(ctx: &Ctx<'js>, host: &Object<'js>) -> rquickjs::Result<()> {
+fn inject_sqlite<'js>(
+    ctx: &Ctx<'js>,
+    host: &Object<'js>,
+    filesystem_policy: FilesystemPolicy,
+) -> rquickjs::Result<()> {
     let sqlite_obj = Object::new(ctx.clone())?;
 
     sqlite_obj.set(
         "query",
-        Function::new(
-            ctx.clone(),
+        Function::new(ctx.clone(), {
+            let filesystem_policy = filesystem_policy.clone();
             move |ctx_inner: Ctx<'_>, db_path: String, sql: String| -> rquickjs::Result<String> {
                 if sql.lines().any(|line| line.trim_start().starts_with('.')) {
                     return Err(Exception::throw_message(
@@ -2294,12 +2560,17 @@ fn inject_sqlite<'js>(ctx: &Ctx<'js>, host: &Object<'js>) -> rquickjs::Result<()
                         "sqlite3 dot-commands are not allowed",
                     ));
                 }
-                let expanded = expand_path(&db_path);
+                let expanded = filesystem_policy
+                    .resolve(&db_path, FilesystemOperation::Read)
+                    .map_err(|err| Exception::throw_message(&ctx_inner, &err))?;
 
                 // Prefer a normal read-only open so WAL contents are visible (common for app state DBs).
                 // Fall back to immutable=1 to bypass WAL/SHM lock issues after macOS sleep.
                 let primary = std::process::Command::new("sqlite3")
-                    .args(["-readonly", "-json", &expanded, &sql])
+                    .arg("-readonly")
+                    .arg("-json")
+                    .arg(&expanded)
+                    .arg(&sql)
                     .stdin(Stdio::null())
                     .output()
                     .map_err(|e| {
@@ -2312,6 +2583,7 @@ fn inject_sqlite<'js>(ctx: &Ctx<'js>, host: &Object<'js>) -> rquickjs::Result<()
 
                 // Percent-encode special chars for valid URI (% must be first!)
                 let encoded = expanded
+                    .to_string_lossy()
                     .replace('%', "%25")
                     .replace(' ', "%20")
                     .replace('#', "%23")
@@ -2339,14 +2611,14 @@ fn inject_sqlite<'js>(ctx: &Ctx<'js>, host: &Object<'js>) -> rquickjs::Result<()
                 }
 
                 Ok(String::from_utf8_lossy(&fallback.stdout).to_string())
-            },
-        )?,
+            }
+        })?,
     )?;
 
     sqlite_obj.set(
         "exec",
-        Function::new(
-            ctx.clone(),
+        Function::new(ctx.clone(), {
+            let filesystem_policy = filesystem_policy.clone();
             move |ctx_inner: Ctx<'_>, db_path: String, sql: String| -> rquickjs::Result<()> {
                 if sql.lines().any(|line| line.trim_start().starts_with('.')) {
                     return Err(Exception::throw_message(
@@ -2354,9 +2626,12 @@ fn inject_sqlite<'js>(ctx: &Ctx<'js>, host: &Object<'js>) -> rquickjs::Result<()
                         "sqlite3 dot-commands are not allowed",
                     ));
                 }
-                let expanded = expand_path(&db_path);
+                let expanded = filesystem_policy
+                    .resolve(&db_path, FilesystemOperation::Write)
+                    .map_err(|err| Exception::throw_message(&ctx_inner, &err))?;
                 let output = std::process::Command::new("sqlite3")
-                    .args([&expanded, &sql])
+                    .arg(&expanded)
+                    .arg(&sql)
                     .stdin(Stdio::null())
                     .output()
                     .map_err(|e| {
@@ -2372,8 +2647,8 @@ fn inject_sqlite<'js>(ctx: &Ctx<'js>, host: &Object<'js>) -> rquickjs::Result<()
                 }
 
                 Ok(())
-            },
-        )?,
+            }
+        })?,
     )?;
 
     host.set("sqlite", sqlite_obj)?;
@@ -2439,6 +2714,200 @@ mod tests {
             "BwcHBwcHBwcHBwcHBwcHBw==:yFbCs4LOJ0aj9NPNf5pfVA==:7PKjtOdATLClvaWrMw0b0M8Nov4KPhxwQX4hdczqQlcZi9Zhi6DjAoK+WolvMwuhPIk=",
             r#"{"access_token":"token","refresh_token":"refresh"}"#,
         )
+    }
+
+    #[test]
+    fn sandbox_policy_allows_in_root_reads_and_writes() {
+        let temp = tempfile::tempdir().expect("create sandbox root");
+        let file = temp.path().join("state.txt");
+        std::fs::write(&file, "inside").expect("write in-root file");
+        let policy = FilesystemPolicy::sandbox(temp.path()).expect("create policy");
+
+        assert_eq!(
+            policy
+                .resolve(file.to_string_lossy().as_ref(), FilesystemOperation::Read)
+                .expect("resolve in-root read"),
+            std::fs::canonicalize(&file).expect("canonical in-root file")
+        );
+        assert_eq!(
+            policy
+                .resolve("new-state.txt", FilesystemOperation::Write,)
+                .expect("resolve in-root write"),
+            temp.path().join("new-state.txt")
+        );
+    }
+
+    #[test]
+    fn sandbox_policy_denies_outside_and_traversal_paths() {
+        let temp = tempfile::tempdir().expect("create sandbox root");
+        let outside = tempfile::NamedTempFile::new().expect("create external sentinel");
+        let policy = FilesystemPolicy::sandbox(temp.path()).expect("create policy");
+
+        for operation in [
+            FilesystemOperation::Read,
+            FilesystemOperation::Write,
+            FilesystemOperation::List,
+            FilesystemOperation::Subscribe,
+        ] {
+            assert!(
+                policy
+                    .resolve(outside.path().to_string_lossy().as_ref(), operation)
+                    .is_err()
+            );
+        }
+        assert!(
+            policy
+                .resolve("../outside.txt", FilesystemOperation::Write)
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_policy_denies_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("create sandbox root");
+        let outside = tempfile::NamedTempFile::new().expect("create external sentinel");
+        let link = temp.path().join("outside-link");
+        let dangling_link = temp.path().join("dangling-outside-link");
+        let outside_parent = tempfile::tempdir().expect("create external parent");
+        symlink(outside.path(), &link).expect("create symlink");
+        symlink(
+            outside_parent.path().join("created-outside.txt"),
+            &dangling_link,
+        )
+        .expect("create dangling symlink");
+        let policy = FilesystemPolicy::sandbox(temp.path()).expect("create policy");
+
+        assert!(
+            policy
+                .resolve(link.to_string_lossy().as_ref(), FilesystemOperation::Read)
+                .is_err()
+        );
+        assert!(
+            policy
+                .resolve(link.to_string_lossy().as_ref(), FilesystemOperation::Write)
+                .is_err()
+        );
+        assert!(
+            policy
+                .resolve(
+                    dangling_link.to_string_lossy().as_ref(),
+                    FilesystemOperation::Write
+                )
+                .is_err()
+        );
+        assert!(
+            policy
+                .resolve(
+                    link.join("missing.json").to_string_lossy().as_ref(),
+                    FilesystemOperation::Subscribe
+                )
+                .is_err()
+        );
+        assert!(
+            policy
+                .resolve(
+                    link.join("missing.json").to_string_lossy().as_ref(),
+                    FilesystemOperation::List
+                )
+                .is_err()
+        );
+        assert!(!outside_parent.path().join("created-outside.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(outside.path()).unwrap_or_default(),
+            ""
+        );
+    }
+
+    #[test]
+    fn sandboxed_host_fs_denies_outside_operations_without_touching_sentinel() {
+        let sandbox = tempfile::tempdir().expect("create sandbox root");
+        let sentinel = tempfile::NamedTempFile::new().expect("create external sentinel");
+        std::fs::write(sentinel.path(), "do not change").expect("seed external sentinel");
+        let policy = FilesystemPolicy::sandbox(sandbox.path()).expect("create policy");
+        let sentinel_json = serde_json::to_string(&sentinel.path().to_string_lossy())
+            .expect("serialize sentinel path");
+
+        let rt = Runtime::new().expect("runtime");
+        let ctx = Context::full(&rt).expect("context");
+        ctx.with(|ctx| {
+            let host = Object::new(ctx.clone()).expect("host object");
+            inject_fs(
+                &ctx,
+                &host,
+                Arc::new(Mutex::new(Vec::new())),
+                policy,
+            )
+            .expect("inject sandboxed fs");
+            ctx.globals()
+                .set("__test_host", host)
+                .expect("install host object");
+
+            let denied: bool = ctx
+                .eval(
+                    format!(
+                        r#"
+                        (function() {{
+                            var path = {sentinel_json};
+                            if (__test_host.fs.exists(path)) return false;
+                            try {{ __test_host.fs.readText(path); return false; }} catch (_) {{}}
+                            try {{ __test_host.fs.writeText(path, "changed"); return false; }} catch (_) {{}}
+                            try {{ __test_host.fs.listDir(path); return false; }} catch (_) {{}}
+                            if (__test_host.fs.subscribeFile(path)) return false;
+                            try {{ __test_host.fs.writeText("../outside.txt", "changed"); return false; }} catch (_) {{}}
+                            return true;
+                        }})()
+                        "#
+                    ),
+                )
+                .expect("evaluate sandbox assertions");
+            assert!(denied, "all outside filesystem operations must be denied");
+        });
+
+        assert_eq!(
+            std::fs::read_to_string(sentinel.path()).expect("read external sentinel"),
+            "do not change"
+        );
+    }
+
+    #[test]
+    fn sandboxed_host_disables_external_state_bridges() {
+        let sandbox = tempfile::tempdir().expect("create sandbox root");
+        let app_data = sandbox.path().join("app-data");
+        std::fs::create_dir_all(&app_data).expect("create app data");
+
+        let rt = Runtime::new().expect("runtime");
+        let ctx = Context::full(&rt).expect("context");
+        ctx.with(|ctx| {
+            inject_host_api_in_sandbox(
+                &ctx,
+                "test",
+                &app_data,
+                "0.0.0-test",
+                Arc::new(Mutex::new(Vec::new())),
+                sandbox.path(),
+            )
+            .expect("inject sandboxed host");
+
+            let disabled: bool = ctx
+                .eval(
+                    r#"
+                    (function() {
+                        var host = __openusage_ctx.host;
+                        if (host.keychain !== undefined) return false;
+                        if (host.ls._discoverRaw("{}") !== "null") return false;
+                        if (JSON.parse(host.ccusage._queryRaw("{}")).status !== "disabled_in_test_sandbox") return false;
+                        try { host.sqlite.query("/tmp/outside.db", "SELECT 1"); return false; } catch (_) {}
+                        try { host.sqlite.exec("/tmp/outside.db", "VACUUM"); return false; } catch (_) {}
+                        return true;
+                    })()
+                    "#,
+                )
+                .expect("evaluate sandbox bridge assertions");
+            assert!(disabled, "sandbox must disable bridges that can reach user state");
+        });
     }
 
     #[test]
@@ -3463,11 +3932,11 @@ mod tests {
             since: None,
             until: None,
             home_path: None,
-            claude_path: Some("/tmp/legacy-claude-path".to_string()),
+            claude_path: Some("/tmp/claude-path".to_string()),
         };
         assert_eq!(
             ccusage_home_override(&claude_compat, CcusageProvider::Claude),
-            Some("/tmp/legacy-claude-path")
+            Some("/tmp/claude-path")
         );
         assert_eq!(
             ccusage_home_override(&claude_compat, CcusageProvider::Codex),

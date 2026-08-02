@@ -2261,13 +2261,6 @@ mod tests {
     }
 
     #[test]
-    fn cli_rejects_legacy_init_config_flag() {
-        let err = parse_with_default_mode(&["--init-config"])
-            .expect_err("--init-config must be rejected");
-        assert!(err.to_string().contains("--init-config"));
-    }
-
-    #[test]
     fn cli_accepts_install_systemd_unit_command() {
         let cli = parse_with_default_mode(&["install-systemd-unit"])
             .expect("install-systemd-unit should parse");

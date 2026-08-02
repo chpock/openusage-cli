@@ -45,7 +45,7 @@ For daemon operation patterns (standalone vs systemd), see [daemon-modes.md](dae
 
 ## Command reference
 
-- `query`: one-shot JSON output (`--type=usage|plugins`)
+- `query`: one-shot JSON output (`--type=usage|plugins|config`)
 - `run-daemon`: start daemon mode
 - `show-default-config`: print default `config.yaml` template
 - `install-systemd-unit`: create `~/.config/systemd/user/openusage-cli.service`
@@ -73,7 +73,12 @@ Runtime flags (`query`, `run-daemon`):
 
 - `--host <host>` (default: `127.0.0.1`)
 - `--port <port>` (default: `0`)
-- `--refresh-interval-secs <seconds>` (default: `300`)
+- `--refresh-interval-secs <seconds>` (default: `180`)
+- `--aggressive-refresh-interval-secs <seconds>` (default: `10`)
+
+  When a provider plan includes a `resetAt` timestamp, the daemon switches to the
+  aggressive interval for that provider after the reset time is reached, polling
+  more frequently so the new quota snapshot is available promptly.
 - `--existing-instance <error|ignore|replace>` (default: `error`)
 - `--service-mode <standalone|systemd>` (default: `standalone`)
 - `--foreground[=true|false]` (`--foreground` means `true`, default: `false`)
@@ -111,45 +116,45 @@ http://127.0.0.1:6738
     "fetchedAt": "2026-07-30T12:00:00Z",
     "account": {
       "id": "default",
-      "displayName": "default"
+      "origin": "native"
     }
   }
   ```
 
   The `account` object is present on every usage snapshot. Account IDs are
-  provider-scoped — each provider defines its own account namespace. Current
-  providers always return `"id": "default"`.
+  provider-scoped — each provider defines its own account namespace. Most
+  providers return only `"id": "default"`. The bundled Codex and Copilot
+  overrides may additionally return stable `"opencode-<path-index>"` accounts.
 
-  ### Plugin return contract (legacy mode)
+  **`origin` field:** Every account object carries an `origin` string that
+  identifies the credential source:
+
+  - `"native"` — credentials supplied by the original plugin (no override active).
+  - `"opencode"` — current Codex and Copilot override accounts that read from
+    OpenCode auth files.
+  - Future releases may introduce additional source identifiers (e.g.
+    `"jetbrains"`, `"vscode"`).
+
+  The `origin` is assigned by the runtime based on the account descriptor or
+  override context. It is preserved unchanged through the daemon cache and
+  serialized API responses.
+
+  When a discovery account has `errorPolicy: "hide-if-other-account"` and at
+  least one other account descriptor exists, policy-suppressed probe failures
+  (context construction errors, probe exceptions, promise rejections, and
+  invalid returned probe objects/lines) are intentionally omitted from output.
+  Non-policy errors and unmarked account failures are always included.
+
+  ### Plugin return contract (single-account mode)
 
   The following applies when the plugin does not export `discoverAccounts`
-  (legacy single-probe mode). For discovery mode, see
+  (single-account mode). For discovery mode, see
   [Multi-account discovery](#multi-account-discovery).
 
-  A plugin may return an `account` object inside its probe result alongside
-  `plan` and `lines`:
-
-  ```js
-  {
-    account: { id: "my-account", displayName: "My Account" },
-    plan: "Pro plan",
-    lines: [/* ... */]
-  }
-  ```
-
-  - If `account` is absent, `null`, or `undefined`, the runtime assigns
-    `{ id: "default", displayName: "default" }`.
-  - If `account` is present, it must be an object with a non-empty string
-    `id` and a non-empty string `displayName`. Any violation (non-object,
-    missing field, empty string, or an accessor that throws) produces a
-    provider-level error output with the default account.
-  - Provider-level error snapshots (runtime failures, script errors,
-    validation failures) always carry the default account.
-  - The returned `account` value is preserved unchanged through the runtime
-    output, daemon cache, and serialized API responses.
-
-  In discovery mode, host identity is authoritative and account-probe
-  errors retain the discovered account (see below).
+  The account identity is not determined by the probe result. The runtime
+  assigns `{ id: "default", origin: "native" }` on every output. The probe
+  returns only `plan` and `lines` — any `account` field in the probe result
+  is ignored.
 
   ### Multi-account discovery
 
@@ -164,8 +169,8 @@ http://127.0.0.1:6738
     probe(ctx) { /* ... */ },
     discoverAccounts(ctx) {
       return [
-        { id: "work", displayName: "Work Account" },
-        { id: "personal", displayName: "Personal Account" }
+        { id: "work", origin: "native" },
+        { id: "personal" }
       ];
     }
   }
@@ -173,38 +178,44 @@ http://127.0.0.1:6738
 
   **Capability detection:** `discoverAccounts` is detected only after the
   plugin script and any override script are evaluated. If absent, `null`,
-  or `undefined`, the runtime uses legacy single-probe mode with the
+  or `undefined`, the runtime uses single-account mode with the
   default account.
 
   If the `discoverAccounts` property accessor throws an exception (e.g. a
   Proxy trap), the runtime produces a single provider-level error output
-  with the default account — it does not fall back to legacy mode.
+  with the default account — it does not fall back to single-account mode.
 
   **Account context:** Each discovered account receives a child context
   that inherits from the base `__openusage_ctx`. The `ctx.account` object
-  has immutable `id` and `displayName` fields matching the discovered
-  descriptor. In legacy mode, the probe receives a child context with
-  `ctx.account = { id: "default", displayName: "default" }` whose identity
-  fields are similarly immutable.
+  has an immutable `id` field matching the discovered descriptor. The
+  `origin` field is **not** exposed on `ctx.account` — it is a runtime
+  output annotation only. In single-account mode, the probe receives a child
+  context with `ctx.account = { id: "default" }` whose identity field is
+  similarly immutable.
 
   **Validation:** The returned array must contain 0–32 items. Each item
-  must be an object with a non-empty string `id` (unique within the array)
-  and a non-empty string `displayName`. Violations (non-array, missing or
-  empty fields, duplicate ids, over 32 items, or an exception) produce a
-  single provider-level error output with the default account.
+  must be an object with a non-empty string `id` (unique within the array).
+  An optional `errorPolicy` field may be set to `"hide-if-other-account"`
+  (see [Discovery error policy](plugin-overrides.md#discovery-error-policy)). An
+  optional `origin` string may be provided; if absent, the runtime assigns
+  `"native"` as the default. Violations (non-array, missing or empty id,
+  duplicate ids, invalid errorPolicy, over 32 items, or an exception)
+  produce a single provider-level error output with the default account.
 
   **Empty list:** A valid empty array produces zero outputs for that
   provider, clearing any previously cached snapshots.
 
-  **Host-authoritative identity:** In discovery mode, if the probe result
-  omits `account`, sets it to `null`/`undefined`, or returns an explicit
-  `{id:"default",displayName:"default"}`, the runtime assigns the
-  discovered account. If the probe returns an explicit `account` that
-  differs in either `id` or `displayName`, the runtime produces an
-  account-specific error carrying the discovered identity.
+  **Host-authoritative identity:** In discovery mode, the runtime assigns
+  account identity from the discovered descriptor (including `origin`). The
+  probe result's `account` field is ignored and never used to override,
+  validate, or reject discovered identity.
 
   **Failure isolation:** A per-account probe failure produces an error
   snapshot carrying that account's identity. Other accounts are unaffected.
+  However, when a discovery account has `errorPolicy: "hide-if-other-account"`
+  and at least one other account descriptor exists, the policy-suppressed
+  failure snapshot is intentionally omitted from output (see
+  [Discovery error policy](plugin-overrides.md#discovery-error-policy)).
 
   **Subscriptions:** All `subscribeFile` calls during `discoverAccounts`
   and each account probe are collected into a single provider-level set.
@@ -215,8 +226,18 @@ http://127.0.0.1:6738
   provider's entire cache vector. A valid empty discovery list clears the
   provider's cached snapshots.
 
-  > No bundled plugin has adopted `discoverAccounts` yet. This is a
-  > forward-looking capability for multi-account provider support.
+  Vendored plugins do not natively implement `discoverAccounts`, but the
+  bundled Codex and Copilot overrides add it. Alongside `default`, they inspect
+  these OpenCode auth candidates in stable path-index order:
+
+  1. `~/.local/share/opencode/auth.json` → `opencode-0`
+  2. `~/.config/opencode/auth.json` → `opencode-1`
+
+  A missing candidate file or provider key omits that account. An unreadable or
+  malformed candidate produces an account-specific error. Only `default` has
+  the `hide-if-other-account` policy; OpenCode account errors remain visible.
+  An OpenCode account uses only its selected source and never falls back to a
+  different OpenCode file or native credentials.
 
   Future multi-account providers will add additional items with the same
   `providerId` and a distinct account `id`. The collection remains a flat
@@ -236,6 +257,7 @@ http://127.0.0.1:6738
   3. Otherwise, `204 No Content` (multiple non-default accounts — account
      selection is deferred; a future account selector will resolve this).
 
+- `GET /v1/config`: return the daemon's active runtime configuration (host, port, refresh intervals, enabled plugins, etc.).
 - `POST /v1/probe`: force refresh. Optional JSON body:
 
   ```json

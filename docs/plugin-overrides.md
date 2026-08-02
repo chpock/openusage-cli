@@ -7,8 +7,9 @@ Use plugin overrides to customize plugin behavior without editing `vendor/*`.
 Source checkout default lookup:
 
 1. `<repo_root>/plugin-overrides`
-2. `<executable_dir>/plugin-overrides`
-3. packaged paths
+2. `<cwd>/plugin-overrides`
+3. `<executable_dir>/plugin-overrides`
+4. packaged paths
 
 Installed binary lookup:
 
@@ -30,81 +31,105 @@ Override scripts run after plugin code and get `globalThis.__openusage_override`
 - `pluginId`
 - `originalProbe(ctx)`
 - `replaceProbe((ctx, originalProbe) => ...)`
-- `wrapProbe((ctx, currentProbe, originalProbe) => ...)`
+- `wrapProbe((ctx, previousProbe, originalProbe) => ...)`
 - `resetProbe()`
 
-### Discovery helpers (optional)
+### Discovery helpers (reference)
 
 When a plugin exports `discoverAccounts(ctx)`, the runtime calls it to
-determine which accounts to probe. Override scripts can intercept this
-with the following helpers. The discovery function receives the base
+determine which accounts to probe. The discovery function receives the base
 context (without `ctx.account`). Account descriptors are returned in
 array order; that order is preserved throughout probing and cache
 storage. The function may return a Promise for async discovery.
 
-The core stores only public account identity (`id`, `displayName`).
-It never stores credentials or provider-specific metadata.
+The core stores only public account identity (`id` and `origin`).
+It never stores credentials, provider-specific metadata, or internal
+discovery fields such as `errorPolicy`.
 
 - `originalDiscoverAccounts` — the original bound function, or `null` if
-  the plugin had none.
-- `replaceDiscoverAccounts((ctx, originalDiscoverAccounts) => [...])` —
-  may add discovery to a legacy plugin that lacks it. The replacement
-  receives the base context and the original (or `null`) and must return
-  an array of account descriptors.
-- `wrapDiscoverAccounts((ctx, currentDiscoverAccounts, originalDiscoverAccounts) => [...])` —
-  requires a current discovery function (native or previously replaced).
-  The wrapper receives the base context, the current (bound) function,
-  and the original (or `null`). Throws if no current discovery function
-  exists.
-- `resetDiscoverAccounts()` — restores the original discovery method;
-  if none originally existed, removes the method added by the override.
-
-### Discovery helper examples
-
-```js
-// Add discovery to a legacy plugin
-globalThis.__openusage_override.replaceDiscoverAccounts(function(ctx, original) {
-  return [{ id: "work", displayName: "Work Account" }];
-});
-
-// Wrap native discovery to append an account
-globalThis.__openusage_override.wrapDiscoverAccounts(async function(ctx, current, original) {
-  var accounts = await current(ctx);
-  accounts.push({ id: "extra", displayName: "Extra Account" });
-  return accounts;
-});
-```
+  the plugin had none. This is a read-only reference; to replace
+  discoverAccounts, use the
+  [Declarative function overrides](#declarative-function-overrides)
+  manifest instead.
 
 ### Account context
 
 In discovery mode, each discovered account gets a fresh child context
-inheriting from the base `__openusage_ctx`. Its `ctx.account.id` and
-`ctx.account.displayName` fields are immutable and match the discovered
-account descriptor.
+inheriting from the base `__openusage_ctx`. Its `ctx.account.id` field
+is immutable and matches the discovered account descriptor. The `origin`
+field is **not** exposed on `ctx.account` — it is a runtime output
+annotation only.
 
-In legacy mode (no `discoverAccounts`), the probe still receives a child
-context with `ctx.account = { id: "default", displayName: "default" }`
-whose identity fields are immutable.
+In single-account mode (no `discoverAccounts`), the probe still receives a child
+context with `ctx.account = { id: "default" }` whose identity field is
+immutable.
 
-### Error handling
+### Account descriptor fields
+
+Account descriptors returned by `discoverAccounts` support the following
+fields:
+
+- `id` (required, non-empty string) — unique account identifier within the
+  provider.
+- `origin` (optional string) — identifies the credential source. If absent,
+  the runtime assigns `"native"` as the default. Known values:
+  - `"native"` — credentials supplied by the original plugin (no override active).
+  - `"opencode"` — OpenCode auth file credentials (Codex/Copilot overrides).
+  - Future releases may introduce additional identifiers.
+- `errorPolicy` (optional string) — controls error suppression behavior
+  (see [Discovery error policy](#discovery-error-policy)).
+
+### Discovery error policy
+
+Account descriptors may include an optional `errorPolicy` field that
+controls error suppression behavior. This field is **never serialized**
+into account output, cache, API responses, or `ctx.account`. It is a
+private runtime directive only.
+
+Supported values:
+
+- `"hide-if-other-account"` — if this account's probe fails and the
+  discovery yielded at least one other account descriptor, the error
+  snapshot is suppressed. If it succeeds, the result is retained. If
+  no other descriptors exist, the error is retained.
+- Any other string value or a non-string value is a discovery validation
+  error and produces a provider-level error output.
+
+Example:
+
+```js
+discoverAccounts(ctx) {
+  return [
+    { id: "primary" },
+    { id: "secondary", errorPolicy: "hide-if-other-account" }
+  ];
+}
+```
+
+Override authors should use this policy for optional credential sources
+whose failure should not produce visible errors when other sources are
+available.
 
 - If the `discoverAccounts` property accessor throws an exception (e.g.
   a Proxy trap), the runtime produces a single provider-level error
-  output with the default account — it does not fall back to legacy mode.
+  output with the default account — it does not fall back to single-account mode.
 - If `discoverAccounts` is present but not a function, the runtime
   produces a single provider-level error output with the default account.
 - If `discoverAccounts` throws or returns a non-array, the runtime
   produces a single provider-level error output.
-- If `discoverAccounts` returns descriptors with missing/empty fields,
-  duplicate ids, or exceeds 32 entries, the runtime produces a single
-  provider-level error output.
+- If `discoverAccounts` returns descriptors with missing/empty id,
+  duplicate ids, invalid errorPolicy, or exceeds 32 entries, the runtime
+  produces a single provider-level error output.
 - A valid empty array produces zero outputs (no probe calls).
 - Per-account probe failures produce an error snapshot carrying that
-  account's identity; other accounts are unaffected.
-- In discovery mode, the probe's returned `account` must match the
-  discovered account identity (absent/null/undefined/explicit default means
-  the discovered account). A mismatch in either id or displayName produces
-  an account-specific error carrying the discovered identity.
+  account's identity; other accounts are unaffected. When a discovery
+  account has `errorPolicy: "hide-if-other-account"` and at least one
+  other account descriptor exists, the policy-suppressed failure snapshot
+  is intentionally omitted from output (see
+  [Discovery error policy](#discovery-error-policy)).
+- In discovery mode, account identity is host-authoritative and comes from the
+  discovered descriptor. The probe's returned `account` field is ignored and
+  never used for identity validation.
 
 ### Subscriptions
 
@@ -117,14 +142,15 @@ sent once per provider with the unioned subscriptions.
 
 Each provider refresh atomically replaces that provider's entire cache
 vector. A valid empty discovery list clears the provider's cached
-snapshots. No bundled plugin has adopted `discoverAccounts` yet.
+snapshots. The bundled Codex and Copilot overrides use `discoverAccounts`
+for multi-account discovery alongside the single default account.
 
 ## Example wrapper
 
 ```js
 // plugin-overrides/codex.js
-globalThis.__openusage_override.wrapProbe(function (ctx, currentProbe) {
-  return currentProbe(ctx)
+globalThis.__openusage_override.wrapProbe(function (ctx, previousProbe, originalProbe) {
+  return previousProbe(ctx)
 })
 ```
 
@@ -140,13 +166,59 @@ globalThis.__openusage_ast_patch = {
   ],
 }
 
-function patchLoadAuth(original, ctx) {
-  return original(ctx)
+function patchLoadAuth(originalLoadAuth, ctx) {
+  return originalLoadAuth(ctx)
 }
 
-function patchSaveAuth(original, ctx, authState) {
-  return original(ctx, authState)
+function patchSaveAuth(originalSaveAuth, ctx, authState) {
+  return originalSaveAuth(ctx, authState)
 }
 ```
 
 When patching is applied, original functions are renamed to `__openusage_original_<target>`.
+
+For `mode: "wrap"`, the callback receives the renamed original function as its first
+argument, followed by the target function's original arguments. For `mode: "replace"`,
+the callback receives only the target function's original arguments. The `with` value
+must name a callback available as `globalThis[with]` when the patched function runs.
+
+`globalThis.__openusage_override` remains available for normal override helpers such as
+`originalProbe`, `replaceProbe`, `wrapProbe`, and `resetProbe`.
+
+## Declarative function overrides
+
+Override scripts may declare function replacements declaratively via
+`globalThis.__openusage_function_overrides`, placed alongside
+`__openusage_ast_patch`. The manifest is processed after override evaluation
+and uses the existing specific discovery override mechanism under the hood.
+
+```js
+globalThis.__openusage_function_overrides = {
+  functions: [
+    { target: "discoverAccounts", with: "discoverAccounts", mode: "replace" }
+  ]
+};
+```
+
+**Whitelist:** The manifest currently accepts only the following values.
+Invalid descriptors produce a visible error at startup:
+
+| Field    | Allowed values               |
+|----------|------------------------------|
+| `target` | `"discoverAccounts"`         |
+| `mode`   | `"replace"`                  |
+| `with`   | any callable global function |
+
+**Processing behavior:**
+
+- **Absent manifest** (`null`, `undefined`, or missing): no-op.
+- **Malformed manifest** (missing `functions` field, non-object, non-array):
+  fails with a detailed error.
+- **Invalid `target`** (anything other than `"discoverAccounts"`): fails with a
+  visible error.
+- **Invalid `mode`** (anything other than `"replace"`): fails with a visible error.
+- **Missing or non-callable `with` reference**: fails with a visible error.
+
+Each valid entry installs the named `with` function as the `discoverAccounts`
+replacement. The callback receives `(ctx, originalDiscoverAccounts)` — matching
+the existing override contract.

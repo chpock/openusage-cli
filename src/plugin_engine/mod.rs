@@ -1,8 +1,9 @@
 pub mod host_api;
 pub mod manifest;
+pub(crate) mod override_api;
+pub mod override_lifecycle;
 pub mod runtime;
 pub mod script_patch;
-
 use manifest::LoadedPlugin;
 use std::path::{Path, PathBuf};
 

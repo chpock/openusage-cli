@@ -1,6 +1,6 @@
 use crate::plugin_engine::host_api;
 use crate::plugin_engine::manifest::LoadedPlugin;
-use crate::plugin_engine::script_patch;
+use crate::plugin_engine::override_lifecycle;
 use rquickjs::object::Property;
 use rquickjs::{Array, Context, Ctx, Error, Object, Runtime, Value};
 use serde::{Deserialize, Serialize};
@@ -67,7 +67,7 @@ impl fmt::Display for MetricLine {
 #[serde(rename_all = "camelCase")]
 pub struct AccountRef {
     pub id: String,
-    pub display_name: String,
+    pub origin: String,
 }
 
 impl AccountRef {
@@ -75,7 +75,7 @@ impl AccountRef {
     pub fn default_account() -> Self {
         Self {
             id: "default".to_string(),
-            display_name: "default".to_string(),
+            origin: "native".to_string(),
         }
     }
 }
@@ -105,7 +105,7 @@ pub use crate::restart_watcher::FileSubscription;
 /// be declared during plugin entry script evaluation, override evaluation,
 /// or the probe/discovery call itself.
 ///
-/// In legacy mode (no `discoverAccounts`), `outputs` contains one item.
+/// In single-account mode (no `discoverAccounts`), `outputs` contains one item.
 /// In discovery mode, `outputs` contains one item per discovered account
 /// (or zero for an empty valid discovery list, or one error output on
 /// discovery failure).
@@ -113,6 +113,238 @@ pub use crate::restart_watcher::FileSubscription;
 pub struct ProbeResult {
     pub outputs: Vec<PluginOutput>,
     pub subscriptions: Vec<FileSubscription>,
+}
+
+/// Execute a provider probe within a sandboxed environment.
+///
+/// Creates a QuickJS runtime, injects host API with sandboxed filesystem
+/// access (rooted at `sandbox_root`), runs the override lifecycle, and
+/// performs discovery/probe as normal.
+///
+/// This is a convenience wrapper for integration tests that need real
+/// filesystem access within a restricted sandbox.
+pub fn run_probe_in_sandbox(
+    plugin: &LoadedPlugin,
+    app_data_dir: &Path,
+    app_version: &str,
+    plugin_overrides_dir: Option<&Path>,
+    sandbox_root: &Path,
+) -> ProbeResult {
+    let subs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let fallback_subs = Arc::clone(&subs);
+    let fallback = ProbeResult {
+        outputs: vec![error_output(plugin, "runtime error".to_string())],
+        subscriptions: std::mem::take(&mut *fallback_subs.lock().unwrap()),
+    };
+
+    let rt = match Runtime::new() {
+        Ok(rt) => rt,
+        Err(_) => return fallback,
+    };
+
+    let ctx = match Context::full(&rt) {
+        Ok(ctx) => ctx,
+        Err(_) => return fallback,
+    };
+
+    let plugin_id = plugin.manifest.id.clone();
+    let override_script = match load_plugin_override(plugin, plugin_overrides_dir) {
+        Ok(value) => value,
+        Err(err) => {
+            return ProbeResult {
+                outputs: vec![error_output(
+                    plugin,
+                    format!("plugin override failed: {}", err),
+                )],
+                subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
+            };
+        }
+    };
+
+    let override_source = override_script
+        .as_ref()
+        .map(|loaded| loaded.script.as_str());
+
+    ctx.with(|ctx| {
+        let subs_pass = Arc::clone(&subs);
+        if host_api::inject_host_api_in_sandbox(
+            &ctx,
+            &plugin_id,
+            app_data_dir,
+            app_version,
+            subs_pass,
+            sandbox_root,
+        )
+        .is_err()
+        {
+            return ProbeResult {
+                outputs: vec![error_output(
+                    plugin,
+                    "host api injection failed".to_string(),
+                )],
+                subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
+            };
+        }
+
+        if host_api::inject_utils(&ctx).is_err() {
+            return ProbeResult {
+                outputs: vec![error_output(plugin, "utils injection failed".to_string())],
+                subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
+            };
+        }
+
+        execute_provider_in_context(&ctx, plugin, override_source, &subs, None, None)
+    })
+}
+///
+/// This is the production probe path used by the test harness. It:
+/// 1. Runs the override lifecycle (AST transform + plugin eval + override bootstrap/eval)
+/// 2. Looks up `__openusage_plugin` and `probe`
+/// 3. Checks for `discoverAccounts` capability
+/// 4. Runs single-account or discovery-mode probe
+/// 5. Returns the result with collected subscriptions
+///
+/// The caller is responsible for host API injection and context setup.
+/// Optional `before_plugin` and `after_lifecycle` hooks are forwarded to
+/// `override_lifecycle::run_lifecycle`.
+#[allow(clippy::type_complexity)]
+pub fn execute_provider_in_context<'js>(
+    ctx: &Ctx<'js>,
+    plugin: &LoadedPlugin,
+    override_script: Option<&str>,
+    subs: &Arc<std::sync::Mutex<Vec<FileSubscription>>>,
+    before_plugin: Option<&dyn Fn(&Ctx<'_>) -> Result<(), override_lifecycle::JsError>>,
+    after_lifecycle: Option<&dyn Fn(&Ctx<'_>) -> Result<(), override_lifecycle::JsError>>,
+) -> ProbeResult {
+    let plugin_id = &plugin.manifest.id;
+    let display_name = &plugin.manifest.name;
+    let icon_url = &plugin.icon_data_url;
+
+    // Run the override lifecycle (AST transform + plugin eval + override bootstrap/eval).
+    let lifecycle_script = match override_lifecycle::run_lifecycle(
+        ctx,
+        plugin_id,
+        &plugin.entry_script,
+        override_script,
+        before_plugin,
+        after_lifecycle,
+    ) {
+        Ok(result) => {
+            if !result.patched_functions.is_empty() {
+                log::info!(
+                    "[plugin:{}] AST patch applied: {}",
+                    plugin_id,
+                    result.patched_functions.join(",")
+                );
+            }
+            result.script
+        }
+        Err(err) => {
+            let user_msg = match &err {
+                override_lifecycle::OverrideLifecycleError::Transform(e) => {
+                    format!("script transform failed: {}", e)
+                }
+                override_lifecycle::OverrideLifecycleError::PluginEval(e) => {
+                    format!("script eval failed: {}", e)
+                }
+                override_lifecycle::OverrideLifecycleError::OverrideApiInject(e) => {
+                    format!("plugin override failed: {}", e)
+                }
+                override_lifecycle::OverrideLifecycleError::OverrideEval(e) => {
+                    format!("plugin override failed: {}", e)
+                }
+                override_lifecycle::OverrideLifecycleError::OverrideManifest(e) => {
+                    format!("plugin override failed: {}", e)
+                }
+                override_lifecycle::OverrideLifecycleError::Hook(e) => {
+                    format!("lifecycle hook error: {}", e)
+                }
+            };
+            return ProbeResult {
+                outputs: vec![error_output(plugin, user_msg)],
+                subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
+            };
+        }
+    };
+    // Keep `lifecycle_script` alive for the duration of the function
+    // so the allocated String isn't dropped before we're done with ctx.
+    let _ = lifecycle_script;
+
+    let globals = ctx.globals();
+    let plugin_obj: Object = match globals.get("__openusage_plugin") {
+        Ok(obj) => obj,
+        Err(_) => {
+            return ProbeResult {
+                outputs: vec![error_output(
+                    plugin,
+                    "missing __openusage_plugin".to_string(),
+                )],
+                subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
+            };
+        }
+    };
+
+    let probe_fn: rquickjs::Function = match plugin_obj.get("probe") {
+        Ok(f) => f,
+        Err(_) => {
+            return ProbeResult {
+                outputs: vec![error_output(plugin, "missing probe()".to_string())],
+                subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
+            };
+        }
+    };
+
+    let base_ctx: Value = globals
+        .get("__openusage_ctx")
+        .unwrap_or_else(|_| Value::new_undefined(ctx.clone()));
+
+    // Check for discoverAccounts capability (after override is applied).
+    let discover_val: Value = match plugin_obj.get("discoverAccounts") {
+        Ok(v) => v,
+        Err(_) => {
+            return ProbeResult {
+                outputs: vec![error_output(
+                    plugin,
+                    "discoverAccounts accessor threw an exception".to_string(),
+                )],
+                subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
+            };
+        }
+    };
+
+    if discover_val.is_function() {
+        let discover_fn: rquickjs::Function = discover_val.into_function().unwrap();
+        run_discovery_mode(
+            ctx,
+            plugin,
+            &probe_fn,
+            &discover_fn,
+            &base_ctx,
+            subs,
+            plugin_id,
+            display_name,
+            icon_url,
+        )
+    } else if discover_val.is_null() || discover_val.is_undefined() {
+        run_single_account_probe(
+            ctx,
+            plugin,
+            &probe_fn,
+            &base_ctx,
+            subs,
+            plugin_id,
+            display_name,
+            icon_url,
+        )
+    } else {
+        ProbeResult {
+            outputs: vec![error_output(
+                plugin,
+                "discoverAccounts must be a function or absent".to_string(),
+            )],
+            subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
+        }
+    }
 }
 
 pub fn run_probe(
@@ -139,7 +371,7 @@ pub fn run_probe(
     };
 
     let plugin_id = plugin.manifest.id.clone();
-    let display_name = plugin.manifest.name.clone();
+    let app_data = app_data_dir.to_path_buf();
     let override_script = match load_plugin_override(plugin, plugin_overrides_dir) {
         Ok(value) => value,
         Err(err) => {
@@ -153,35 +385,9 @@ pub fn run_probe(
         }
     };
 
-    let entry_script = match script_patch::transform_plugin_script(
-        &plugin_id,
-        &plugin.entry_script,
-        override_script
-            .as_ref()
-            .map(|loaded| loaded.script.as_str()),
-    ) {
-        Ok(result) => {
-            if !result.patched_functions.is_empty() {
-                log::info!(
-                    "[plugin:{}] AST patch applied: {}",
-                    plugin_id,
-                    result.patched_functions.join(",")
-                );
-            }
-            result.script
-        }
-        Err(err) => {
-            return ProbeResult {
-                outputs: vec![error_output(
-                    plugin,
-                    format!("script transform failed: {}", err),
-                )],
-                subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
-            };
-        }
-    };
-    let icon_url = plugin.icon_data_url.clone();
-    let app_data = app_data_dir.to_path_buf();
+    let override_source = override_script
+        .as_ref()
+        .map(|loaded| loaded.script.as_str());
 
     ctx.with(|ctx| {
         let subs_pass = Arc::clone(&subs);
@@ -225,111 +431,13 @@ pub fn run_probe(
             };
         }
 
-        if ctx.eval::<(), _>(entry_script.as_bytes()).is_err() {
-            return ProbeResult {
-                outputs: vec![error_output(plugin, "script eval failed".to_string())],
-                subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
-            };
-        }
-
-        if let Err(err) = apply_plugin_override(&ctx, &plugin_id, override_script.as_ref()) {
-            return ProbeResult {
-                outputs: vec![error_output(
-                    plugin,
-                    format!("plugin override failed: {}", err),
-                )],
-                subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
-            };
-        }
-
-        let globals = ctx.globals();
-        let plugin_obj: Object = match globals.get("__openusage_plugin") {
-            Ok(obj) => obj,
-            Err(_) => {
-                return ProbeResult {
-                    outputs: vec![error_output(
-                        plugin,
-                        "missing __openusage_plugin".to_string(),
-                    )],
-                    subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
-                };
-            }
-        };
-
-        let probe_fn: rquickjs::Function = match plugin_obj.get("probe") {
-            Ok(f) => f,
-            Err(_) => {
-                return ProbeResult {
-                    outputs: vec![error_output(plugin, "missing probe()".to_string())],
-                    subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
-                };
-            }
-        };
-
-        let base_ctx: Value = globals
-            .get("__openusage_ctx")
-            .unwrap_or_else(|_| Value::new_undefined(ctx.clone()));
-
-        // Check for discoverAccounts capability (after override is applied).
-        // Only absent/null/undefined selects legacy mode.
-        // An accessor-thrown exception produces a provider error output.
-        let discover_val: Value = match plugin_obj.get("discoverAccounts") {
-            Ok(v) => v,
-            Err(_) => {
-                return ProbeResult {
-                    outputs: vec![error_output(
-                        plugin,
-                        "discoverAccounts accessor threw an exception".to_string(),
-                    )],
-                    subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
-                };
-            }
-        };
-
-        if discover_val.is_null() || discover_val.is_undefined() {
-            return run_legacy_probe(
-                &ctx,
-                plugin,
-                &probe_fn,
-                &base_ctx,
-                &subs,
-                &plugin_id,
-                &display_name,
-                &icon_url,
-            );
-        }
-
-        // discoverAccounts is present — must be a function.
-        let discover_fn: rquickjs::Function = match discover_val.into_function() {
-            Some(f) => f,
-            None => {
-                return ProbeResult {
-                    outputs: vec![error_output(
-                        plugin,
-                        "discoverAccounts must be a function".to_string(),
-                    )],
-                    subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
-                };
-            }
-        };
-
-        run_discovery_mode(
-            &ctx,
-            plugin,
-            &probe_fn,
-            &discover_fn,
-            &base_ctx,
-            &subs,
-            &plugin_id,
-            &display_name,
-            &icon_url,
-        )
+        execute_provider_in_context(&ctx, plugin, override_source, &subs, None, None)
     })
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Legacy mode: call probe once with a child context and default account.
-fn run_legacy_probe<'js>(
+/// Single-account mode: call probe once with a child context and default account.
+fn run_single_account_probe<'js>(
     ctx: &Ctx<'js>,
     plugin: &LoadedPlugin,
     probe_fn: &rquickjs::Function<'js>,
@@ -434,8 +542,8 @@ fn run_discovery_mode<'js>(
         }
     };
 
-    // Parse and validate account descriptors.
-    let accounts = match parse_discovery_accounts(&accounts_array) {
+    // Parse and validate account descriptors (DiscoveryDescriptor with private errorPolicy).
+    let descriptors = match parse_discovery_accounts(&accounts_array) {
         Ok(accs) => accs,
         Err(msg) => {
             return ProbeResult {
@@ -446,7 +554,7 @@ fn run_discovery_mode<'js>(
     };
 
     // Empty valid list: produce zero outputs.
-    if accounts.is_empty() {
+    if descriptors.is_empty() {
         return ProbeResult {
             outputs: Vec::new(),
             subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
@@ -454,15 +562,22 @@ fn run_discovery_mode<'js>(
     }
 
     // Probe each discovered account sequentially.
-    let mut outputs = Vec::with_capacity(accounts.len());
-    for account in &accounts {
-        let account_ctx = match create_account_context(ctx, account, base_ctx) {
+    let mut outputs: Vec<(usize, PluginOutput)> = Vec::with_capacity(descriptors.len());
+    for (desc_idx, descriptor) in descriptors.iter().enumerate() {
+        let account_ref = AccountRef {
+            id: descriptor.id.clone(),
+            origin: descriptor.origin.clone(),
+        };
+        let account_ctx = match create_account_context(ctx, &account_ref, base_ctx) {
             Ok(c) => c,
             Err(_) => {
-                outputs.push(error_output_with_account(
-                    plugin,
-                    "failed to create account context".to_string(),
-                    account,
+                outputs.push((
+                    desc_idx,
+                    error_output_with_account(
+                        plugin,
+                        "failed to create account context".to_string(),
+                        &account_ref,
+                    ),
                 ));
                 continue;
             }
@@ -471,10 +586,9 @@ fn run_discovery_mode<'js>(
         let result_value: Value = match probe_fn.call((account_ctx,)) {
             Ok(r) => r,
             Err(_) => {
-                outputs.push(error_output_with_account(
-                    plugin,
-                    extract_error_string(ctx),
-                    account,
+                outputs.push((
+                    desc_idx,
+                    error_output_with_account(plugin, extract_error_string(ctx), &account_ref),
                 ));
                 continue;
             }
@@ -483,24 +597,60 @@ fn run_discovery_mode<'js>(
         let result = match resolve_js_result(ctx, result_value) {
             Ok(obj) => obj,
             Err(msg) => {
-                outputs.push(error_output_with_account(plugin, msg, account));
+                outputs.push((
+                    desc_idx,
+                    error_output_with_account(plugin, msg, &account_ref),
+                ));
                 continue;
             }
         };
 
         // In discovery mode, identity is host-authoritative.
-        let output = build_plugin_output(&result, plugin_id, display_name, icon_url, Some(account));
-        outputs.push(output);
+        let output = build_plugin_output(
+            &result,
+            plugin_id,
+            display_name,
+            icon_url,
+            Some(&account_ref),
+        );
+        outputs.push((desc_idx, output));
     }
 
+    // Apply soft-fail: errorPolicy=hide-if-other-account hides that descriptor's
+    // error whenever ANY OTHER descriptor exists, whether that other account
+    // succeeds or errors. It applies only to the descriptor carrying the policy.
+    // Opencode errors stay visible regardless.
+    let has_any_other_descriptor = descriptors.len() > 1;
+
+    let final_outputs: Vec<PluginOutput> = outputs
+        .into_iter()
+        .filter(|(desc_idx, o)| {
+            // If this is an error output and descriptor has hide-if-other-account policy
+            let is_error = o
+                .lines
+                .iter()
+                .any(|l| matches!(l, MetricLine::Badge { label, .. } if label == "Error"));
+            if is_error
+                && desc_idx < &descriptors.len()
+                && descriptors[*desc_idx].error_policy == ErrorPolicy::HideIfOtherAccount
+                && has_any_other_descriptor
+                && o.account.origin != "opencode"
+            {
+                return false; // hide this error
+            }
+            true
+        })
+        .map(|(_, o)| o)
+        .collect();
+
     ProbeResult {
-        outputs,
+        outputs: final_outputs,
         subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
     }
 }
 
 /// Create a child context inheriting from `base_ctx` with an immutable
-/// `account` property.
+/// `account` property containing only `{ id }`.
 ///
 /// Uses `Object::new` + `set_prototype` for the prototype chain and
 /// `Property` for immutable descriptors — no string interpolation of
@@ -516,11 +666,6 @@ fn create_account_context<'js>(
         Object::new(ctx.clone()).map_err(|_| "failed to create account object".to_string())?;
     acct.prop("id", Property::from(account.id.as_str()).enumerable())
         .map_err(|_| "failed to set account id".to_string())?;
-    acct.prop(
-        "displayName",
-        Property::from(account.display_name.as_str()).enumerable(),
-    )
-    .map_err(|_| "failed to set account displayName".to_string())?;
 
     // Create child context using Object::new + set_prototype.
     let child =
@@ -543,9 +688,25 @@ fn create_account_context<'js>(
     Ok(child)
 }
 
+/// Private discovery descriptor with error policy (not serialized).
+#[derive(Debug, Clone)]
+struct DiscoveryDescriptor {
+    id: String,
+    origin: String,
+    error_policy: ErrorPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ErrorPolicy {
+    None,
+    HideIfOtherAccount,
+}
+
 /// Parse and validate a discovery result array.
 /// Returns up to 32 account descriptors with unique non-empty ids.
-fn parse_discovery_accounts(array: &Array) -> Result<Vec<AccountRef>, String> {
+/// Each descriptor carries id, origin, and private errorPolicy.
+/// No displayName handling.
+fn parse_discovery_accounts(array: &Array) -> Result<Vec<DiscoveryDescriptor>, String> {
     let len = array.len();
     if len > 32 {
         return Err(format!(
@@ -579,18 +740,67 @@ fn parse_discovery_accounts(array: &Array) -> Result<Vec<AccountRef>, String> {
             ));
         }
 
-        let display_name: String = obj.get("displayName").map_err(|_| {
-            format!(
-                "discoverAccounts: element at index {} missing displayName",
-                idx
-            )
-        })?;
-        if display_name.trim().is_empty() {
-            return Err(format!(
-                "discoverAccounts: element at index {} has empty displayName",
-                idx
-            ));
-        }
+        // origin: absent/null => "native"; empty/non-string/accessor => error
+        let origin: String = match obj.get::<_, rquickjs::Value>("origin") {
+            Ok(val) => {
+                if val.is_null() || val.is_undefined() {
+                    "native".to_string()
+                } else if let Some(s) = val.as_string() {
+                    let raw = s.to_string().unwrap_or_default();
+                    if raw.trim().is_empty() {
+                        return Err(format!(
+                            "discoverAccounts: element at index {} has empty origin",
+                            idx
+                        ));
+                    }
+                    raw
+                } else {
+                    return Err(format!(
+                        "discoverAccounts: element at index {} has non-string origin",
+                        idx
+                    ));
+                }
+            }
+            Err(_) => {
+                return Err(format!(
+                    "discoverAccounts: element at index {} has invalid origin (accessor threw)",
+                    idx
+                ));
+            }
+        };
+
+        // errorPolicy: private, not serialized
+        // absent/null/undefined => None; "hide-if-other-account" => HideIfOtherAccount;
+        // any other string, non-string, or accessor error => discovery validation error
+        let error_policy: ErrorPolicy = match obj.get::<_, rquickjs::Value>("errorPolicy") {
+            Ok(val) => {
+                if val.is_null() || val.is_undefined() {
+                    ErrorPolicy::None
+                } else if let Some(s) = val.as_string() {
+                    match s.to_string().unwrap_or_default().as_str() {
+                        "hide-if-other-account" => ErrorPolicy::HideIfOtherAccount,
+                        _ => {
+                            return Err(format!(
+                                "discoverAccounts: element at index {} has invalid errorPolicy '{}'",
+                                idx,
+                                s.to_string().unwrap_or_default()
+                            ));
+                        }
+                    }
+                } else {
+                    return Err(format!(
+                        "discoverAccounts: element at index {} has non-string errorPolicy",
+                        idx
+                    ));
+                }
+            }
+            Err(_) => {
+                return Err(format!(
+                    "discoverAccounts: element at index {} has invalid errorPolicy (accessor threw)",
+                    idx
+                ));
+            }
+        };
 
         if !seen_ids.insert(id.clone()) {
             return Err(format!(
@@ -599,7 +809,11 @@ fn parse_discovery_accounts(array: &Array) -> Result<Vec<AccountRef>, String> {
             ));
         }
 
-        accounts.push(AccountRef { id, display_name });
+        accounts.push(DiscoveryDescriptor {
+            id,
+            origin,
+            error_policy,
+        });
     }
 
     Ok(accounts)
@@ -625,13 +839,9 @@ fn resolve_js_result<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Object<'j
 
 /// Build a PluginOutput from a probe result object.
 ///
-/// In legacy mode (`discovery_account` is None), existing account parsing
-/// applies (absent/null/undefined -> default; present -> validated).
-///
-/// In discovery mode (`discovery_account` is Some), identity is host-authoritative:
-/// absent/null/undefined/explicit default result.account means the discovered
-/// account; a returned account that differs in either id or displayName produces
-/// an account-specific error carrying the discovered identity.
+/// The account is host-authoritative: never read from `result.account`.
+/// In single-account mode (`discovery_account` is None), the default account is used.
+/// In discovery mode (`discovery_account` is Some), the discovered identity is used.
 fn build_plugin_output(
     result: &Object,
     plugin_id: &str,
@@ -650,40 +860,9 @@ fn build_plugin_output(
         Err(msg) => vec![error_line(msg)],
     };
 
-    let account = match discovery_account {
-        None => {
-            // Legacy mode: existing behavior.
-            match parse_account(result) {
-                Ok(account) => account,
-                Err(msg) => {
-                    return PluginOutput {
-                        provider_id: plugin_id.to_string(),
-                        display_name: display_name.to_string(),
-                        plan: None,
-                        lines: vec![error_line(msg)],
-                        icon_url: icon_url.to_string(),
-                        account: AccountRef::default_account(),
-                    };
-                }
-            }
-        }
-        Some(discovered) => {
-            // Discovery mode: host-authoritative identity.
-            match parse_account_in_discovery(result, discovered) {
-                Ok(account) => account,
-                Err(msg) => {
-                    return PluginOutput {
-                        provider_id: plugin_id.to_string(),
-                        display_name: display_name.to_string(),
-                        plan: None,
-                        lines: vec![error_line(msg)],
-                        icon_url: icon_url.to_string(),
-                        account: discovered.clone(),
-                    };
-                }
-            }
-        }
-    };
+    let account = discovery_account
+        .cloned()
+        .unwrap_or_else(AccountRef::default_account);
 
     PluginOutput {
         provider_id: plugin_id.to_string(),
@@ -692,76 +871,6 @@ fn build_plugin_output(
         lines,
         icon_url: icon_url.to_string(),
         account,
-    }
-}
-
-/// Parse account from a probe result in discovery mode.
-/// Host-authoritative: absent/null/undefined -> discovered account.
-/// An explicit `{id:"default",displayName:"default"}` is also treated as
-/// unspecified and receives the discovered identity.
-/// A genuinely mismatched id or displayName produces an account-specific
-/// error with a generic mismatch message.
-fn parse_account_in_discovery(
-    result: &Object,
-    discovered: &AccountRef,
-) -> Result<AccountRef, String> {
-    let has_account = match result.contains_key("account") {
-        Ok(v) => v,
-        Err(_) => {
-            return Err("plugin returned invalid account: accessor threw".to_string());
-        }
-    };
-
-    if !has_account {
-        return Ok(discovered.clone());
-    }
-
-    let account_val: rquickjs::Value = match result.get("account") {
-        Ok(v) => v,
-        Err(_) => {
-            return Err("plugin returned invalid account: accessor threw".to_string());
-        }
-    };
-
-    if account_val.is_null() || account_val.is_undefined() {
-        return Ok(discovered.clone());
-    }
-
-    let account_obj = match account_val.into_object() {
-        Some(obj) => obj,
-        None => {
-            return Err(
-                "plugin returned account that does not match discovered identity".to_string(),
-            );
-        }
-    };
-
-    let id: String = match account_obj.get("id") {
-        Ok(v) => v,
-        Err(_) => {
-            return Err(
-                "plugin returned account that does not match discovered identity".to_string(),
-            );
-        }
-    };
-    let display_name: String = match account_obj.get("displayName") {
-        Ok(v) => v,
-        Err(_) => {
-            return Err(
-                "plugin returned account that does not match discovered identity".to_string(),
-            );
-        }
-    };
-
-    // Explicit default is equivalent to unspecified — apply discovered identity.
-    if id == "default" && display_name == "default" {
-        return Ok(discovered.clone());
-    }
-
-    if id == discovered.id && display_name == discovered.display_name {
-        Ok(discovered.clone())
-    } else {
-        Err("plugin returned account that does not match discovered identity".to_string())
     }
 }
 
@@ -781,7 +890,6 @@ fn error_output_with_account(
 }
 
 struct LoadedOverrideScript {
-    path: PathBuf,
     script: String,
 }
 
@@ -810,35 +918,8 @@ fn load_plugin_override(
     }
 
     Ok(Some(LoadedOverrideScript {
-        path: override_path,
         script: override_script,
     }))
-}
-
-fn apply_plugin_override(
-    ctx: &Ctx<'_>,
-    plugin_id: &str,
-    override_script: Option<&LoadedOverrideScript>,
-) -> Result<(), String> {
-    let Some(override_script) = override_script else {
-        return Ok(());
-    };
-
-    inject_override_api(ctx, plugin_id)?;
-
-    if ctx
-        .eval::<(), _>(override_script.script.as_bytes())
-        .is_err()
-    {
-        return Err(extract_error_string(ctx));
-    }
-
-    log::info!(
-        "[plugin:{}] override loaded: {}",
-        plugin_id,
-        override_script.path.display()
-    );
-    Ok(())
 }
 
 fn resolve_plugin_override_path(overrides_dir: &Path, plugin_id: &str) -> Option<PathBuf> {
@@ -859,6 +940,7 @@ fn resolve_plugin_override_path(overrides_dir: &Path, plugin_id: &str) -> Option
     candidates.into_iter().find(|path| path.is_file())
 }
 
+#[allow(dead_code)]
 fn inject_override_api(ctx: &Ctx<'_>, plugin_id: &str) -> Result<(), String> {
     let plugin_id_json = serde_json::to_string(plugin_id)
         .map_err(|e| format!("failed to encode plugin id for override api: {}", e))?;
@@ -950,53 +1032,6 @@ fn inject_override_api(ctx: &Ctx<'_>, plugin_id: &str) -> Result<(), String> {
     }
 
     Ok(())
-}
-
-fn parse_account(result: &Object) -> Result<AccountRef, String> {
-    // Check whether account property exists on the result object.
-    // If the accessor throws (e.g. a Proxy trap), return a validation error.
-    let has_account = match result.contains_key("account") {
-        Ok(v) => v,
-        Err(_) => {
-            return Err("plugin returned invalid account: accessor threw".to_string());
-        }
-    };
-
-    if !has_account {
-        return Ok(AccountRef::default_account());
-    }
-
-    // Property exists — read it. A getter that throws here is also an error.
-    let account_val: rquickjs::Value = match result.get("account") {
-        Ok(v) => v,
-        Err(_) => {
-            return Err("plugin returned invalid account: accessor threw".to_string());
-        }
-    };
-
-    if account_val.is_null() || account_val.is_undefined() {
-        return Ok(AccountRef::default_account());
-    }
-
-    let account_obj = account_val
-        .into_object()
-        .ok_or_else(|| "plugin returned invalid account: must be an object".to_string())?;
-
-    let id: String = account_obj
-        .get("id")
-        .map_err(|_| "plugin returned account without id".to_string())?;
-    if id.trim().is_empty() {
-        return Err("plugin returned account with empty id".to_string());
-    }
-
-    let display_name: String = account_obj
-        .get("displayName")
-        .map_err(|_| "plugin returned account without displayName".to_string())?;
-    if display_name.trim().is_empty() {
-        return Err("plugin returned account with empty displayName".to_string());
-    }
-
-    Ok(AccountRef { id, display_name })
 }
 
 fn parse_lines(result: &Object) -> Result<Vec<MetricLine>, String> {
@@ -1304,6 +1339,21 @@ fn extract_error_string(ctx: &Ctx<'_>) -> String {
         let trimmed = message.trim();
         if !trimmed.is_empty() {
             return trimmed.to_string();
+        }
+    }
+    // Try as an Error object (throw new Error(...))
+    if let Some(obj) = exc.as_object() {
+        if let Ok(msg) = obj.get::<_, String>("message") {
+            let trimmed = msg.trim().to_string();
+            if !trimmed.is_empty() {
+                return trimmed;
+            }
+        }
+        if let Ok(msg) = obj.get::<_, String>("name") {
+            let trimmed = msg.trim().to_string();
+            if !trimmed.is_empty() {
+                return trimmed;
+            }
         }
     }
     "The plugin failed, try again or contact plugin author.".to_string()
@@ -1757,9 +1807,10 @@ mod tests {
         let json: JsonValue = serde_json::to_value(&account).expect("serialize");
         let obj = json.as_object().expect("object");
         assert_eq!(obj.get("id").and_then(|v| v.as_str()), Some("default"));
-        assert_eq!(
-            obj.get("displayName").and_then(|v| v.as_str()),
-            Some("default")
+        assert_eq!(obj.get("origin").and_then(|v| v.as_str()), Some("native"));
+        assert!(
+            obj.get("displayName").is_none(),
+            "should not have displayName key"
         );
         assert!(
             obj.get("display_name").is_none(),
@@ -1825,7 +1876,9 @@ mod tests {
     }
 
     #[test]
-    fn plugin_output_custom_account_preserved() {
+    fn plugin_output_never_reads_probe_account() {
+        // probe().account is NEVER read, validated, or accessed.
+        // In single-account mode, the output always carries the default account.
         let plugin = test_plugin(
             r#"
             globalThis.__openusage_plugin = {
@@ -1841,15 +1894,15 @@ mod tests {
         let result = run_probe(&plugin, &temp_app_dir("custom-account"), "0.0.0", None);
         assert_eq!(
             result.outputs[0].account,
-            AccountRef {
-                id: "custom-id".to_string(),
-                display_name: "Custom Name".to_string(),
-            }
+            AccountRef::default_account(),
+            "probe().account must never alter the output account in single-account mode"
         );
     }
 
     #[test]
-    fn plugin_output_omitted_account_defaults() {
+    fn probe_result_account_ignored_in_single_account_mode() {
+        // In single-account mode, probe().account is NEVER read.
+        // The output account is always the default.
         let plugin = test_plugin(
             r#"
             globalThis.__openusage_plugin = {
@@ -1866,7 +1919,7 @@ mod tests {
     }
 
     #[test]
-    fn plugin_output_null_account_defaults() {
+    fn null_probe_result_account_defaults_to_default() {
         let plugin = test_plugin(
             r#"
             globalThis.__openusage_plugin = {
@@ -1880,129 +1933,12 @@ mod tests {
             "#,
         );
         let result = run_probe(&plugin, &temp_app_dir("null-account"), "0.0.0", None);
+        // probe().account is never read, output always has default account
         assert_eq!(result.outputs[0].account, AccountRef::default_account());
     }
 
     #[test]
-    fn plugin_output_invalid_account_non_object_errors() {
-        let plugin = test_plugin(
-            r#"
-            globalThis.__openusage_plugin = {
-                probe(ctx) {
-                    return {
-                        account: "not-an-object",
-                        lines: [ctx.line.text({ label: "Status", value: "ok" })]
-                    };
-                }
-            };
-            "#,
-        );
-        let result = run_probe(&plugin, &temp_app_dir("invalid-account"), "0.0.0", None);
-        assert_eq!(
-            result.outputs[0].account,
-            AccountRef::default_account(),
-            "invalid account must produce error output with default account"
-        );
-        assert_eq!(result.outputs[0].lines.len(), 1);
-        match &result.outputs[0].lines[0] {
-            MetricLine::Badge { label, text, .. } => {
-                assert_eq!(label, "Error");
-                assert!(
-                    text.contains("invalid account"),
-                    "error text should mention invalid account: {}",
-                    text
-                );
-            }
-            other => panic!("expected error badge, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn plugin_output_invalid_account_empty_id_errors() {
-        let plugin = test_plugin(
-            r#"
-            globalThis.__openusage_plugin = {
-                probe(ctx) {
-                    return {
-                        account: { id: "", displayName: "Name" },
-                        lines: [ctx.line.text({ label: "Status", value: "ok" })]
-                    };
-                }
-            };
-            "#,
-        );
-        let result = run_probe(&plugin, &temp_app_dir("empty-id"), "0.0.0", None);
-        assert_eq!(result.outputs[0].account, AccountRef::default_account());
-        match &result.outputs[0].lines[0] {
-            MetricLine::Badge { text, .. } => {
-                assert!(
-                    text.contains("empty id"),
-                    "error text should mention empty id: {}",
-                    text
-                );
-            }
-            other => panic!("expected error badge, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn plugin_output_invalid_account_empty_display_name_errors() {
-        let plugin = test_plugin(
-            r#"
-            globalThis.__openusage_plugin = {
-                probe(ctx) {
-                    return {
-                        account: { id: "custom-id", displayName: "" },
-                        lines: [ctx.line.text({ label: "Status", value: "ok" })]
-                    };
-                }
-            };
-            "#,
-        );
-        let result = run_probe(&plugin, &temp_app_dir("empty-display-name"), "0.0.0", None);
-        assert_eq!(result.outputs[0].account, AccountRef::default_account());
-        match &result.outputs[0].lines[0] {
-            MetricLine::Badge { text, .. } => {
-                assert!(
-                    text.contains("empty displayName"),
-                    "error text should mention empty displayName: {}",
-                    text
-                );
-            }
-            other => panic!("expected error badge, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn plugin_output_invalid_account_missing_id_errors() {
-        let plugin = test_plugin(
-            r#"
-            globalThis.__openusage_plugin = {
-                probe(ctx) {
-                    return {
-                        account: { displayName: "Name" },
-                        lines: [ctx.line.text({ label: "Status", value: "ok" })]
-                    };
-                }
-            };
-            "#,
-        );
-        let result = run_probe(&plugin, &temp_app_dir("missing-id"), "0.0.0", None);
-        assert_eq!(result.outputs[0].account, AccountRef::default_account());
-        match &result.outputs[0].lines[0] {
-            MetricLine::Badge { text, .. } => {
-                assert!(
-                    text.contains("without id"),
-                    "error text should mention missing id: {}",
-                    text
-                );
-            }
-            other => panic!("expected error badge, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn plugin_output_undefined_account_defaults() {
+    fn undefined_probe_result_account_defaults_to_default() {
         let plugin = test_plugin(
             r#"
             globalThis.__openusage_plugin = {
@@ -2020,35 +1956,93 @@ mod tests {
     }
 
     #[test]
-    fn plugin_output_invalid_account_missing_display_name_errors() {
+    fn probe_account_non_object_does_not_cause_error() {
+        // probe().account is never read, so a non-object value produces
+        // normal success output with default account.
         let plugin = test_plugin(
             r#"
             globalThis.__openusage_plugin = {
                 probe(ctx) {
                     return {
-                        account: { id: "custom-id" },
+                        account: "not-an-object",
                         lines: [ctx.line.text({ label: "Status", value: "ok" })]
                     };
                 }
             };
             "#,
         );
-        let result = run_probe(&plugin, &temp_app_dir("missing-displayname"), "0.0.0", None);
-        assert_eq!(result.outputs[0].account, AccountRef::default_account());
+        let result = run_probe(&plugin, &temp_app_dir("invalid-account"), "0.0.0", None);
+        assert_eq!(
+            result.outputs[0].account,
+            AccountRef::default_account(),
+            "probe().account is never read - output is success with default account"
+        );
+        assert_eq!(result.outputs[0].lines.len(), 1);
+        // Lines should be success, not error
         match &result.outputs[0].lines[0] {
-            MetricLine::Badge { text, .. } => {
-                assert!(
-                    text.contains("without displayName"),
-                    "error text should mention missing displayName: {}",
-                    text
-                );
+            MetricLine::Text { label, value, .. } => {
+                assert_eq!(label, "Status");
+                assert_eq!(value, "ok");
             }
-            other => panic!("expected error badge, got {:?}", other),
+            other => panic!("expected text line, got {:?}", other),
         }
     }
 
     #[test]
-    fn plugin_output_throwing_account_accessor_errors() {
+    fn probe_account_empty_id_does_not_cause_error() {
+        // probe().account is never read, empty id has no effect.
+        let plugin = test_plugin(
+            r#"
+            globalThis.__openusage_plugin = {
+                probe(ctx) {
+                    return {
+                        account: { id: "", displayName: "Name" },
+                        lines: [ctx.line.text({ label: "Status", value: "ok" })]
+                    };
+                }
+            };
+            "#,
+        );
+        let result = run_probe(&plugin, &temp_app_dir("empty-id"), "0.0.0", None);
+        assert_eq!(result.outputs[0].account, AccountRef::default_account());
+        // Should be success, not error
+        assert_eq!(result.outputs[0].lines.len(), 1);
+        match &result.outputs[0].lines[0] {
+            MetricLine::Text { label, value, .. } => {
+                assert_eq!(label, "Status");
+                assert_eq!(value, "ok");
+            }
+            other => panic!("expected text line, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn probe_account_missing_id_does_not_cause_error() {
+        // probe().account is never read, missing id has no effect.
+        let plugin = test_plugin(
+            r#"
+            globalThis.__openusage_plugin = {
+                probe(ctx) {
+                    return {
+                        account: { displayName: "Name" },
+                        lines: [ctx.line.text({ label: "Status", value: "ok" })]
+                    };
+                }
+            };
+            "#,
+        );
+        let result = run_probe(&plugin, &temp_app_dir("missing-id"), "0.0.0", None);
+        assert_eq!(result.outputs[0].account, AccountRef::default_account());
+        assert_eq!(result.outputs[0].lines.len(), 1);
+        match &result.outputs[0].lines[0] {
+            MetricLine::Text { .. } => {} // success
+            other => panic!("expected text line, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn probe_account_throwing_accessor_does_not_cause_error() {
+        // probe().account accessor throw is NEVER caught — it has no effect.
         let plugin = test_plugin(
             r#"
             globalThis.__openusage_plugin = {
@@ -2070,17 +2064,85 @@ mod tests {
         assert_eq!(
             result.outputs[0].account,
             AccountRef::default_account(),
-            "throwing accessor must produce error output with default account"
+            "throwing accessor on probe().account is never caught - output is success with default account"
         );
+        // Should be success, not error
+        assert_eq!(result.outputs[0].lines.len(), 1);
         match &result.outputs[0].lines[0] {
-            MetricLine::Badge { text, .. } => {
-                assert!(
-                    text.contains("accessor threw"),
-                    "error text should mention accessor threw: {}",
-                    text
-                );
-            }
-            other => panic!("expected error badge, got {:?}", other),
+            MetricLine::Text { .. } => {} // success
+            other => panic!("expected text line, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn probe_account_empty_display_name_does_not_cause_error() {
+        // probe().account is never read, empty displayName has no effect.
+        let plugin = test_plugin(
+            r#"
+            globalThis.__openusage_plugin = {
+                probe(ctx) {
+                    return {
+                        account: { id: "custom-id", displayName: "" },
+                        lines: [ctx.line.text({ label: "Status", value: "ok" })]
+                    };
+                }
+            };
+            "#,
+        );
+        let result = run_probe(&plugin, &temp_app_dir("empty-display-name"), "0.0.0", None);
+        assert_eq!(result.outputs[0].account, AccountRef::default_account());
+        assert_eq!(result.outputs[0].lines.len(), 1);
+        match &result.outputs[0].lines[0] {
+            MetricLine::Text { .. } => {} // success
+            other => panic!("expected text line, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn probe_account_missing_display_name_does_not_cause_error() {
+        // probe().account is never read, missing displayName has no effect.
+        let plugin = test_plugin(
+            r#"
+            globalThis.__openusage_plugin = {
+                probe(ctx) {
+                    return {
+                        account: { id: "custom-id" },
+                        lines: [ctx.line.text({ label: "Status", value: "ok" })]
+                    };
+                }
+            };
+            "#,
+        );
+        let result = run_probe(&plugin, &temp_app_dir("missing-displayname"), "0.0.0", None);
+        assert_eq!(result.outputs[0].account, AccountRef::default_account());
+        assert_eq!(result.outputs[0].lines.len(), 1);
+        match &result.outputs[0].lines[0] {
+            MetricLine::Text { .. } => {} // success
+            other => panic!("expected text line, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn probe_account_non_object_string_does_not_cause_error() {
+        // probe().account as a string is not read, no error.
+        let plugin = test_plugin(
+            r#"
+            globalThis.__openusage_plugin = {
+                probe(ctx) {
+                    return {
+                        account: "some-string",
+                        lines: [ctx.line.text({ label: "Status", value: "ok" })]
+                    };
+                }
+            };
+            "#,
+        );
+        let result = run_probe(&plugin, &temp_app_dir("string-account"), "0.0.0", None);
+        assert_eq!(result.outputs[0].account, AccountRef::default_account());
+        assert_eq!(result.outputs[0].lines.len(), 1);
+        match &result.outputs[0].lines[0] {
+            MetricLine::Text { .. } => {} // success
+            other => panic!("expected text line, got {:?}", other),
         }
     }
 
@@ -2109,8 +2171,8 @@ mod tests {
     }
 
     #[test]
-    fn override_replace_discover_accounts_adds_to_legacy_plugin() {
-        // A legacy plugin with only probe() gains discoverAccounts via replace.
+    fn override_replace_discover_accounts_adds_to_single_account_plugin() {
+        // A single-account plugin with only probe() gains discoverAccounts via replace.
         with_override_context(
             r#"
             globalThis.__openusage_plugin = {
@@ -2124,7 +2186,7 @@ mod tests {
             var plugin = globalThis.__openusage_plugin;
             globalThis.__test_result = {};
 
-            // originalDiscoverAccounts must be null for a legacy plugin
+            // originalDiscoverAccounts must be null for a single-account plugin
             globalThis.__test_result.originalIsNull = (ov.originalDiscoverAccounts === null);
 
             // replaceDiscoverAccounts adds the function
@@ -2312,7 +2374,7 @@ mod tests {
 
     #[test]
     fn override_reset_discover_accounts_removes_override_added() {
-        // When replace added discovery to a legacy plugin, reset removes it.
+        // When replace added discovery to a single-account plugin, reset removes it.
         with_override_context(
             r#"
             globalThis.__openusage_plugin = {
@@ -2502,20 +2564,18 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     #[test]
-    fn legacy_probe_has_immutable_default_account_context() {
+    fn single_account_probe_has_immutable_default_account_context() {
         let plugin = test_plugin(
             r#"
             globalThis.__openusage_plugin = {
                 probe(ctx) {
                     var acct = ctx.account;
                     var id = acct.id;
-                    var displayName = acct.displayName;
                     var stillDefault = ctx.account.id === "default";
                     var desc = Object.getOwnPropertyDescriptor(acct, "id");
                     return {
                         lines: [
                             ctx.line.text({ label: "ID", value: id }),
-                            ctx.line.text({ label: "DisplayName", value: displayName }),
                             ctx.line.text({ label: "StillDefault", value: String(stillDefault) }),
                             ctx.line.text({ label: "Writable", value: String(desc.writable) }),
                             ctx.line.text({ label: "Configurable", value: String(desc.configurable) })
@@ -2525,7 +2585,12 @@ mod tests {
             };
             "#,
         );
-        let result = run_probe(&plugin, &temp_app_dir("legacy-immutable"), "0.0.0", None);
+        let result = run_probe(
+            &plugin,
+            &temp_app_dir("single-account-immutable"),
+            "0.0.0",
+            None,
+        );
         let lines = &result.outputs[0].lines;
         let get_text = |label: &str| -> String {
             lines
@@ -2539,7 +2604,6 @@ mod tests {
                 .unwrap_or_default()
         };
         assert_eq!(get_text("ID"), "default");
-        assert_eq!(get_text("DisplayName"), "default");
         assert_eq!(get_text("StillDefault"), "true");
         assert_eq!(
             get_text("Writable"),
@@ -2561,14 +2625,13 @@ mod tests {
             globalThis.__openusage_plugin = {
                 probe(ctx) {
                     return {
-                        account: { id: ctx.account.id, displayName: ctx.account.displayName },
                         lines: [ctx.line.text({ label: "Account", value: ctx.account.id })]
                     };
                 },
                 discoverAccounts(ctx) {
                     return [
-                        { id: "work", displayName: "Work" },
-                        { id: "personal", displayName: "Personal" }
+                        { id: "work" },
+                        { id: "personal" }
                     ];
                 }
             };
@@ -2582,6 +2645,8 @@ mod tests {
 
     #[test]
     fn discovery_host_authoritative_identity() {
+        // Host-authoritative: probe().account is never read.
+        // The output account always uses the discovered identity.
         let plugin = test_plugin(
             r#"
             globalThis.__openusage_plugin = {
@@ -2590,14 +2655,14 @@ mod tests {
                         return { lines: [ctx.line.text({ label: "Status", value: "ok" })] };
                     }
                     return {
-                        account: { id: "personal", displayName: "Personal" },
+                        account: { id: "mismatched", displayName: "Override" },
                         lines: [ctx.line.text({ label: "Status", value: "ok" })]
                     };
                 },
                 discoverAccounts(ctx) {
                     return [
-                        { id: "work", displayName: "Work" },
-                        { id: "personal", displayName: "Personal" }
+                        { id: "work" },
+                        { id: "personal" }
                     ];
                 }
             };
@@ -2605,8 +2670,11 @@ mod tests {
         );
         let result = run_probe(&plugin, &temp_app_dir("host-auth"), "0.0.0", None);
         assert_eq!(result.outputs.len(), 2);
+        // Host-authoritative: accounts come from discovery descriptors, not probe()
         assert_eq!(result.outputs[0].account.id, "work");
         assert_eq!(result.outputs[1].account.id, "personal");
+        // Both outputs are success (probe().account is never validated)
+        assert!(result.outputs[1].lines[0].to_string().contains("ok"));
     }
 
     #[test]
@@ -2618,7 +2686,7 @@ mod tests {
                     return { lines: [ctx.line.text({ label: "Account", value: ctx.account.id })] };
                 },
                 async discoverAccounts(ctx) {
-                    return [{ id: "async-acc", displayName: "Async Account" }];
+                    return [{ id: "async-acc" }];
                 }
             };
             "#,
@@ -2683,7 +2751,7 @@ mod tests {
                     return { lines: [ctx.line.text({ label: "Status", value: "ok" })] };
                 },
                 discoverAccounts(ctx) {
-                    return [{ displayName: "No ID" }];
+                    return [{}];
                 }
             };
             "#,
@@ -2714,7 +2782,8 @@ mod tests {
     }
 
     #[test]
-    fn discovery_empty_display_name_returns_error() {
+    fn discovery_empty_origin_returns_error() {
+        // Empty origin in discovery descriptor must produce an error.
         let plugin = test_plugin(
             r#"
             globalThis.__openusage_plugin = {
@@ -2722,14 +2791,15 @@ mod tests {
                     return { lines: [ctx.line.text({ label: "Status", value: "ok" })] };
                 },
                 discoverAccounts(ctx) {
-                    return [{ id: "x", displayName: "" }];
+                    return [{ id: "x", origin: "" }];
                 }
             };
             "#,
         );
-        let result = run_probe(&plugin, &temp_app_dir("empty-dn"), "0.0.0", None);
+        let result = run_probe(&plugin, &temp_app_dir("empty-origin"), "0.0.0", None);
         assert_eq!(result.outputs.len(), 1);
         assert_eq!(result.outputs[0].account, AccountRef::default_account());
+        assert!(error_text(&result.outputs[0]).contains("empty origin"));
     }
 
     #[test]
@@ -2742,8 +2812,8 @@ mod tests {
                 },
                 discoverAccounts(ctx) {
                     return [
-                        { id: "dup", displayName: "First" },
-                        { id: "dup", displayName: "Second" }
+                        { id: "dup" },
+                        { id: "dup" }
                     ];
                 }
             };
@@ -2766,7 +2836,7 @@ mod tests {
                 discoverAccounts(ctx) {
                     var arr = [];
                     for (var i = 0; i < 33; i++) {
-                        arr.push({ id: "a" + i, displayName: "A" + i });
+                        arr.push({ id: "a" + i });
                     }
                     return arr;
                 }
@@ -2830,9 +2900,9 @@ mod tests {
                 },
                 discoverAccounts(ctx) {
                     return [
-                        { id: "good", displayName: "Good" },
-                        { id: "broken", displayName: "Broken" },
-                        { id: "also-good", displayName: "Also Good" }
+                        { id: "good" },
+                        { id: "broken" },
+                        { id: "also-good" }
                     ];
                 }
             };
@@ -2864,8 +2934,8 @@ mod tests {
                 discoverAccounts(ctx) {
                     ctx.host.fs.subscribeFile("/tmp/discovery-dep.json");
                     return [
-                        { id: "a", displayName: "A" },
-                        { id: "b", displayName: "B" }
+                        { id: "a" },
+                        { id: "b" }
                     ];
                 }
             };
@@ -2902,7 +2972,7 @@ mod tests {
             overrides_dir.join("test.js"),
             r#"
             globalThis.__openusage_override.replaceDiscoverAccounts(function(ctx, original) {
-                return [{ id: "override-acc", displayName: "Override Account" }];
+                return [{ id: "override-acc" }];
             });
             "#,
         )
@@ -2926,7 +2996,7 @@ mod tests {
                     return { lines: [ctx.line.text({ label: "Account", value: ctx.account.id })] };
                 },
                 discoverAccounts(ctx) {
-                    return [{ id: "native", displayName: "Native" }];
+                    return [{ id: "native" }];
                 }
             };
             "#,
@@ -2939,7 +3009,7 @@ mod tests {
             r#"
             globalThis.__openusage_override.wrapDiscoverAccounts(function(ctx, current, original) {
                 var accounts = current(ctx);
-                accounts.push({ id: "wrapped", displayName: "Wrapped" });
+                accounts.push({ id: "wrapped" });
                 return accounts;
             });
             "#,
@@ -2967,7 +3037,7 @@ mod tests {
                 discoverAccounts(ctx) {
                     var arr = [];
                     for (var i = 0; i < 32; i++) {
-                        arr.push({ id: "acc" + i, displayName: "Account " + i });
+                        arr.push({ id: "acc" + i });
                     }
                     return arr;
                 }
@@ -2982,7 +3052,7 @@ mod tests {
     }
     #[test]
     fn discovery_account_context_handles_special_characters() {
-        // Account ids/displayNames with quotes and newlines must be handled safely.
+        // Account ids with quotes must be handled safely ctx.account.id.
         let plugin = test_plugin(
             r#"
             globalThis.__openusage_plugin = {
@@ -2993,7 +3063,7 @@ mod tests {
                 },
                 discoverAccounts(ctx) {
                     return [
-                        { id: "it's \"quoted\"", displayName: "Name with 'quotes' and \n newline" }
+                        { id: "it's \"quoted\"" }
                     ];
                 }
             };
@@ -3002,15 +3072,11 @@ mod tests {
         let result = run_probe(&plugin, &temp_app_dir("special-chars"), "0.0.0", None);
         assert_eq!(result.outputs.len(), 1);
         assert_eq!(result.outputs[0].account.id, "it's \"quoted\"");
-        assert_eq!(
-            result.outputs[0].account.display_name,
-            "Name with 'quotes' and \n newline"
-        );
     }
 
     #[test]
-    fn legacy_probe_without_discover_accounts_has_default_account() {
-        // Legacy plugin without discoverAccounts gets default account context.
+    fn single_account_probe_without_discover_accounts_has_default_account() {
+        // Single-account plugin without discoverAccounts gets default account context.
         let plugin = test_plugin(
             r#"
             globalThis.__openusage_plugin = {
@@ -3022,7 +3088,12 @@ mod tests {
             };
             "#,
         );
-        let result = run_probe(&plugin, &temp_app_dir("legacy-default"), "0.0.0", None);
+        let result = run_probe(
+            &plugin,
+            &temp_app_dir("single-account-default"),
+            "0.0.0",
+            None,
+        );
         assert_eq!(result.outputs.len(), 1);
         assert_eq!(result.outputs[0].account, AccountRef::default_account());
     }
@@ -3030,7 +3101,7 @@ mod tests {
     #[test]
     fn discover_accounts_getter_exception_produces_error() {
         // A Proxy that throws on get("discoverAccounts") must produce a
-        // provider error, not fall back to legacy mode.
+        // provider error, not fall back to single-account mode.
         let plugin = test_plugin(
             r#"
             var handler = {
@@ -3111,8 +3182,8 @@ mod tests {
     }
 
     #[test]
-    fn account_context_account_id_and_display_name_are_immutable() {
-        // The account object's id and displayName must be read-only via
+    fn account_context_account_id_is_immutable() {
+        // The account object's id must be read-only via
         // Property API (non-writable, non-configurable).
         let plugin = test_plugin(
             r#"
@@ -3120,7 +3191,6 @@ mod tests {
                 probe(ctx) {
                     var before = ctx.account.id;
                     try { ctx.account.id = "hacked-id"; } catch(e) {}
-                    try { ctx.account.displayName = "Hacked Name"; } catch(e) {}
                     var after = ctx.account.id;
                     var desc = Object.getOwnPropertyDescriptor(ctx.account, "id");
                     return {
@@ -3188,7 +3258,7 @@ mod tests {
                     };
                 },
                 discoverAccounts(ctx) {
-                    return [{ id: "work", displayName: "Work Account" }];
+                    return [{ id: "work" }];
                 }
             };
             "#,
@@ -3278,9 +3348,9 @@ mod tests {
     }
 
     #[test]
-    fn discovery_explicit_default_account_uses_discovered_identity() {
-        // In discovery mode, an explicit {id:"default",displayName:"default"}
-        // is equivalent to unspecified and must receive the discovered identity.
+    fn probe_result_account_never_read_in_discovery_mode() {
+        // probe().account is NEVER read in discovery mode.
+        // The output account always uses the discovered identity.
         let plugin = test_plugin(
             r#"
             globalThis.__openusage_plugin = {
@@ -3291,92 +3361,83 @@ mod tests {
                     };
                 },
                 discoverAccounts(ctx) {
-                    return [{ id: "work", displayName: "Work Account" }];
+                    return [{ id: "work" }];
                 }
             };
             "#,
         );
-        let result = run_probe(
-            &plugin,
-            &temp_app_dir("disc-explicit-default"),
-            "0.0.0",
-            None,
-        );
+        let result = run_probe(&plugin, &temp_app_dir("disc-never-read"), "0.0.0", None);
         assert_eq!(result.outputs.len(), 1);
         assert_eq!(
             result.outputs[0].account.id, "work",
-            "explicit default must be replaced by discovered identity"
+            "probe().account is never read - discovered identity is always used"
         );
-        assert_eq!(result.outputs[0].account.display_name, "Work Account");
+        // Output is success (not an error)
+        assert!(result.outputs[0].lines[0].to_string().contains("work"));
     }
 
     #[test]
-    fn discovery_mismatched_id_is_account_specific_error() {
-        // A returned account with a mismatched id must produce an
-        // account-specific error carrying the discovered identity.
+    fn probe_result_account_mismatch_has_no_effect_in_discovery() {
+        // probe().account is NEVER read, even with mismatched id.
+        // The output is success with the discovered identity.
         let plugin = test_plugin(
             r#"
             globalThis.__openusage_plugin = {
                 probe(ctx) {
                     return {
-                        account: { id: "wrong-id", displayName: "Work Account" },
+                        account: { id: "wrong-id", displayName: "Wrong" },
                         lines: [ctx.line.text({ label: "Status", value: "ok" })]
                     };
                 },
                 discoverAccounts(ctx) {
-                    return [{ id: "work", displayName: "Work Account" }];
+                    return [{ id: "work" }];
                 }
             };
             "#,
         );
-        let result = run_probe(&plugin, &temp_app_dir("mismatch-id"), "0.0.0", None);
+        let result = run_probe(&plugin, &temp_app_dir("mismatch-no-effect"), "0.0.0", None);
         assert_eq!(result.outputs.len(), 1);
-        // Error must carry the discovered account, not default.
+        // Account from discovery, not from probe().account
         assert_eq!(
             result.outputs[0].account.id, "work",
-            "mismatched id error must carry discovered account identity"
+            "probe().account must not alter the output account"
         );
-        assert!(
-            error_text(&result.outputs[0]).contains("does not match discovered identity"),
-            "error must use generic mismatch message"
-        );
+        // Output is success
+        assert!(result.outputs[0].lines[0].to_string().contains("ok"));
     }
 
     #[test]
-    fn discovery_mismatched_display_name_is_account_specific_error() {
-        // A returned account with a mismatched displayName must produce an
-        // account-specific error carrying the discovered identity.
+    fn probe_result_account_with_any_content_has_no_effect() {
+        // probe().account content (id, displayName, or anything else)
+        // has zero effect on the output account.
         let plugin = test_plugin(
             r#"
             globalThis.__openusage_plugin = {
                 probe(ctx) {
                     return {
-                        account: { id: "work", displayName: "Wrong Name" },
+                        account: { id: "work", displayName: "Some Name" },
                         lines: [ctx.line.text({ label: "Status", value: "ok" })]
                     };
                 },
                 discoverAccounts(ctx) {
-                    return [{ id: "work", displayName: "Work Account" }];
+                    return [{ id: "work" }];
                 }
             };
             "#,
         );
-        let result = run_probe(&plugin, &temp_app_dir("mismatch-dn"), "0.0.0", None);
+        let result = run_probe(&plugin, &temp_app_dir("any-content"), "0.0.0", None);
         assert_eq!(result.outputs.len(), 1);
-        // Error must carry the discovered account, not default.
         assert_eq!(
             result.outputs[0].account.id, "work",
-            "mismatched displayName error must carry discovered account identity"
+            "account from descriptor, not from probe().account"
         );
-        assert!(
-            error_text(&result.outputs[0]).contains("does not match discovered identity"),
-            "error must use generic mismatch message"
-        );
+        // Output is success
+        assert!(result.outputs[0].lines[0].to_string().contains("ok"));
     }
 
     #[test]
-    fn discovery_null_uses_legacy_mode() {
-        // discoverAccounts: null must use legacy mode with default account.
+    fn discovery_null_uses_single_account_mode() {
+        // discoverAccounts: null must use single-account mode with default account.
         let plugin = test_plugin(
             r#"
             globalThis.__openusage_plugin = {
@@ -3393,8 +3454,8 @@ mod tests {
     }
 
     #[test]
-    fn discovery_undefined_uses_legacy_mode() {
-        // Explicit discoverAccounts: undefined must use legacy mode.
+    fn discovery_undefined_uses_single_account_mode() {
+        // Explicit discoverAccounts: undefined must use single-account mode.
         let plugin = test_plugin(
             r#"
             globalThis.__openusage_plugin = {
@@ -3489,10 +3550,9 @@ mod tests {
     }
 
     #[test]
-    fn discovery_throwing_account_getter_isolates_that_account() {
-        // A probe that returns a result with a throwing account getter
-        // must produce an error for that account only, while the next
-        // account still succeeds.
+    fn probe_account_throwing_getter_has_no_effect() {
+        // probe().account accessor is NEVER accessed, so a throwing getter
+        // on result.account has no effect.
         let plugin = test_plugin(
             r#"
             globalThis.__openusage_plugin = {
@@ -3511,28 +3571,80 @@ mod tests {
                 },
                 discoverAccounts(ctx) {
                     return [
-                        { id: "broken", displayName: "Broken" },
-                        { id: "good", displayName: "Good" }
+                        { id: "broken" },
+                        { id: "good" }
                     ];
                 }
             };
             "#,
         );
-        let result = run_probe(&plugin, &temp_app_dir("getter-isolate"), "0.0.0", None);
+        let result = run_probe(&plugin, &temp_app_dir("getter-no-effect"), "0.0.0", None);
         assert_eq!(result.outputs.len(), 2);
-        // First (broken) account: error carrying discovered identity.
+        // Neither account sees the getter - both succeed
         assert_eq!(result.outputs[0].account.id, "broken");
         assert!(
-            result.outputs[0].lines[0]
-                .to_string()
-                .contains("accessor threw"),
-            "broken account should have error about accessor"
+            result.outputs[0].lines[0].to_string().contains("broken"),
+            "broken account should succeed (account getter is never read)"
         );
-        // Second (good) account: succeeds.
         assert_eq!(result.outputs[1].account.id, "good");
         assert!(
             result.outputs[1].lines[0].to_string().contains("good"),
-            "good account should succeed"
+            "good account should also succeed"
+        );
+    }
+
+    #[test]
+    fn soft_fail_hides_default_error_only_when_opencode_also_errors() {
+        // Regression: errorPolicy=hide-if-other-account on a default descriptor
+        // hides that error when ANY OTHER descriptor exists. But opencode errors
+        // stay visible. So when both default and opencode error, only the opencode
+        // error output is present.
+        let plugin = test_plugin(
+            r#"
+            globalThis.__openusage_plugin = {
+                probe(ctx) {
+                    if (ctx.account.id === "opencode-0") {
+                        throw "opencode error detail";
+                    }
+                    throw "default error detail";
+                },
+                discoverAccounts(ctx) {
+                    return [
+                        { id: "default", origin: "native", errorPolicy: "hide-if-other-account" },
+                        { id: "opencode-0", origin: "opencode" }
+                    ];
+                }
+            };
+            "#,
+        );
+        let result = run_probe(&plugin, &temp_app_dir("soft-fail-opencode"), "0.0.0", None);
+
+        // Default error is hidden (hide-if-other-account + other descriptor exists).
+        // Opencode error stays visible (opencode errors are never hidden).
+        assert_eq!(
+            result.outputs.len(),
+            1,
+            "expected only opencode error output, got {} outputs: {:?}",
+            result.outputs.len(),
+            result
+                .outputs
+                .iter()
+                .map(|o| &o.account.id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            result.outputs[0].account.id, "opencode-0",
+            "remaining output must be the opencode account"
+        );
+        assert_eq!(
+            result.outputs[0].account.origin, "opencode",
+            "remaining output must have opencode origin"
+        );
+        // The opencode error detail should be visible
+        assert!(
+            error_text(&result.outputs[0]).contains("opencode error detail"),
+            "opencode error message must be visible, got: {}",
+            error_text(&result.outputs[0])
         );
     }
 }

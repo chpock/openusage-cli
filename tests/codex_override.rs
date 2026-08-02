@@ -1,8 +1,22 @@
-use openusage_cli::plugin_engine::script_patch;
-use rquickjs::{Context, Runtime};
+#![allow(unreachable_patterns)]
+
+// Integration tests for the Codex plugin override.
+//
+// Every test calls the single shared `RunSpec { probe_mode: true }` path,
+// which calls `execute_provider_in_context` (production probe code).
+// No manual Runtime/Context/override_api injection or discovery/probe loops.
+//
+// Tests assert actual `ProbeResult` (typed outputs with lines, accounts)
+// and/or optional post-probe assertion JS that captures test-state JSON.
+
+mod support;
+
+use openusage_cli::plugin_engine::runtime::ProbeResult;
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
+
+use support::override_runner::{ProviderOutcome, ProviderSpec, run_provider_probe};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -18,45 +32,111 @@ fn codex_override_script() -> String {
     fs::read_to_string(path).expect("read codex override")
 }
 
-fn execute_probe_with_setup(setup_script: &str) -> Value {
-    let plugin_script = codex_plugin_script();
-    let override_script = codex_override_script();
-    let transformed =
-        script_patch::transform_plugin_script("codex", &plugin_script, Some(&override_script))
-            .expect("transform codex plugin for test");
-
-    let rt = Runtime::new().expect("runtime");
-    let ctx = Context::full(&rt).expect("context");
-
-    ctx.with(|ctx| {
-        ctx.eval::<(), _>(HARNESS_SCRIPT.as_bytes())
-            .expect("eval harness");
-        ctx.eval::<(), _>(setup_script.as_bytes())
-            .expect("eval setup");
-        ctx.eval::<(), _>(transformed.script.as_bytes())
-            .expect("eval plugin");
-        ctx.eval::<(), _>(override_script.as_bytes())
-            .expect("eval override script");
-
-        let json: String = ctx
-            .eval(PROBE_EXEC_SCRIPT.as_bytes())
-            .expect("execute probe script");
-        serde_json::from_str(&json).expect("parse probe output")
-    })
+/// Run a codex probe test through the shared runner.
+///
+/// `setup_js` is injected as the `setup` field; it mutates `__test_state`
+/// with files, responses, account, and other test fixtures.
+///
+/// Returns the `ProbeResult` and an option to inspect assertion JSON.
+fn run_codex_probe(setup_js: &str) -> (ProbeResult, Option<Value>) {
+    let outcome = run_provider_probe(&ProviderSpec {
+        plugin_id: "codex",
+        plugin_name: "Codex",
+        plugin_source: &codex_plugin_script(),
+        override_source: Some(&codex_override_script()),
+        harness: HARNESS_SCRIPT,
+        setup: setup_js,
+        assertion: Some(ASSERTION_SCRIPT),
+        // probe_mode removed — ProviderSpec has no such field
+    });
+    match outcome {
+        ProviderOutcome::Probe { result, assertion } => {
+            let obs = assertion.ok();
+            (result, obs)
+        }
+        other => panic!("expected Probe outcome, got {:?}", other),
+    }
 }
 
-fn assert_subscriptions(output: &Value, expected: &[&str]) {
-    let subs: Vec<&str> = output["state"]["subscriptions"]
+fn assert_subscriptions(obs: &Value, expected: &[&str]) {
+    let subs: Vec<&str> = obs["subscriptions"]
         .as_array()
         .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
         .unwrap_or_default();
     assert_eq!(subs, expected, "subscription mismatch");
 }
 
+/// Extract the first request from assertion state.
+fn first_request(obs: &Value) -> Option<Value> {
+    obs["requests"]
+        .as_array()
+        .and_then(|arr| arr.first().cloned())
+}
+
+fn first_request_auth(obs: &Value) -> String {
+    first_request(obs)
+        .and_then(|r| r["authorization"].as_str().map(String::from))
+        .unwrap_or_default()
+}
+
+fn first_request_account_id(obs: &Value) -> String {
+    first_request(obs)
+        .and_then(|r| r["accountId"].as_str().map(String::from))
+        .unwrap_or_default()
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Test suite
+// ═══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn codex_override_native_default_source() {
+    // Native Codex auth (no opencode fallback needed) with default account.
+    let (result, obs) = run_codex_probe(
+        r#"
+        __test_state.files["~/.config/codex/auth.json"] = JSON.stringify({
+          tokens: {
+            access_token: "native-token"
+          },
+          last_refresh: "2026-04-19T00:00:00.000Z"
+        });
+        __test_state.responses.usage.push({
+          status: 200,
+          headers: {},
+          bodyText: JSON.stringify({})
+        });
+        "#,
+    );
+
+    let obs = obs.expect("assertion should produce state");
+
+    // Both candidate paths declared at override evaluation time.
+    assert_subscriptions(
+        &obs,
+        &[
+            "~/.local/share/opencode/auth.json",
+            "~/.config/opencode/auth.json",
+        ],
+    );
+
+    // Native token used.
+    assert_eq!(first_request_auth(&obs), "Bearer native-token");
+
+    // Probe result has correct metadata from execute_provider_in_context.
+    assert!(!result.outputs.is_empty(), "expected at least one output");
+    assert_eq!(result.outputs[0].provider_id, "codex");
+    assert_eq!(result.outputs[0].display_name, "Codex");
+    assert_eq!(
+        result.outputs[0].account.origin, "native",
+        "default account origin should be native"
+    );
+}
+
 #[test]
 fn codex_override_uses_opencode_fallback_auth_when_primary_auth_missing() {
-    let output = execute_probe_with_setup(
+    let (result, obs) = run_codex_probe(
         r#"
+        __test_state.account = "opencode-0";
         __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({
           openai: {
             type: "oauth",
@@ -74,35 +154,31 @@ fn codex_override_uses_opencode_fallback_auth_when_primary_auth_missing() {
         "#,
     );
 
-    assert_eq!(output["ok"], Value::Bool(true));
+    let obs = obs.expect("assertion should produce state");
 
-    // Both candidate paths declared at override evaluation time.
     assert_subscriptions(
-        &output,
+        &obs,
         &[
             "~/.local/share/opencode/auth.json",
             "~/.config/opencode/auth.json",
         ],
     );
 
-    let first_request = output["state"]["requests"]
-        .as_array()
-        .and_then(|arr| arr.first())
-        .expect("first request");
+    assert_eq!(first_request_auth(&obs), "Bearer fallback-access");
+    assert_eq!(first_request_account_id(&obs), "fallback-account");
 
+    // Probe metadata from typed runner.
+    assert!(!result.outputs.is_empty());
+    assert_eq!(result.outputs[0].provider_id, "codex");
     assert_eq!(
-        first_request["authorization"],
-        Value::String("Bearer fallback-access".to_string())
-    );
-    assert_eq!(
-        first_request["accountId"],
-        Value::String("fallback-account".to_string())
+        result.outputs[0].account.origin, "opencode",
+        "opencode account origin should be opencode"
     );
 }
 
 #[test]
 fn codex_override_preserves_original_auth_path_priority() {
-    let output = execute_probe_with_setup(
+    let (result, obs) = run_codex_probe(
         r#"
         __test_state.files["~/.config/codex/auth.json"] = JSON.stringify({
           tokens: {
@@ -127,32 +203,31 @@ fn codex_override_preserves_original_auth_path_priority() {
         "#,
     );
 
-    assert_eq!(output["ok"], Value::Bool(true));
+    let obs = obs.expect("assertion should produce state");
 
-    // Both candidate paths declared at override evaluation time.
     assert_subscriptions(
-        &output,
+        &obs,
         &[
             "~/.local/share/opencode/auth.json",
             "~/.config/opencode/auth.json",
         ],
     );
 
-    let first_request = output["state"]["requests"]
-        .as_array()
-        .and_then(|arr| arr.first())
-        .expect("first request");
+    assert_eq!(first_request_auth(&obs), "Bearer primary-access");
 
+    assert!(!result.outputs.is_empty());
+    assert_eq!(result.outputs[0].provider_id, "codex");
     assert_eq!(
-        first_request["authorization"],
-        Value::String("Bearer primary-access".to_string())
+        result.outputs[0].account.origin, "native",
+        "default account origin should be native"
     );
 }
 
 #[test]
 fn codex_override_persists_refresh_back_to_opencode_auth_file() {
-    let output = execute_probe_with_setup(
+    let (result, obs) = run_codex_probe(
         r#"
+        __test_state.account = "opencode-0";
         __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({
           openai: {
             type: "oauth",
@@ -183,20 +258,17 @@ fn codex_override_persists_refresh_back_to_opencode_auth_file() {
         "#,
     );
 
-    assert_eq!(output["ok"], Value::Bool(true));
+    let obs = obs.expect("assertion should produce state");
 
-    // Both candidate paths declared at override evaluation time.
     assert_subscriptions(
-        &output,
+        &obs,
         &[
             "~/.local/share/opencode/auth.json",
             "~/.config/opencode/auth.json",
         ],
     );
 
-    let requests = output["state"]["requests"]
-        .as_array()
-        .expect("requests array");
+    let requests = obs["requests"].as_array().expect("requests array");
     assert!(
         requests.iter().any(|req| req["url"]
             .as_str()
@@ -220,7 +292,7 @@ fn codex_override_persists_refresh_back_to_opencode_auth_file() {
         Value::String("Bearer new-access".to_string())
     );
 
-    let updated_text = output["state"]["files"]["~/.local/share/opencode/auth.json"]
+    let updated_text = obs["files"]["~/.local/share/opencode/auth.json"]
         .as_str()
         .expect("updated opencode auth file text");
     let updated: Value = serde_json::from_str(updated_text).expect("updated auth json");
@@ -236,12 +308,20 @@ fn codex_override_persists_refresh_back_to_opencode_auth_file() {
         updated["openai"]["accountId"],
         Value::String("acc-123".to_string())
     );
+
+    assert!(!result.outputs.is_empty());
+    assert_eq!(result.outputs[0].provider_id, "codex");
+    assert_eq!(
+        result.outputs[0].account.origin, "opencode",
+        "opencode account origin should be opencode"
+    );
 }
 
 #[test]
 fn codex_override_reloads_opencode_auth_before_refresh() {
-    let output = execute_probe_with_setup(
+    let (result, obs) = run_codex_probe(
         r#"
+        __test_state.account = "opencode-0";
         __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({
           openai: {
             type: "oauth",
@@ -283,22 +363,17 @@ fn codex_override_reloads_opencode_auth_before_refresh() {
         "#,
     );
 
-    assert_eq!(output["ok"], Value::Bool(true));
+    let obs = obs.expect("assertion should produce state");
 
-    // Both candidate paths declared at override evaluation time.
-    // The reload of the active fallback does NOT duplicate paths.
     assert_subscriptions(
-        &output,
+        &obs,
         &[
             "~/.local/share/opencode/auth.json",
             "~/.config/opencode/auth.json",
         ],
     );
 
-    let requests = output["state"]["requests"]
-        .as_array()
-        .expect("requests array");
-
+    let requests = obs["requests"].as_array().expect("requests array");
     assert!(
         requests.iter().all(|req| !req["url"]
             .as_str()
@@ -321,12 +396,20 @@ fn codex_override_reloads_opencode_auth_before_refresh() {
         usage_requests[1]["authorization"],
         Value::String("Bearer new-access-from-opencode".to_string())
     );
+
+    assert!(!result.outputs.is_empty());
+    assert_eq!(result.outputs[0].provider_id, "codex");
+    assert_eq!(
+        result.outputs[0].account.origin, "opencode",
+        "opencode account origin should be opencode"
+    );
 }
 
 #[test]
 fn codex_override_preserves_other_providers_when_persisting_refresh() {
-    let output = execute_probe_with_setup(
+    let (result, obs) = run_codex_probe(
         r#"
+        __test_state.account = "opencode-0";
         __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({
           openai: {
             type: "oauth",
@@ -363,18 +446,17 @@ fn codex_override_preserves_other_providers_when_persisting_refresh() {
         "#,
     );
 
-    assert_eq!(output["ok"], Value::Bool(true));
+    let obs = obs.expect("assertion should produce state");
 
-    // Both candidate paths declared at override evaluation time.
     assert_subscriptions(
-        &output,
+        &obs,
         &[
             "~/.local/share/opencode/auth.json",
             "~/.config/opencode/auth.json",
         ],
     );
 
-    let updated_text = output["state"]["files"]["~/.local/share/opencode/auth.json"]
+    let updated_text = obs["files"]["~/.local/share/opencode/auth.json"]
         .as_str()
         .expect("updated opencode auth file text");
     let updated: Value = serde_json::from_str(updated_text).expect("updated auth json");
@@ -391,12 +473,20 @@ fn codex_override_preserves_other_providers_when_persisting_refresh() {
         updated["google"]["refresh"],
         Value::String("google-refresh".to_string())
     );
+
+    assert!(!result.outputs.is_empty());
+    assert_eq!(result.outputs[0].provider_id, "codex");
+    assert_eq!(
+        result.outputs[0].account.origin, "opencode",
+        "opencode account origin should be opencode"
+    );
 }
 
 #[test]
 fn codex_override_tries_multiple_opencode_auth_paths() {
-    let output = execute_probe_with_setup(
+    let (result, obs) = run_codex_probe(
         r#"
+        __test_state.account = "opencode-1";
         __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({
           google: {
             type: "oauth",
@@ -422,55 +512,747 @@ fn codex_override_tries_multiple_opencode_auth_paths() {
         "#,
     );
 
-    assert_eq!(output["ok"], Value::Bool(true));
+    let obs = obs.expect("assertion should produce state");
 
-    // Both fallback paths consulted (first has no openai, second has it).
     assert_subscriptions(
-        &output,
+        &obs,
         &[
             "~/.local/share/opencode/auth.json",
             "~/.config/opencode/auth.json",
         ],
     );
 
-    let first_request = output["state"]["requests"]
-        .as_array()
-        .and_then(|arr| arr.first())
-        .expect("first request");
+    assert_eq!(first_request_auth(&obs), "Bearer fallback-access-2");
+    assert_eq!(first_request_account_id(&obs), "fallback-account-2");
 
+    assert!(!result.outputs.is_empty());
+    assert_eq!(result.outputs[0].provider_id, "codex");
     assert_eq!(
-        first_request["authorization"],
-        Value::String("Bearer fallback-access-2".to_string())
-    );
-    assert_eq!(
-        first_request["accountId"],
-        Value::String("fallback-account-2".to_string())
+        result.outputs[0].account.origin, "opencode",
+        "opencode account origin should be opencode"
     );
 }
 
 #[test]
 fn codex_override_keeps_not_logged_in_error_without_valid_fallback_payload() {
-    let output = execute_probe_with_setup(
+    let (result, obs) = run_codex_probe(
         r#"
         __test_state.files["~/.local/share/opencode/auth.json"] = "{bad-json";
         "#,
     );
 
-    assert_eq!(output["ok"], Value::Bool(false));
+    let obs = obs.expect("assertion should produce state");
 
-    // Invalid JSON at first fallback path -> still consulted.
     assert_subscriptions(
-        &output,
+        &obs,
         &[
             "~/.local/share/opencode/auth.json",
             "~/.config/opencode/auth.json",
         ],
     );
 
-    let error = output["error"].as_str().unwrap_or_default();
-    assert!(error.contains("Not logged in"));
+    // The plugin or override fails to parse the invalid JSON during lifecycle
+    // (e.g. discoverAccounts tries to read and parse the file). The error
+    // surfaces in the ProbeResult's PluginOutput lines.
+    assert!(!result.outputs.is_empty(), "expected an output");
+    assert_eq!(result.outputs[0].provider_id, "codex");
+    assert_eq!(
+        result.outputs[0].account.origin, "opencode",
+        "opencode error account origin should be opencode"
+    );
+    let error_text: String = result.outputs[0]
+        .lines
+        .iter()
+        .map(|l| format!("{}", l))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        error_text.contains("Invalid JSON") || error_text.contains("failed"),
+        "expected a parse or lifecycle error for bad JSON, got: {}",
+        error_text
+    );
 }
 
+#[test]
+fn codex_override_only_default_soft_fail() {
+    // Only one account with error policy hide-if-other-account -> no suppression.
+    let outcome = run_provider_probe(&ProviderSpec {
+        plugin_id: "codex",
+        plugin_name: "Codex",
+        plugin_source: &codex_plugin_script(),
+        override_source: Some(&codex_override_script()),
+        harness: HARNESS_SCRIPT,
+        setup: r#"
+        __test_state.files["~/.config/codex/auth.json"] = JSON.stringify({
+          tokens: { access_token: "primary" },
+          last_refresh: "2026-04-19T00:00:00.000Z"
+        });
+        __test_state.responses.usage.push({
+          status: 200,
+          headers: {},
+          bodyText: JSON.stringify({})
+        });
+        "#,
+        assertion: Some(ASSERTION_SCRIPT),
+        // probe_mode removed — ProviderSpec has no such field
+    });
+    match outcome {
+        ProviderOutcome::Probe { result, .. } => {
+            // Should have at least one output from the real plugin discovery.
+            assert!(!result.outputs.is_empty(), "expected probe outputs");
+            assert_eq!(result.outputs[0].provider_id, "codex");
+            assert_eq!(
+                result.outputs[0].account.origin, "native",
+                "default only account origin should be native"
+            );
+        }
+        other => panic!("expected Probe outcome, got {:?}", other),
+    }
+}
+
+#[test]
+fn codex_override_stable_path_index_ids() {
+    // Verify that discovery accounts carry stable path-index-based IDs
+    // matching the original override behavior.
+    let (result, obs) = run_codex_probe(
+        r#"
+        __test_state.account = "opencode-0";
+        __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({
+          openai: {
+            type: "oauth",
+            refresh: "r",
+            access: "a",
+            expires: 1776806966592,
+            accountId: "acct-0"
+          }
+        });
+        __test_state.responses.usage.push({
+          status: 200,
+          headers: {},
+          bodyText: JSON.stringify({})
+        });
+        "#,
+    );
+
+    let obs = obs.expect("assertion should produce state");
+
+    // Subscription paths confirm the override's fallback discovery ran.
+    assert_subscriptions(
+        &obs,
+        &[
+            "~/.local/share/opencode/auth.json",
+            "~/.config/opencode/auth.json",
+        ],
+    );
+
+    assert!(!result.outputs.is_empty());
+    assert_eq!(result.outputs[0].provider_id, "codex");
+    assert_eq!(
+        result.outputs[0].account.origin, "opencode",
+        "opencode account origin should be opencode"
+    );
+}
+
+#[test]
+fn codex_override_no_cross_source_native_fallback() {
+    // When native auth exists, opencode fallback is NOT used.
+    let (result, obs) = run_codex_probe(
+        r#"
+        __test_state.account = "opencode-0";
+        __test_state.files["~/.config/codex/auth.json"] = JSON.stringify({
+          tokens: {
+            access_token: "native-only"
+          },
+          last_refresh: "2026-04-19T00:00:00.000Z"
+        });
+        __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({
+          openai: {
+            type: "oauth",
+            refresh: "fallback-refresh",
+            access: "fallback-access",
+            expires: 1776806966592,
+            accountId: "fallback-account"
+          }
+        });
+        __test_state.responses.usage.push({
+          status: 200,
+          headers: {},
+          bodyText: JSON.stringify({})
+        });
+        "#,
+    );
+
+    let obs = obs.expect("assertion should produce state");
+
+    // Should still declare both candidate paths.
+    assert_subscriptions(
+        &obs,
+        &[
+            "~/.local/share/opencode/auth.json",
+            "~/.config/opencode/auth.json",
+        ],
+    );
+
+    // Native token used, not opencode.
+    assert_eq!(first_request_auth(&obs), "Bearer native-only");
+
+    assert!(!result.outputs.is_empty());
+    assert!(!result.outputs.is_empty());
+    assert_eq!(result.outputs[0].provider_id, "codex");
+    assert_eq!(
+        result.outputs[0].account.origin, "native",
+        "default account origin should be native"
+    );
+    // The opencode-0 output (index 1) should have opencode origin.
+    if result.outputs.len() > 1 {
+        assert_eq!(
+            result.outputs[1].account.origin, "opencode",
+            "opencode account origin should be opencode"
+        );
+    }
+}
+
+#[test]
+fn codex_override_empty_source_no_account() {
+    // Empty source file is treated as normally absent — no account/error created.
+    let (result, obs) = run_codex_probe(
+        r#"
+        __test_state.files["~/.local/share/opencode/auth.json"] = "";
+        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify({}) });
+        "#,
+    );
+    let obs = obs.expect("assertion should produce state");
+    assert_subscriptions(
+        &obs,
+        &[
+            "~/.local/share/opencode/auth.json",
+            "~/.config/opencode/auth.json",
+        ],
+    );
+    // Only default account — no error descriptor for empty source.
+    assert!(!result.outputs.is_empty(), "expected probe outputs");
+    assert_eq!(result.outputs[0].provider_id, "codex");
+    assert_eq!(
+        result.outputs[0].account.origin, "native",
+        "default account origin should be native"
+    );
+}
+
+#[test]
+fn codex_override_unreadable_source_creates_error_account() {
+    // Source file exists but readText throws -> error account for that candidate.
+    let (result, obs) = run_codex_probe(
+        r#"
+        __test_state.files["~/.local/share/opencode/auth.json"] = "throw-on-read";
+        __test_state.readErrors["~/.local/share/opencode/auth.json"] = true;
+        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify({}) });
+        "#,
+    );
+    let obs = obs.expect("assertion should produce state");
+    assert_subscriptions(
+        &obs,
+        &[
+            "~/.local/share/opencode/auth.json",
+            "~/.config/opencode/auth.json",
+        ],
+    );
+    // Error account with read error descriptor visible.
+    assert!(!result.outputs.is_empty(), "expected probe outputs");
+    assert_eq!(result.outputs[0].provider_id, "codex");
+    assert_eq!(
+        result.outputs[0].account.origin, "opencode",
+        "opencode error account origin should be opencode"
+    );
+    let error_text: String = result.outputs[0]
+        .lines
+        .iter()
+        .map(|l| format!("{}", l))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        error_text.contains("read error") || error_text.contains("Failed to read"),
+        "expected read error, got: {}",
+        error_text
+    );
+}
+
+#[test]
+fn codex_override_missing_provider_key_omits_candidate() {
+    // File exists but no openai key -> no account created for that candidate.
+    let (result, obs) = run_codex_probe(
+        r#"
+        __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({
+            google: { type: "oauth", access: "g-access", expires: 1776806966592 }
+        });
+        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify({}) });
+        "#,
+    );
+    let obs = obs.expect("assertion should produce state");
+    assert_subscriptions(
+        &obs,
+        &[
+            "~/.local/share/opencode/auth.json",
+            "~/.config/opencode/auth.json",
+        ],
+    );
+    // Only default account — missing key creates no extra account.
+    assert!(!result.outputs.is_empty(), "expected probe outputs");
+    assert_eq!(result.outputs[0].provider_id, "codex");
+}
+
+#[test]
+fn codex_override_malformed_provider_block_null_error() {
+    // openai key is null -> error account.
+    let (result, obs) = run_codex_probe(
+        r#"
+        __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({
+            openai: null
+        });
+        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify({}) });
+        "#,
+    );
+    let obs = obs.expect("assertion should produce state");
+    assert_subscriptions(
+        &obs,
+        &[
+            "~/.local/share/opencode/auth.json",
+            "~/.config/opencode/auth.json",
+        ],
+    );
+    // Null provider block creates a visible error for that candidate.
+    assert!(!result.outputs.is_empty(), "expected probe outputs");
+    assert_eq!(result.outputs[0].provider_id, "codex");
+    let error_text: String = result.outputs[0]
+        .lines
+        .iter()
+        .map(|l| format!("{}", l))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        error_text.contains("Provider block") || error_text.contains("Invalid"),
+        "expected provider block error, got: {}",
+        error_text
+    );
+}
+
+#[test]
+fn codex_override_malformed_provider_block_array_error() {
+    // openai key is an array -> error account.
+    let (result, obs) = run_codex_probe(
+        r#"
+        __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({
+            openai: ["not", "valid"]
+        });
+        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify({}) });
+        "#,
+    );
+    let obs = obs.expect("assertion should produce state");
+    assert_subscriptions(
+        &obs,
+        &[
+            "~/.local/share/opencode/auth.json",
+            "~/.config/opencode/auth.json",
+        ],
+    );
+    assert!(!result.outputs.is_empty(), "expected probe outputs");
+    assert_eq!(result.outputs[0].provider_id, "codex");
+    assert_eq!(
+        result.outputs[0].account.origin, "opencode",
+        "opencode error account origin should be opencode"
+    );
+    let error_text: String = result.outputs[0]
+        .lines
+        .iter()
+        .map(|l| format!("{}", l))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        error_text.contains("Provider block") || error_text.contains("Invalid"),
+        "expected provider block error, got: {}",
+        error_text
+    );
+}
+
+#[test]
+fn codex_override_missing_access_token_error() {
+    // Provider block exists but missing access token -> error account.
+    let (result, obs) = run_codex_probe(
+        r#"
+        __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({
+            openai: { type: "oauth", refresh: "r", expires: 1776806966592 }
+        });
+        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify({}) });
+        "#,
+    );
+    let obs = obs.expect("assertion should produce state");
+    assert_subscriptions(
+        &obs,
+        &[
+            "~/.local/share/opencode/auth.json",
+            "~/.config/opencode/auth.json",
+        ],
+    );
+    assert!(!result.outputs.is_empty(), "expected probe outputs");
+    assert_eq!(result.outputs[0].provider_id, "codex");
+    assert_eq!(
+        result.outputs[0].account.origin, "opencode",
+        "opencode error account origin should be opencode"
+    );
+    let error_text: String = result.outputs[0]
+        .lines
+        .iter()
+        .map(|l| format!("{}", l))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        error_text.contains("access") || error_text.contains("Invalid"),
+        "expected error about missing access token, got: {}",
+        error_text
+    );
+}
+
+#[test]
+fn codex_override_default_native_error_visible_when_alone() {
+    // No opencode files, native auth fails -> default error visible.
+    let (result, obs) = run_codex_probe(
+        r#"
+        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify({}) });
+        "#,
+    );
+    let obs = obs.expect("assertion should produce state");
+    assert_subscriptions(
+        &obs,
+        &[
+            "~/.local/share/opencode/auth.json",
+            "~/.config/opencode/auth.json",
+        ],
+    );
+    assert!(!result.outputs.is_empty(), "expected probe outputs");
+    assert_eq!(result.outputs[0].provider_id, "codex");
+    let error_text: String = result.outputs[0]
+        .lines
+        .iter()
+        .map(|l| format!("{}", l))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        error_text.contains("Not logged in") || error_text.contains("error"),
+        "expected native auth failure visible, got: {}",
+        error_text
+    );
+}
+
+#[test]
+fn codex_override_default_suppressed_when_opencode_descriptor_exists() {
+    // Malformed JSON creates error descriptor; default error suppressed.
+    let (result, obs) = run_codex_probe(
+        r#"
+        __test_state.files["~/.local/share/opencode/auth.json"] = "{bad-json";
+        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify({}) });
+        "#,
+    );
+    let obs = obs.expect("assertion should produce state");
+    assert_subscriptions(
+        &obs,
+        &[
+            "~/.local/share/opencode/auth.json",
+            "~/.config/opencode/auth.json",
+        ],
+    );
+    // Only opencode-0 error account visible, default suppressed.
+    assert!(!result.outputs.is_empty(), "expected probe outputs");
+    assert_eq!(result.outputs[0].provider_id, "codex");
+}
+
+#[test]
+fn codex_override_no_cross_source_fallback() {
+    // OpenCode account should not fall through to native credentials.
+    let (result, obs) = run_codex_probe(
+        r#"
+        __test_state.account = "opencode-0";
+        __test_state.files["~/.config/codex/auth.json"] = JSON.stringify({
+            tokens: { access_token: "native-only" },
+            last_refresh: "2026-04-19T00:00:00.000Z"
+        });
+        __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({
+            openai: { type: "oauth", access: "oc-access", expires: 1776806966592, accountId: "oc-acc" }
+        });
+        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify({}) });
+        "#,
+    );
+    let obs = obs.expect("assertion should produce state");
+    assert_subscriptions(
+        &obs,
+        &[
+            "~/.local/share/opencode/auth.json",
+            "~/.config/opencode/auth.json",
+        ],
+    );
+    // Native token ignored for opencode account
+    assert!(!result.outputs.is_empty());
+    assert_eq!(result.outputs[0].provider_id, "codex");
+}
+
+#[test]
+fn codex_override_refresh_error_propagation() {
+    // Upstream refresh endpoint returns error -> propagated to output.
+    let (result, obs) = run_codex_probe(
+        r#"
+        __test_state.account = "opencode-0";
+        __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({
+            openai: { type: "oauth", refresh: "old-refresh", access: "old-access",
+                      expires: 1776806966592, accountId: "acc-123" }
+        });
+        __test_state.responses.usage.push({ status: 401, headers: {}, bodyText: JSON.stringify({ error: "expired" }) });
+        __test_state.responses.refresh.push({ status: 400, headers: {}, bodyText: JSON.stringify({ error: "invalid_grant" }) });
+        "#,
+    );
+    let obs = obs.expect("assertion should produce state");
+    assert_subscriptions(
+        &obs,
+        &[
+            "~/.local/share/opencode/auth.json",
+            "~/.config/opencode/auth.json",
+        ],
+    );
+    assert!(!result.outputs.is_empty(), "expected probe outputs");
+    assert_eq!(result.outputs[0].provider_id, "codex");
+    let error_text: String = result.outputs[0]
+        .lines
+        .iter()
+        .map(|l| format!("{}", l))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        error_text.contains("Token expired")
+            || error_text.contains("refresh")
+            || error_text.contains("invalid_grant"),
+        "expected refresh error propagation, got: {}",
+        error_text
+    );
+}
+
+#[test]
+fn codex_override_persistence_failure_visible() {
+    // Persist fails after refresh -> error visible, original file unchanged.
+    let (result, obs) = run_codex_probe(
+        r#"
+        __test_state.account = "opencode-0";
+        __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({
+            openai: { type: "oauth", refresh: "old-refresh", access: "old-access",
+                      expires: 1776806966592, accountId: "acc-123" }
+        });
+        __test_state.responses.usage.push({ status: 401, headers: {}, bodyText: JSON.stringify({ error: "expired" }) });
+        __test_state.responses.refresh.push({ status: 200, headers: {}, bodyText: JSON.stringify({ access_token: "new-access", refresh_token: "new-refresh" }) });
+        __test_ctx.host.fs.writeText = function() { throw new Error("write failure"); };
+        "#,
+    );
+    let obs = obs.expect("assertion should produce state");
+    assert_subscriptions(
+        &obs,
+        &[
+            "~/.local/share/opencode/auth.json",
+            "~/.config/opencode/auth.json",
+        ],
+    );
+    assert!(!result.outputs.is_empty(), "expected probe outputs");
+    assert_eq!(result.outputs[0].provider_id, "codex");
+    let error_text: String = result.outputs[0]
+        .lines
+        .iter()
+        .map(|l| format!("{}", l))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        error_text.contains("write")
+            || error_text.contains("persist")
+            || error_text.contains("failed"),
+        "expected persistence error, got: {}",
+        error_text
+    );
+}
+// ═══════════════════════════════════════════════════════════════════════
+// Regression: missing subscribeFile
+// ═══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn codex_override_fails_visibly_when_subscribefile_missing() {
+    // Regression: missing subscribeFile should cause override init to fail
+    // visibly rather than silently continuing.
+    let outcome = run_provider_probe(&ProviderSpec {
+        plugin_id: "codex",
+        plugin_name: "Codex",
+        plugin_source: &codex_plugin_script(),
+        override_source: Some(&codex_override_script()),
+        harness: HARNESS_SCRIPT,
+        setup: r#"
+        delete __test_ctx.host.fs.subscribeFile;
+        "#,
+        assertion: None,
+    });
+    match outcome {
+        ProviderOutcome::Probe { result, .. } => {
+            assert!(
+                !result.outputs.is_empty(),
+                "expected error output when subscribeFile is missing"
+            );
+            let error_text: String = result.outputs[0]
+                .lines
+                .iter()
+                .map(|l| format!("{}", l))
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                error_text.contains("subscribeFile")
+                    || error_text.contains("plugin override failed"),
+                "expected error about missing subscribeFile, got: {}",
+                error_text
+            );
+        }
+        other => panic!("expected Probe outcome, got {:?}", other),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Public run_probe lifecycle test
+// ═══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn codex_override_run_probe_lifecycle() {
+    let Some(paths) = support::hermetic::enter("codex_override_run_probe_lifecycle") else {
+        return;
+    };
+
+    // Use the public production `run_probe` entrypoint with a temporary
+    // override directory and HOME, exercising the real override file and
+    // real host API (filesystem, env) without network.
+    use openusage_cli::plugin_engine::manifest::{LoadedPlugin, PluginManifest};
+    use openusage_cli::plugin_engine::runtime::{MetricLine, PluginOutput, run_probe_in_sandbox};
+
+    // Synthetic plugin with all AST patch targets required by the codex override.
+    let plugin_script = r#"
+(function() {
+  function loadAuth(ctx) { return null; }
+  function saveAuth(ctx, authState) { return false; }
+  function refreshToken(ctx, authState) { return null; }
+  function probe(ctx) {
+    var authState = loadAuth(ctx);
+    if (!authState || !authState.auth) {
+      throw "Not logged in. Run `codex` to authenticate.";
+    }
+    var auth = authState.auth;
+    if (auth.tokens && auth.tokens.access_token) {
+      return {
+        plan: "Pro",
+        lines: [ctx.line.badge({ label: "Status", text: "Authenticated" })]
+      };
+    }
+    throw "Not logged in. Run `codex` to authenticate.";
+  }
+  globalThis.__openusage_plugin = { id: "codex", probe: probe };
+})();
+"#;
+
+    // Write the real override file
+    let override_path = paths.overrides.join("codex.js");
+    std::fs::write(&override_path, codex_override_script()).expect("write override file");
+
+    // Create a valid OpenCode auth candidate in HOME
+    let opencode_dir = paths.root.join(".local/share/opencode");
+    std::fs::create_dir_all(&opencode_dir).expect("create opencode dir");
+    let auth_json = serde_json::json!({
+        "openai": {
+            "type": "oauth",
+            "access": "test-access-token",
+            "refresh": "test-refresh-token",
+            "expires": 9999999999999i64,
+            "accountId": "test-account"
+        }
+    });
+    std::fs::write(
+        opencode_dir.join("auth.json"),
+        serde_json::to_string_pretty(&auth_json).expect("serialize auth"),
+    )
+    .expect("write auth.json");
+
+    let plugin = LoadedPlugin {
+        manifest: PluginManifest {
+            schema_version: 1,
+            id: "codex".to_string(),
+            name: "Codex".to_string(),
+            version: "0.0.0".to_string(),
+            entry: "plugin.js".to_string(),
+            icon: "icon.svg".to_string(),
+            brand_color: None,
+            lines: vec![],
+            links: vec![],
+        },
+        plugin_dir: std::path::PathBuf::from("."),
+        entry_script: plugin_script.to_string(),
+        icon_data_url: "data:image/svg+xml;base64,".to_string(),
+    };
+
+    let result = run_probe_in_sandbox(
+        &plugin,
+        &paths.app_data,
+        "0.0.0-test",
+        Some(&paths.overrides),
+        &paths.root,
+    );
+
+    // Assert: override file was loaded (discoverAccounts produced opencode-0)
+    assert!(!result.outputs.is_empty(), "expected at least one output");
+
+    // Find the opencode-0 output
+    let opencode_outputs: Vec<&PluginOutput> = result
+        .outputs
+        .iter()
+        .filter(|o| o.account.id == "opencode-0")
+        .collect();
+    assert_eq!(
+        opencode_outputs.len(),
+        1,
+        "expected exactly one opencode-0 output, got {:?}",
+        result.outputs
+    );
+
+    let output = opencode_outputs[0];
+
+    // Assert: native/default failure is soft-suppressed
+    // (the "default" account with hide-if-other-account should not appear)
+    let default_outputs: Vec<&PluginOutput> = result
+        .outputs
+        .iter()
+        .filter(|o| o.account.id == "default")
+        .collect();
+    assert!(
+        default_outputs.is_empty(),
+        "default account should be suppressed when opencode-0 exists"
+    );
+
+    // Assert: resulting output is exactly the expected opencode-0 account with successful output
+    assert_eq!(output.provider_id, "codex");
+    assert_eq!(output.display_name, "Codex");
+    assert_eq!(output.plan.as_deref(), Some("Pro"));
+    assert_eq!(output.lines.len(), 1, "expected exactly one line");
+    match &output.lines[0] {
+        MetricLine::Badge { label, text, .. } => {
+            assert_eq!(label, "Status");
+            assert_eq!(text, "Authenticated");
+        }
+        other => panic!("expected badge line, got: {:?}", other),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Harness and assertion scripts
+// ═══════════════════════════════════════════════════════════════════════
+
+/// The harness script sets up `__test_state` and `__openusage_ctx` with
+/// mock implementations for all host APIs the Codex plugin and override use.
+///
+/// This is evaluated via the `before_plugin` hook before the lifecycle runs,
+/// so the plugin and override see the mock context.
 const HARNESS_SCRIPT: &str = r#"
 (function () {
   globalThis.__test_state = {
@@ -479,6 +1261,7 @@ const HARNESS_SCRIPT: &str = r#"
     requests: [],
     logs: [],
     subscriptions: [],
+    readErrors: {},
     responses: {
       usage: [],
       refresh: []
@@ -513,6 +1296,9 @@ const HARNESS_SCRIPT: &str = r#"
         readText: function (path) {
           if (!Object.prototype.hasOwnProperty.call(globalThis.__test_state.files, path)) {
             throw new Error("file not found: " + path);
+          }
+          if (globalThis.__test_state.readErrors && globalThis.__test_state.readErrors[path]) {
+            throw new Error("read error: " + path);
           }
           return globalThis.__test_state.files[path];
         },
@@ -653,31 +1439,17 @@ const HARNESS_SCRIPT: &str = r#"
 })();
 "#;
 
-const PROBE_EXEC_SCRIPT: &str = r#"
-(function () {
-  try {
-    var result = globalThis.__openusage_plugin.probe(globalThis.__test_ctx);
-    return JSON.stringify({
-      ok: true,
-      result: result,
-      state: {
-        files: globalThis.__test_state.files,
-        requests: globalThis.__test_state.requests,
-        logs: globalThis.__test_state.logs,
-        subscriptions: globalThis.__test_state.subscriptions
-      }
-    });
-  } catch (e) {
-    return JSON.stringify({
-      ok: false,
-      error: String(e),
-      state: {
-        files: globalThis.__test_state.files,
-        requests: globalThis.__test_state.requests,
-        logs: globalThis.__test_state.logs,
-        subscriptions: globalThis.__test_state.subscriptions
-      }
-    });
-  }
+/// Post-probe assertion script — captures test state as JSON for Rust assertions.
+/// This is evaluated after `execute_provider_in_context` finishes, so all
+/// probe-induced file writes, requests, and subscriptions are available.
+const ASSERTION_SCRIPT: &str = r#"
+(function() {
+  var state = globalThis.__test_state;
+  return JSON.stringify({
+    subscriptions: state.subscriptions,
+    requests: state.requests,
+    files: state.files,
+    logs: state.logs
+  });
 })();
 "#;

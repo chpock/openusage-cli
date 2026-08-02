@@ -1,296 +1,436 @@
+// ── Codex override: account discovery + source routing ────────────
+// This override adds opencode-<path-index> accounts to the Codex plugin.
+// It patches loadAuth, saveAuth, and refreshToken to route through
+// exact selected auth files with no cross-file or native fallback.
+
 globalThis.__openusage_ast_patch = {
   functions: [
-    // Codex keeps auth internals private in plugin scope. We patch load/save/refresh
-    // so opencode auth.json can be used as an alternative source of truth.
     { target: "loadAuth", with: "patchLoadAuth", mode: "wrap" },
     { target: "saveAuth", with: "patchSaveAuth", mode: "wrap" },
-    { target: "refreshToken", with: "patchRefreshToken", mode: "wrap" },
-  ],
+    { target: "refreshToken", with: "patchRefreshToken", mode: "wrap" }
+  ]
 };
 
-const OPENCODE_AUTH_PATHS = [
-  "~/.local/share/opencode/auth.json",
-  "~/.config/opencode/auth.json",
-];
-const OPENAI_PROVIDER_KEY = "openai";
+globalThis.__openusage_function_overrides = {
+  functions: [
+    { target: "discoverAccounts", with: "discoverAccounts", mode: "replace" }
+  ]
+};
 
-// Declare candidate paths at override evaluation time so the monitor
-// dependency tracker knows about them before any probe runs.
-(function() {
+// ── Helpers ───────────────────────────────────────────────────────
+
+function isNonEmptyString(v) {
+  return typeof v === "string" && v.length > 0;
+}
+
+function logWarn(ctx, msg) {
   try {
-    var ctx = globalThis.__openusage_ctx;
-    if (ctx && ctx.host && ctx.host.fs && typeof ctx.host.fs.subscribeFile === "function") {
-      for (var i = 0; i < OPENCODE_AUTH_PATHS.length; i++) {
-        ctx.host.fs.subscribeFile(OPENCODE_AUTH_PATHS[i]);
-      }
-    }
-  } catch (_) {}
-})();
-
-function patchLoadAuth(originalLoadAuth, ctx) {
-  const primary = originalLoadAuth(ctx);
-  if (primary) {
-    return primary;
-  }
-  // Preserve original priority: fallback is only used when Codex local auth
-  // is missing or empty.
-  return loadOpencodeAuthFallback(ctx);
-}
-
-function patchSaveAuth(originalSaveAuth, ctx, authState) {
-  if (authState && authState.source === "opencode") {
-    // When auth came from opencode fallback, keep writes in the same file so
-    // refresh results do not diverge from the fallback source.
-    return persistAuthToOpencode(ctx, authState);
-  }
-  return originalSaveAuth(ctx, authState);
-}
-
-function patchRefreshToken(originalRefreshToken, ctx, authState) {
-  if (!authState || authState.source !== "opencode") {
-    return originalRefreshToken(ctx, authState);
-  }
-
-  // Codex may run refresh while another process already rotated tokens in
-  // opencode auth.json. Reload first to avoid unnecessary oauth/token calls.
-  const currentAccessToken = readAccessToken(authState);
-  const latestAuthState = reloadOpencodeAuthState(ctx, authState);
-  if (latestAuthState) {
-    applyAuthState(authState, latestAuthState);
-    const reloadedAccessToken = readAccessToken(authState);
-    if (
-      isNonEmptyString(reloadedAccessToken) &&
-      (!isNonEmptyString(currentAccessToken) || reloadedAccessToken !== currentAccessToken)
-    ) {
-      logInfo(ctx, "codex override: token reloaded from opencode auth.json, refresh skipped");
-      return reloadedAccessToken;
-    }
-  }
-
-  return originalRefreshToken(ctx, authState);
-}
-
-function logInfo(ctx, message) {
-  try {
-    if (ctx && ctx.host && ctx.host.log && typeof ctx.host.log.info === "function") {
-      ctx.host.log.info(message);
+    if (ctx && ctx.host && typeof ctx.host.log === "function") {
+      ctx.host.log("warn", msg);
     }
   } catch (_) {}
 }
 
-function logWarn(ctx, message) {
-  try {
-    if (ctx && ctx.host && ctx.host.log && typeof ctx.host.log.warn === "function") {
-      ctx.host.log.warn(message);
+function buildAuthStateFromCredential(cred, route) {
+  var auth = {
+    last_refresh: new Date().toISOString(),
+    tokens: {
+      access_token: cred.access_token || "",
+      refresh_token: cred.refresh_token || "",
     }
-  } catch (_) {}
-}
-
-function parseJsonLoose(text) {
-  if (typeof text !== "string") {
-    return null;
-  }
-  const trimmed = text.replace(/\u0000+$/g, "").trim();
-  if (!trimmed) {
-    return null;
-  }
-  try {
-    return JSON.parse(trimmed);
-  } catch (_) {
-    return null;
-  }
-}
-
-function isNonEmptyString(value) {
-  return typeof value === "string" && value.trim().length > 0;
-}
-
-function nowIso() {
-  return new Date().toISOString();
-}
-
-function readAccessToken(authState) {
-  if (!authState || !authState.auth || !authState.auth.tokens) {
-    return "";
-  }
-  const accessToken = authState.auth.tokens.access_token;
-  return isNonEmptyString(accessToken) ? accessToken.trim() : "";
-}
-
-function applyAuthState(targetAuthState, latestAuthState) {
-  if (!targetAuthState || !latestAuthState) {
-    return;
-  }
-  // Mutate the existing object because Codex continues using the same authState
-  // reference after refreshToken returns.
-  targetAuthState.source = latestAuthState.source;
-  targetAuthState.authPath = latestAuthState.authPath;
-  targetAuthState.auth = latestAuthState.auth;
-}
-
-function buildCodexAuthStateFromOpencodeDoc(doc, sourcePath) {
-  if (!doc || typeof doc !== "object") {
-    return null;
-  }
-
-  const openai = doc[OPENAI_PROVIDER_KEY];
-  if (!openai || typeof openai !== "object") {
-    return null;
-  }
-
-  const accessToken = isNonEmptyString(openai.access) ? openai.access.trim() : "";
-  if (!accessToken) {
-    return null;
-  }
-
-  const tokens = {
-    access_token: accessToken,
   };
-  if (isNonEmptyString(openai.refresh)) {
-    tokens.refresh_token = openai.refresh.trim();
+  if (route.accountId) {
+    auth.tokens.account_id = route.accountId;
   }
-  if (isNonEmptyString(openai.accountId)) {
-    tokens.account_id = openai.accountId.trim();
-  }
-
   return {
     source: "opencode",
-    authPath: sourcePath,
-    auth: {
-      tokens: tokens,
-      // Codex stores an ISO timestamp in auth.last_refresh; keep the shape it
-      // expects even for fallback-derived state.
-      last_refresh: nowIso(),
-    },
+    auth: auth,
+    authPath: route.path,
+    providerKey: route.providerKey
   };
 }
 
-function loadOpencodeAuthAtPath(ctx, authPath) {
-  if (!ctx || !ctx.host || !ctx.host.fs || !isNonEmptyString(authPath)) {
-    return null;
+// ── Route registry ────────────────────────────────────────────────
+// Populated by discoverAccounts. Each entry maps accountId -> route.
+var routes = {};
+
+// ── discoverAccounts ──────────────────────────────────────────────
+// Scans OPENCODE_AUTH_PATHS for valid auth files and yields one
+// account per candidate. Each account is identified by its path index.
+
+var OPENCODE_AUTH_PATHS = [
+  "~/.local/share/opencode/auth.json",
+  "~/.config/opencode/auth.json"
+];
+var OPENAI_PROVIDER_KEY = "openai";
+
+function discoverAccounts(ctx, originalDiscoverAccounts) {
+  // Reset routes on each discovery
+  var keys = Object.keys(routes);
+  for (var i = 0; i < keys.length; i++) {
+    delete routes[keys[i]];
   }
 
-  if (!ctx.host.fs.exists(authPath)) {
-    return null;
-  }
+  var accounts = [];
 
-  const text = ctx.host.fs.readText(authPath);
-  const doc = parseJsonLoose(text);
-  if (!doc) {
-    logWarn(ctx, "codex override: opencode auth file is invalid JSON: " + authPath);
-    return null;
-  }
-
-  const authState = buildCodexAuthStateFromOpencodeDoc(doc, authPath);
-  if (!authState) {
-    logWarn(ctx, "codex override: openai auth payload not found in " + authPath);
-    return null;
-  }
-
-  return authState;
-}
-
-function reloadOpencodeAuthState(ctx, authState) {
-  if (!ctx || !ctx.host || !ctx.host.fs) {
-    return null;
-  }
-
-  if (authState && isNonEmptyString(authState.authPath)) {
+  // Include original plugin accounts first
+  if (typeof originalDiscoverAccounts === "function") {
     try {
-      // Prefer the currently active file first so token source remains stable.
-      const fromCurrentPath = loadOpencodeAuthAtPath(ctx, authState.authPath);
-      if (fromCurrentPath) {
-        return fromCurrentPath;
+      var origAccounts = originalDiscoverAccounts(ctx);
+      if (Array.isArray(origAccounts)) {
+        for (var oi = 0; oi < origAccounts.length; oi++) {
+          accounts.push(origAccounts[oi]);
+        }
+      }
+    } catch (_) {}
+  } else {
+    // No original discoverAccounts — add a default account with
+    // hide-if-other-account policy so errors are suppressed when
+    // opencode accounts exist.
+    accounts.push({
+      id: "default",
+      errorPolicy: "hide-if-other-account"
+    });
+  }
+
+  var fs = ctx && ctx.host && ctx.host.fs;
+
+  for (var i = 0; i < OPENCODE_AUTH_PATHS.length; i++) {
+    var path = OPENCODE_AUTH_PATHS[i];
+    var accountId = "opencode-" + i;
+
+    if (!fs || typeof fs.readText !== "function") {
+      continue;
+    }
+
+    // Check existence first to distinguish missing from unreadable.
+    var fileExists;
+    try {
+      if (typeof fs.exists === "function") {
+        fileExists = fs.exists(path);
+      } else {
+        // No exists API — fall back to try-readText
+        fileExists = null;
       }
     } catch (e) {
-      logWarn(
-        ctx,
-        "codex override: failed to reload opencode auth from " + authState.authPath + ": " + String(e)
-      );
+      // exists() threw — treat as error route
+      routes[accountId] = { type: "error", error: "Failed to check auth file: " + String(e) };
+      accounts.push({ id: accountId, origin: "opencode" });
+      continue;
     }
-  }
 
-  // If the current path no longer works, walk regular fallback paths.
-  return loadOpencodeAuthFallback(ctx);
-}
+    if (fileExists === false) {
+      // File does not exist — omit this account
+      continue;
+    }
 
-function loadOpencodeAuthFallback(ctx) {
-  if (!ctx || !ctx.host || !ctx.host.fs) {
-    return null;
-  }
-
-  // Path order is explicit and deterministic to keep behavior predictable.
-  for (let i = 0; i < OPENCODE_AUTH_PATHS.length; i++) {
-    const authPath = OPENCODE_AUTH_PATHS[i];
+    var text;
     try {
-      const fallback = loadOpencodeAuthAtPath(ctx, authPath);
-      if (!fallback) {
+      text = fs.readText(path);
+    } catch (e) {
+      // File exists but read failed — error route
+      routes[accountId] = { type: "error", error: "Failed to read auth file: " + String(e) };
+      accounts.push({ id: accountId, origin: "opencode" });
+      continue;
+    }
+
+    if (!isNonEmptyString(text)) {
+      continue;
+    }
+
+    var doc;
+    try {
+      doc = JSON.parse(text);
+    } catch (e) {
+      routes[accountId] = { type: "error", error: "Invalid JSON: " + String(e) };
+      accounts.push({ id: accountId, origin: "opencode" });
+      continue;
+    }
+
+    if (!doc || typeof doc !== "object" || Array.isArray(doc)) {
+      routes[accountId] = { type: "error", error: "Auth file is not valid JSON" };
+      accounts.push({ id: accountId, origin: "opencode" });
+      continue;
+    }
+
+    // Find the first provider block with an access token
+    var providerKeys = Object.keys(doc);
+    var found = false;
+
+    for (var j = 0; j < providerKeys.length; j++) {
+      var key = providerKeys[j];
+      var block = doc[key];
+
+      // Only accept openai provider blocks
+      if (key !== OPENAI_PROVIDER_KEY) {
         continue;
       }
 
-      logInfo(ctx, "codex override: using fallback auth from " + authPath);
-      return fallback;
-    } catch (e) {
-      logWarn(ctx, "codex override: failed to read fallback auth from " + authPath + ": " + String(e));
+      // Provider block exists but is not an object — error account
+      if (!block || typeof block !== "object" || Array.isArray(block)) {
+        routes[accountId] = { type: "error", error: "Provider block is not an object" };
+        accounts.push({ id: accountId, origin: "opencode" });
+        found = true;
+        break;
+      }
+
+      var accessToken = isNonEmptyString(block.access) ? block.access.trim() : "";
+      if (!accessToken) {
+        // Provider block exists but no access token — error account
+        routes[accountId] = { type: "error", error: "Provider block has no access token" };
+        accounts.push({ id: accountId, origin: "opencode" });
+        found = true;
+        break;
+      }
+
+      var refreshToken = isNonEmptyString(block.refresh) ? block.refresh.trim() : "";
+      var accountIdFromBlock = isNonEmptyString(block.accountId) ? block.accountId : "";
+
+      // Store route for this account
+      routes[accountId] = {
+        path: path,
+        providerKey: key,
+        accountId: accountIdFromBlock,
+        credential: {
+          access_token: accessToken,
+          refresh_token: refreshToken
+        },
+        type: "ready",
+        persistFailed: false
+      };
+
+      accounts.push({ id: accountId, origin: "opencode" });
+      found = true;
+      break;
+    }
+
+    if (!found) {
+      continue;
     }
   }
 
-  return null;
+  return accounts;
 }
 
-function persistAuthToOpencode(ctx, authState) {
-  if (!authState || authState.source !== "opencode" || !isNonEmptyString(authState.authPath)) {
-    return false;
+// ── AST Patch implementations (direct callbacks) ──────────────────
+// Each callback receives (original, ...args) and returns the result
+// directly — no factory/handler wrapping.
+
+function patchLoadAuth(originalLoadAuth, ctx) {
+  var accountId = ctx && ctx.account && ctx.account.id;
+
+  if (!accountId || accountId === "default") {
+    return originalLoadAuth(ctx);
   }
 
-  const auth = authState.auth;
-  if (!auth || typeof auth !== "object") {
-    return false;
+  var route = routes[accountId];
+  if (!route) {
+    throw "Unknown account: " + accountId;
   }
 
-  const tokens = auth.tokens;
-  if (!tokens || typeof tokens !== "object") {
-    return false;
+  if (route.type === "error") {
+    throw route.error;
   }
 
-  const fs = ctx && ctx.host && ctx.host.fs;
+  if (route.persistFailed) {
+    throw "Token persistence failed for account " + accountId;
+  }
+
+  return buildAuthStateFromCredential(route.credential, route);
+}
+
+function patchSaveAuth(originalSaveAuth, ctx, authState) {
+  var accountId = ctx && ctx.account && ctx.account.id;
+
+  if (!accountId || accountId === "default") {
+    return originalSaveAuth(ctx, authState);
+  }
+
+  var route = routes[accountId];
+  if (!route) {
+    throw "Unknown account: " + accountId;
+  }
+
+  if (route.type === "error") {
+    throw route.error;
+  }
+
+  if (route.persistFailed) {
+    throw "Token persistence failed for account " + accountId;
+  }
+
+  var tokens = authState && authState.auth && authState.auth.tokens;
+  if (!tokens) return false;
+
+  var newTokens = {};
+  if (isNonEmptyString(tokens.access_token)) {
+    newTokens.access_token = tokens.access_token;
+  }
+  if (isNonEmptyString(tokens.refresh_token)) {
+    newTokens.refresh_token = tokens.refresh_token;
+  }
+
+  var saved = persistToFile(ctx, route.path, route.providerKey, newTokens);
+  if (!saved) {
+    route.persistFailed = true;
+    logWarn(ctx, "codex override: failed to persist auth to " + route.path);
+  } else {
+    if (newTokens.access_token) route.credential.access_token = newTokens.access_token;
+    if (newTokens.refresh_token) route.credential.refresh_token = newTokens.refresh_token;
+    route.persistFailed = false;
+  }
+  return saved;
+}
+
+function patchRefreshToken(originalRefreshToken, ctx, authState) {
+  var accountId = ctx && ctx.account && ctx.account.id;
+
+  if (!accountId || accountId === "default") {
+    return originalRefreshToken(ctx, authState);
+  }
+
+  var route = routes[accountId];
+  if (!route) {
+    throw "Unknown account: " + accountId;
+  }
+
+  if (route.type === "error") {
+    throw route.error;
+  }
+
+  if (route.persistFailed) {
+    throw "Token persistence failed for account " + accountId;
+  }
+
+  // Capture in-memory token before exact-source reload
+  var priorToken = route.credential && route.credential.access_token;
+
+  var providerBlock = readProviderBlock(ctx, route.path, route.providerKey);
+  if (!providerBlock) {
+    throw "Failed to reload auth file for account " + accountId;
+  }
+
+  var currentAccessToken = isNonEmptyString(providerBlock.access)
+    ? providerBlock.access.trim()
+    : "";
+
+  // If token changed on disk since last load, use it immediately
+  // without OAuth refresh, regardless of last_refresh age.
+  if (isNonEmptyString(currentAccessToken) && currentAccessToken !== priorToken) {
+    route.credential.access_token = currentAccessToken;
+    if (authState && authState.auth && authState.auth.tokens) {
+      authState.auth.tokens.access_token = currentAccessToken;
+    }
+    return currentAccessToken;
+  }
+
+  // No changed token — delegate to upstream OAuth refresh.
+  var upstreamRefreshResult = originalRefreshToken(ctx, authState);
+
+  // Sync route credential state from the mutated authState after upstream refresh.
+  if (authState && authState.auth && authState.auth.tokens) {
+    var upstreamAccess = authState.auth.tokens.access_token;
+    if (isNonEmptyString(upstreamAccess)) {
+      route.credential.access_token = upstreamAccess;
+    }
+    var upstreamRefresh = authState.auth.tokens.refresh_token;
+    if (isNonEmptyString(upstreamRefresh)) {
+      route.credential.refresh_token = upstreamRefresh;
+    }
+  }
+
+  // If selected-source save failed earlier, surface it now as an
+  // account-specific error — even though upstream may have succeeded.
+  if (route.persistFailed) {
+    throw "Token refresh succeeded but persistence failed for account " + accountId;
+  }
+
+  return upstreamRefreshResult;
+}
+
+// ── File persistence helpers ──────────────────────────────────────
+
+function readProviderBlock(ctx, path, providerKey) {
+  var fs = ctx && ctx.host && ctx.host.fs;
+  if (!fs || typeof fs.readText !== "function") return null;
+
+  var text;
+  try {
+    text = fs.readText(path);
+  } catch (_) {
+    return null;
+  }
+
+  if (!isNonEmptyString(text)) return null;
+
+  var doc;
+  try {
+    doc = JSON.parse(text);
+  } catch (_) {
+    return null;
+  }
+
+  if (!doc || typeof doc !== "object" || Array.isArray(doc)) return null;
+
+  var block = doc[providerKey];
+  if (!block || typeof block !== "object" || Array.isArray(block)) return null;
+
+  return block;
+}
+
+function persistToFile(ctx, path, providerKey, tokens) {
+  var fs = ctx && ctx.host && ctx.host.fs;
   if (!fs || typeof fs.readText !== "function" || typeof fs.writeText !== "function") {
     return false;
   }
 
-  let doc = {};
+  var text;
   try {
-    if (fs.exists(authState.authPath)) {
-      doc = parseJsonLoose(fs.readText(authState.authPath)) || {};
-    }
+    text = fs.readText(path);
   } catch (_) {
-    doc = {};
-  }
-  if (!doc || typeof doc !== "object") {
-    doc = {};
+    return false;
   }
 
-  let openai = doc[OPENAI_PROVIDER_KEY];
-  if (!openai || typeof openai !== "object") {
-    openai = {};
+  if (!isNonEmptyString(text)) return false;
+
+  var doc;
+  try {
+    doc = JSON.parse(text);
+  } catch (_) {
+    return false;
   }
 
-  // Update only openai block and preserve other providers in auth.json.
+  if (!doc || typeof doc !== "object" || Array.isArray(doc)) return false;
+
+  var block = doc[providerKey];
+  if (!block || typeof block !== "object" || Array.isArray(block)) {
+    // Provider block missing — cannot persist
+    return false;
+  }
+
   if (isNonEmptyString(tokens.access_token)) {
-    openai.access = tokens.access_token;
+    block.access = tokens.access_token;
   }
   if (isNonEmptyString(tokens.refresh_token)) {
-    openai.refresh = tokens.refresh_token;
+    block.refresh = tokens.refresh_token;
   }
-  if (isNonEmptyString(tokens.account_id)) {
-    openai.accountId = tokens.account_id;
-  }
-  if (!isNonEmptyString(openai.type)) {
-    openai.type = "oauth";
+  block.type = "oauth";
+  if (typeof block.expires !== "number") {
+    block.expires = 0;
   }
 
-  doc[OPENAI_PROVIDER_KEY] = openai;
-  fs.writeText(authState.authPath, JSON.stringify(doc, null, 2));
-  logInfo(ctx, "codex override: persisted auth to " + authState.authPath);
-  return true;
+  doc[providerKey] = block;
+
+  try {
+    fs.writeText(path, JSON.stringify(doc, null, 2));
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+// ── Subscribe to candidate paths ─────────────────────────────────
+// Subscribe to candidate paths so the monitor knows about them.
+for (var si = 0; si < OPENCODE_AUTH_PATHS.length; si++) {
+  globalThis.__openusage_ctx.host.fs.subscribeFile(OPENCODE_AUTH_PATHS[si]);
 }

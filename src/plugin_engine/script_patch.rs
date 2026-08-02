@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use swc_core::common::{FileName, SourceMap, sync::Lrc};
 use swc_core::ecma::ast::{
-    AssignExpr, AssignTarget, BlockStmt, Decl, Expr, ExprStmt, Lit, ObjectLit, Pat, Prop, PropName,
-    PropOrSpread, Script, SimpleAssignTarget, Stmt,
+    AssignExpr, AssignTarget, BlockStmt, Decl, Expr, ExprStmt, Lit, MemberProp, ObjectLit, Pat,
+    Prop, PropName, PropOrSpread, Script, SimpleAssignTarget, Stmt,
 };
 use swc_core::ecma::codegen::text_writer::JsWriter;
 use swc_core::ecma::codegen::{Config as CodegenConfig, Emitter};
@@ -14,6 +14,8 @@ use swc_core::ecma::visit::{VisitMut, VisitMutWith};
 pub struct TransformResult {
     pub script: String,
     pub patched_functions: Vec<String>,
+    /// Per-patched-function: the registration name (from manifest `with` field)
+    pub callback_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +48,7 @@ pub fn transform_plugin_script(
         return Ok(TransformResult {
             script: source.to_string(),
             patched_functions: vec![],
+            callback_names: vec![],
         });
     };
 
@@ -53,6 +56,7 @@ pub fn transform_plugin_script(
         return Ok(TransformResult {
             script: source.to_string(),
             patched_functions: vec![],
+            callback_names: vec![],
         });
     };
 
@@ -78,10 +82,18 @@ pub fn transform_plugin_script(
         .map(|patch| patch.spec.target.clone())
         .collect::<Vec<_>>();
 
+    let callback_names = injector
+        .patches
+        .iter()
+        .filter(|patch| patch.applied)
+        .map(|patch| patch.spec.patch_function.clone())
+        .collect::<Vec<_>>();
+
     let script = emit_script(&cm, &plugin_script)?;
     Ok(TransformResult {
         script,
         patched_functions,
+        callback_names,
     })
 }
 
@@ -283,10 +295,8 @@ fn is_ast_patch_assignment_target(target: &AssignTarget) -> bool {
     }
 
     match &member.prop {
-        swc_core::ecma::ast::MemberProp::Ident(ident) => {
-            ident.sym.as_ref() == "__openusage_ast_patch"
-        }
-        swc_core::ecma::ast::MemberProp::Computed(computed) => {
+        MemberProp::Ident(ident) => ident.sym.as_ref() == "__openusage_ast_patch",
+        MemberProp::Computed(computed) => {
             if let Expr::Lit(Lit::Str(str_lit)) = &*computed.expr {
                 return str_lit.value == "__openusage_ast_patch";
             }
@@ -306,6 +316,7 @@ fn parse_patch_specs_from_manifest(manifest: &ObjectLit) -> Result<Vec<FunctionP
 
     let mut specs = Vec::new();
     let mut seen_targets = HashSet::new();
+    let mut seen_callback_names = HashSet::new();
 
     for (idx, element) in array_lit.elems.iter().enumerate() {
         let Some(element) = element else {
@@ -339,6 +350,14 @@ fn parse_patch_specs_from_manifest(manifest: &ObjectLit) -> Result<Vec<FunctionP
                 spec.target
             ));
         }
+
+        if !seen_callback_names.insert(spec.patch_function.clone()) {
+            return Err(format!(
+                "duplicate AST patch callback registration name in manifest: {}",
+                spec.patch_function
+            ));
+        }
+
         specs.push(spec);
     }
 
@@ -563,9 +582,33 @@ mod tests {
                 .contains("function __openusage_original_saveAuth"),
             "saveAuth should be renamed"
         );
+        assert!(
+            transformed.script.contains("function loadAuth("),
+            "loadAuth should use wrapper"
+        );
+        assert!(
+            transformed.script.contains("function saveAuth("),
+            "saveAuth should use wrapper"
+        );
+        assert!(
+            transformed
+                .script
+                .contains(r#"globalThis["patchLoadAuth"]"#),
+            "wrapper should look up patchLoadAuth on globalThis"
+        );
+        assert!(
+            transformed
+                .script
+                .contains(r#"globalThis["patchSaveAuth"]"#),
+            "wrapper should look up patchSaveAuth on globalThis"
+        );
         assert_eq!(
             transformed.patched_functions,
             vec!["loadAuth".to_string(), "saveAuth".to_string()]
+        );
+        assert_eq!(
+            transformed.callback_names,
+            vec!["patchLoadAuth".to_string(), "patchSaveAuth".to_string()]
         );
     }
 
@@ -574,16 +617,12 @@ mod tests {
         let source = r#"
         (function () {
           function loadAuth(ctx) { return null; }
-          function saveAuth(ctx, authState) {
-            return authState && authState.source === "file";
-          }
+          function saveAuth(ctx, authState) { return authState && authState.source === "file"; }
           function probe(ctx) {
             const authState = loadAuth(ctx);
             const persisted = saveAuth(ctx, authState);
-            return {
-              plan: authState && authState.source ? authState.source : "none",
-              lines: [ctx.line.badge({ label: "Persisted", text: String(persisted) })]
-            };
+            return { plan: authState && authState.source ? authState.source : "none",
+              lines: [ctx.line.badge({ label: "Persisted", text: String(persisted) })] };
           }
           globalThis.__openusage_plugin = { id: "codex", probe: probe };
         })();
@@ -601,9 +640,7 @@ mod tests {
           return { source: "opencode", auth: { tokens: { access_token: "x" } } };
         }
         function patchSaveAuth(original, ctx, authState) {
-          if (authState && authState.source === "opencode") {
-            return true;
-          }
+          if (authState && authState.source === "opencode") return true;
           return original(ctx, authState);
         }
         "#;
@@ -624,7 +661,6 @@ mod tests {
             ctx.eval::<String, _>(TEST_PROBE_SCRIPT.as_bytes())
                 .expect("eval probe")
         });
-
         let parsed: Value = serde_json::from_str(&probe_json).expect("parse probe json");
         assert_eq!(parsed["plan"], Value::String("opencode".to_string()));
         assert_eq!(parsed["persisted"], Value::String("true".to_string()));
@@ -634,7 +670,6 @@ mod tests {
     fn transform_is_noop_without_ast_manifest() {
         let source = "globalThis.__openusage_plugin = { id: \"mock\", probe: function() { return { lines: [] }; } };";
         let override_script = "globalThis.__openusage_override = { note: 'probe-only override' };";
-
         let transformed = transform_plugin_script("mock", source, Some(override_script))
             .expect("transform without manifest");
         assert_eq!(transformed.script, source);
@@ -655,20 +690,104 @@ mod tests {
         };
         function patchLoadAuth(original, ctx) { return original(ctx); }
         "#;
-
         let err = transform_plugin_script("codex", source, Some(override_script))
             .expect_err("expected missing target error");
         assert!(err.contains("loadAuth"));
     }
 
+    #[test]
+    fn transform_wrappers_fallback_before_override() {
+        let source = r#"
+        (function () {
+          function loadAuth(ctx) { return null; }
+          function probe(ctx) {
+            const state = loadAuth(ctx);
+            return { plan: state && state.source ? state.source : "none",
+              lines: [ctx.line.badge({ label: "Auth", text: state ? "yes" : "no" })] };
+          }
+          globalThis.__openusage_plugin = { id: "codex", probe: probe };
+        })();
+        "#;
+        let override_script = r#"
+        globalThis.__openusage_ast_patch = {
+          functions: [{ target: "loadAuth", with: "patchLoadAuth", mode: "wrap" }]
+        };
+        function patchLoadAuth(original, ctx) { return { source: "patched", auth: {} }; }
+        "#;
+        let transformed =
+            transform_plugin_script("codex", source, Some(override_script)).expect("transform");
+        let rt = Runtime::new().expect("runtime");
+        let ctx = Context::full(&rt).expect("context");
+        let probe_json = ctx.with(|ctx| {
+            ctx.eval::<(), _>(TEST_CTX_SCRIPT.as_bytes())
+                .expect("eval test ctx");
+            ctx.eval::<(), _>(transformed.script.as_bytes())
+                .expect("eval plugin");
+            // No override eval — wrapper falls back to original
+            ctx.eval::<String, _>(TEST_PROBE_SCRIPT.as_bytes())
+                .expect("eval probe")
+        });
+        let parsed: Value = serde_json::from_str(&probe_json).expect("parse probe json");
+        assert_eq!(parsed["plan"], Value::String("none".to_string()));
+    }
+
+    #[test]
+    fn transform_rejects_duplicate_with_names() {
+        let source = r#"
+        (function () {
+          function loadAuth(ctx) { return null; }
+          function saveAuth(ctx, authState) { return !!authState; }
+          globalThis.__openusage_plugin = { id: "codex", probe: function () {} };
+        })();
+        "#;
+        let override_script = r#"
+        globalThis.__openusage_ast_patch = {
+          functions: [
+            { target: "loadAuth", with: "patchAuth", mode: "wrap" },
+            { target: "saveAuth", with: "patchAuth", mode: "wrap" }
+          ]
+        };
+        "#;
+        let err = transform_plugin_script("codex", source, Some(override_script))
+            .expect_err("duplicate with names should be rejected");
+        assert!(
+            err.contains("duplicate AST patch callback registration name"),
+            "error should mention duplicate callback name, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn transform_rejects_duplicate_target_names() {
+        let source = r#"
+        (function () {
+          function loadAuth(ctx) { return null; }
+          globalThis.__openusage_plugin = { id: "codex", probe: function () {} };
+        })();
+        "#;
+        let override_script = r#"
+        globalThis.__openusage_ast_patch = {
+          functions: [
+            { target: "loadAuth", with: "patchLoadAuth", mode: "wrap" },
+            { target: "loadAuth", with: "patchLoadAuth2", mode: "wrap" }
+          ]
+        };
+        "#;
+        let err = transform_plugin_script("codex", source, Some(override_script))
+            .expect_err("duplicate target names should be rejected");
+        assert!(
+            err.contains("duplicate AST patch target"),
+            "error should mention duplicate target, got: {}",
+            err
+        );
+    }
+
     const TEST_CTX_SCRIPT: &str = r#"
     (function () {
       globalThis.__test_ctx = {
-        line: {
-          badge: function(opts) {
-            return { type: "badge", label: opts.label, text: opts.text };
-          }
-        }
+        line: { badge: function(opts) {
+          return { type: "badge", label: opts.label, text: opts.text };
+        } }
       };
     })();
     "#;

@@ -43,7 +43,7 @@ openusage-cli query --with-state
 
 ## `run-daemon` mode in detail
 
-Daemon mode keeps runtime warm and refreshes snapshots periodically (`--refresh-interval-secs`, default `300`).
+Daemon mode keeps runtime warm and refreshes snapshots periodically (`--refresh-interval-secs`, default `180`).
 
 Benefits:
 
@@ -130,7 +130,12 @@ Cons:
 Main runtime knobs:
 
 - `host` / `port`
-- `refresh_interval_secs`
+- `refresh_interval_secs` (default: `180`)
+- `aggressive_refresh_interval_secs` (default: `10`)
+
+  When a provider plan includes a `resetAt` timestamp, the daemon switches to
+  the aggressive interval for that provider after the reset time is reached,
+  polling more frequently so the new quota snapshot is available promptly.
 - `enabled_plugins`
 - `plugins_dir`
 - `plugin_overrides_dir`

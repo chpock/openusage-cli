@@ -1040,13 +1040,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_preserves_custom_account_from_plugin() {
+    async fn refresh_uses_default_account_in_single_account_mode() {
+        // Single-account mode (no discoverAccounts): probe result.account is ignored.
+        // The output always carries the default account.
         let plugin = test_plugin(
             r#"
             globalThis.__openusage_plugin = {
                 probe(ctx) {
                     return {
-                        account: { id: "custom-id", displayName: "Custom Name" },
+                        account: { id: "custom-id" },
                         lines: [ctx.line.text({ label: "Status", value: "ok" })]
                     };
                 }
@@ -1070,23 +1072,17 @@ mod tests {
         assert_eq!(snapshots[0].provider_id, "test");
         assert_eq!(
             snapshots[0].account,
-            AccountRef {
-                id: "custom-id".to_string(),
-                display_name: "Custom Name".to_string(),
-            },
-            "refresh must preserve custom account from plugin"
+            AccountRef::default_account(),
+            "single-account mode must use default account (probe result.account ignored)"
         );
 
-        // Verify the cached snapshot also has the custom account.
+        // Verify the cached snapshot also has the default account.
         let cached = state.cached(Some(&["test".to_string()])).await;
         assert_eq!(cached.len(), 1, "snapshot should be cached");
         assert_eq!(
             cached[0].account,
-            AccountRef {
-                id: "custom-id".to_string(),
-                display_name: "Custom Name".to_string(),
-            },
-            "cached snapshot must preserve custom account"
+            AccountRef::default_account(),
+            "cached snapshot must use default account in single-account mode"
         );
     }
 
@@ -1122,7 +1118,7 @@ mod tests {
                         fetched_at: now_iso(),
                         account: AccountRef {
                             id: "secondary".to_string(),
-                            display_name: "Secondary".to_string(),
+                            origin: "native".to_string(),
                         },
                     },
                 ],
@@ -1191,7 +1187,7 @@ mod tests {
                     fetched_at: now_iso(),
                     account: AccountRef {
                         id: "secondary".to_string(),
-                        display_name: "Secondary".to_string(),
+                        origin: "native".to_string(),
                     },
                 },
                 CachedPluginSnapshot {
@@ -1242,7 +1238,7 @@ mod tests {
                     fetched_at: now_iso(),
                     account: AccountRef {
                         id: "secondary".to_string(),
-                        display_name: "Secondary".to_string(),
+                        origin: "native".to_string(),
                     },
                 },
                 CachedPluginSnapshot {
@@ -1295,7 +1291,7 @@ mod tests {
                         fetched_at: now_iso(),
                         account: AccountRef {
                             id: "secondary".to_string(),
-                            display_name: "Secondary".to_string(),
+                            origin: "native".to_string(),
                         },
                     },
                     CachedPluginSnapshot {
@@ -1342,7 +1338,7 @@ mod tests {
                     fetched_at: now_iso(),
                     account: AccountRef {
                         id: "custom-account".to_string(),
-                        display_name: "Custom Account".to_string(),
+                        origin: "native".to_string(),
                     },
                 }],
             );
@@ -1380,7 +1376,7 @@ mod tests {
                         fetched_at: now_iso(),
                         account: AccountRef {
                             id: "account-a".to_string(),
-                            display_name: "Account A".to_string(),
+                            origin: "native".to_string(),
                         },
                     },
                     CachedPluginSnapshot {
@@ -1391,7 +1387,7 @@ mod tests {
                         fetched_at: now_iso(),
                         account: AccountRef {
                             id: "account-b".to_string(),
-                            display_name: "Account B".to_string(),
+                            origin: "native".to_string(),
                         },
                     },
                 ],
@@ -1417,7 +1413,7 @@ mod tests {
                 fetched_at: now_iso(),
                 account: AccountRef {
                     id: "other".to_string(),
-                    display_name: "Other".to_string(),
+                    origin: "native".to_string(),
                 },
             },
             CachedPluginSnapshot {
@@ -1455,7 +1451,7 @@ mod tests {
                 fetched_at: now_iso(),
                 account: AccountRef {
                     id: "secondary".to_string(),
-                    display_name: "Secondary".to_string(),
+                    origin: "native".to_string(),
                 },
             },
             CachedPluginSnapshot {
@@ -1491,8 +1487,8 @@ mod tests {
                 },
                 discoverAccounts(ctx) {
                     return [
-                        { id: "work", displayName: "Work" },
-                        { id: "personal", displayName: "Personal" }
+                        { id: "work" },
+                        { id: "personal" }
                     ];
                 }
             };
@@ -1574,8 +1570,8 @@ mod tests {
                 discoverAccounts(ctx) {
                     ctx.host.fs.subscribeFile("/tmp/discovery-dep.json");
                     return [
-                        { id: "a", displayName: "A" },
-                        { id: "b", displayName: "B" }
+                        { id: "a" },
+                        { id: "b" }
                     ];
                 }
             };
@@ -1666,8 +1662,8 @@ mod tests {
                 },
                 discoverAccounts(ctx) {
                     return [
-                        { id: "work", displayName: "Work" },
-                        { id: "personal", displayName: "Personal" }
+                        { id: "work" },
+                        { id: "personal" }
                     ];
                 }
             };

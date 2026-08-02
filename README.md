@@ -84,10 +84,13 @@ curl http://127.0.0.1:6738/v1/usage
 ## REST API at a glance
 
 - `GET /health`
+- `GET /v1/config`
 - `GET /v1/plugins`
 - `GET /v1/usage`
 - `GET /v1/usage/{provider}`
 - `POST /v1/probe`
+- `POST /v1/shutdown`
+- `POST /v1/restart`
 
 ## Documentation
 

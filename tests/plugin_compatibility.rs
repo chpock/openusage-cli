@@ -126,12 +126,10 @@ fn run_probe_with_production_ctx(
             .set_prototype(Some(&base_obj))
             .map_err(|_| "failed to set prototype".to_string())?;
 
-        // Create immutable default account object.
+        // Create immutable default account object (id only).
         let acct = Object::new(ctx.clone()).map_err(|_| "failed to create acct".to_string())?;
         acct.prop("id", Property::from("default").enumerable())
             .map_err(|_| "failed to set id".to_string())?;
-        acct.prop("displayName", Property::from("default").enumerable())
-            .map_err(|_| "failed to set displayName".to_string())?;
         child
             .prop("account", Property::from(acct).enumerable())
             .map_err(|_| "failed to set account".to_string())?;

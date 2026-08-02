@@ -371,8 +371,10 @@ fn query_mode_connects_to_running_daemon() {
 
     // Verify the default account is present on every snapshot
     assert!(
-        snapshots.iter().all(|s| s.get("account")
-            == Some(&serde_json::json!({"id": "default", "displayName": "default"}))),
+        snapshots
+            .iter()
+            .all(|s| s.get("account")
+                == Some(&serde_json::json!({"id": "default", "origin": "native"}))),
         "every query output snapshot must carry the default account"
     );
 
@@ -555,8 +557,10 @@ fn query_mode_with_state_reports_cache_when_daemon_response_is_used() {
 
     // Verify the default account on every wrapped data item
     assert!(
-        snapshots.iter().all(|s| s.get("account")
-            == Some(&serde_json::json!({"id": "default", "displayName": "default"}))),
+        snapshots
+            .iter()
+            .all(|s| s.get("account")
+                == Some(&serde_json::json!({"id": "default", "origin": "native"}))),
         "every daemon-backed --with-state snapshot must carry the default account"
     );
 
@@ -622,7 +626,7 @@ fn query_mode_use_daemon_false_skips_daemon_and_reports_direct_with_state() {
     {
         assert!(
             data.iter().all(|s| s.get("account")
-                == Some(&serde_json::json!({"id": "default", "displayName": "default"}))),
+                == Some(&serde_json::json!({"id": "default", "origin": "native"}))),
             "every forced-direct --with-state snapshot must carry the default account"
         );
     }
@@ -689,8 +693,10 @@ fn query_mode_falls_back_to_local_execution_when_no_daemon() {
 
     // Verify the default account on every local fallback snapshot
     assert!(
-        snapshots.iter().all(|s| s.get("account")
-            == Some(&serde_json::json!({"id": "default", "displayName": "default"}))),
+        snapshots
+            .iter()
+            .all(|s| s.get("account")
+                == Some(&serde_json::json!({"id": "default", "origin": "native"}))),
         "every local fallback snapshot must carry the default account"
     );
 }
@@ -931,8 +937,10 @@ fn query_mode_falls_back_when_daemon_endpoint_file_exists_but_daemon_dead() {
 
     // Verify the default account on every local fallback snapshot
     assert!(
-        snapshots.iter().all(|s| s.get("account")
-            == Some(&serde_json::json!({"id": "default", "displayName": "default"}))),
+        snapshots
+            .iter()
+            .all(|s| s.get("account")
+                == Some(&serde_json::json!({"id": "default", "origin": "native"}))),
         "every stale-daemon fallback snapshot must carry the default account"
     );
 

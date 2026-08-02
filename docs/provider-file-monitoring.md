@@ -214,17 +214,16 @@ The predeclared paths are:
 1. `~/.local/share/opencode/auth.json`
 2. `~/.config/opencode/auth.json`
 
-- **Primary auth available**: both candidate paths are declared but never read
-  by the override.  The monitor watches them anyway; if they change, the
-  provider is refreshed.
-- **Fallback used**: the same two paths (already declared).  No duplicate
-  subscriptions.
-- **Invalid JSON or missing file**: the paths are still declared; the monitor
-  watches their parent or frontier ancestor.  Changes to these files will
-  trigger a refresh even if the current probe could not read them.
+- Both candidate paths are declared during override evaluation, so monitoring
+  remains active even before discovery finds an OpenCode account.
+- Discovery evaluates each candidate as a distinct account even when native
+  credentials exist. Missing files are omitted; unreadable or malformed files
+  produce account-specific errors.
+- Monitoring remains predeclared. A later file creation, repair, deletion, or
+  replacement triggers a provider refresh and a new discovery cycle.
 
-The auth priority, fallback order, and persistence behaviour are unchanged from
-the upstream plugin contract.
+Persistence and auth-priority behaviour for OpenCode accounts are defined by
+the overrides and may differ from the upstream plugin contract.
 
 ## Symbolic link limitation
 
