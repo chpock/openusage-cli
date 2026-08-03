@@ -29,8 +29,12 @@ function isPlainObject(v) {
 
 function logWarn(ctx, msg) {
   try {
-    if (ctx && ctx.host && typeof ctx.host.log === "function") {
-      ctx.host.log("warn", msg);
+    if (ctx && ctx.host && ctx.host.log) {
+      if (typeof ctx.host.log.warn === "function") {
+        ctx.host.log.warn(msg);
+      } else if (typeof ctx.host.log === "function") {
+        ctx.host.log("warn", msg);
+      }
     }
   } catch (_) {}
 }
@@ -174,6 +178,7 @@ function discoverAccounts(ctx, originalDiscoverAccounts) {
   function pushErrorRoute(routeId, message, label) {
     routes[routeId] = { type: "error", error: message };
     accounts.push(buildAccountDescriptor(routeId, label || routeId));
+    logWarn(ctx, "codex override: " + message + " (account: " + routeId + ")");
   }
 
   function readJsonFile(path, missingState, kindLabel) {
@@ -378,16 +383,6 @@ function discoverAccounts(ctx, originalDiscoverAccounts) {
         continue;
       }
 
-      if (usedRouteIds[declaredAccountId]) {
-        var duplicateIdRoute = nextRouteId();
-        pushErrorRoute(
-          duplicateIdRoute,
-          "Duplicate accountId in discovery results: " + declaredAccountId,
-          declaredAccountId
-        );
-        continue;
-      }
-
       var routeId = reserveRouteId(declaredAccountId);
 
       var isActive = entry.isActive === true;
@@ -441,10 +436,12 @@ function patchLoadAuth(originalLoadAuth, ctx) {
 
   var route = routes[accountId];
   if (!route) {
+    logWarn(ctx, "codex override: unknown account route for " + String(accountId));
     throw "Unknown account: " + accountId;
   }
 
   if (route.type === "error") {
+    logWarn(ctx, "codex override: route error for " + String(accountId) + ": " + route.error);
     throw route.error;
   }
 
@@ -464,10 +461,12 @@ function patchSaveAuth(originalSaveAuth, ctx, authState) {
 
   var route = routes[accountId];
   if (!route) {
+    logWarn(ctx, "codex override: unknown account route for " + String(accountId));
     throw "Unknown account: " + accountId;
   }
 
   if (route.type === "error") {
+    logWarn(ctx, "codex override: route error for " + String(accountId) + ": " + route.error);
     throw route.error;
   }
 
@@ -507,10 +506,12 @@ function patchRefreshToken(originalRefreshToken, ctx, authState) {
 
   var route = routes[accountId];
   if (!route) {
+    logWarn(ctx, "codex override: unknown account route for " + String(accountId));
     throw "Unknown account: " + accountId;
   }
 
   if (route.type === "error") {
+    logWarn(ctx, "codex override: route error for " + String(accountId) + ": " + route.error);
     throw route.error;
   }
 
@@ -522,6 +523,7 @@ function patchRefreshToken(originalRefreshToken, ctx, authState) {
 
   var reloadedCredential = reloadCredentialFromRoute(ctx, route);
   if (!reloadedCredential) {
+    logWarn(ctx, "codex override: failed to reload credentials for account " + String(accountId));
     throw "Failed to reload auth file for account " + accountId;
   }
 

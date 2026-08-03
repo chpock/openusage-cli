@@ -25,6 +25,14 @@ function isPlainObject(v) {
   return !!v && typeof v === "object" && !Array.isArray(v);
 }
 
+function logWarn(ctx, msg) {
+  try {
+    if (ctx && ctx.host && ctx.host.log && typeof ctx.host.log.warn === "function") {
+      ctx.host.log.warn(msg);
+    }
+  } catch (_) {}
+}
+
 function parseJsonLoose(text) {
   if (!isNonEmptyString(text)) return null;
   try {
@@ -139,6 +147,7 @@ function discoverAccounts(ctx, originalDiscoverAccounts) {
       error: message
     };
     accounts.push(buildAccountDescriptor(routeId, label || routeId));
+    logWarn(ctx, "copilot override: " + message + " (path: " + path + ", account: " + routeId + ")");
   }
 
   function readJsonFile(path, missingState, kindLabel) {
@@ -333,12 +342,6 @@ function discoverAccounts(ctx, originalDiscoverAccounts) {
         continue;
       }
 
-      if (usedRouteIds[declaredAccountId]) {
-        var duplicateRouteId = nextRouteId();
-        pushErrorRoute(duplicateRouteId, accountsPath, "Duplicate accountId in discovery results: " + declaredAccountId, declaredAccountId);
-        continue;
-      }
-
       var routeId = reserveRouteId(declaredAccountId);
 
       var isActive = entry.isActive === true;
@@ -385,9 +388,11 @@ function patchLoadToken(originalLoadToken, ctx) {
 
   var route = ROUTE_REGISTRY[accountId];
   if (!route) {
+    logWarn(ctx, "copilot override: unknown account route for " + String(accountId));
     throw "Unknown account: " + accountId;
   }
   if (route.error) {
+    logWarn(ctx, "copilot override: route error for " + String(accountId) + ": " + route.error);
     throw route.error;
   }
 

@@ -592,6 +592,101 @@ fn copilot_override_accounts_json_duplicate_account_id_creates_error_route() {
 }
 
 #[test]
+fn copilot_override_accounts_json_duplicate_default_does_not_conflict_with_native_default() {
+    let (result, obs) = run_copilot_probe(
+        r#"
+        __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({
+          "github-copilot": {
+            type: "oauth",
+            refresh: "fallback-refresh",
+            access: "fallback-access",
+            expires: 0
+          }
+        });
+        __test_state.files["~/.local/share/opencode/accounts.json"] = JSON.stringify({
+          "github-copilot": [
+            { accountId: "default", isActive: true }
+          ]
+        });
+        __test_state.account = "default";
+        __test_state.responses.usage.push({
+          status: 200,
+          headers: {},
+          bodyText: JSON.stringify({})
+        });
+        "#,
+    );
+
+    let obs = obs.expect("assertion should produce state");
+
+    assert_subscriptions(
+        &obs,
+        &[
+            "~/.local/share/opencode/auth.json",
+            "~/.local/share/opencode/accounts.json",
+            "~/.config/opencode/auth.json",
+            "~/.config/opencode/accounts.json",
+        ],
+    );
+
+    assert!(!result.outputs.is_empty(), "expected probe output");
+    assert_eq!(result.outputs[0].provider_id, "copilot");
+
+    let has_duplicate_discovery_error = result.outputs.iter().any(|output| {
+        output
+            .lines
+            .iter()
+            .map(|line| format!("{}", line))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .contains("Duplicate accountId in discovery results")
+    });
+    assert!(
+        !has_duplicate_discovery_error,
+        "same id as native default must not trigger discovery duplicate error: {:?}",
+        result
+            .outputs
+            .iter()
+            .map(|o| (&o.account.id, &o.lines))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn copilot_override_logs_accounts_validation_errors() {
+    let (result, obs) = run_copilot_probe(
+        r#"
+        __test_state.files["~/.local/share/opencode/accounts.json"] = JSON.stringify({
+          "github-copilot": [
+            { accountId: "dup", isActive: true },
+            { accountId: "dup", isActive: false, data: { access: "x" } }
+          ]
+        });
+        "#,
+    );
+
+    let obs = obs.expect("assertion should produce state");
+    let logs: Vec<String> = obs["logs"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    assert!(
+        logs.iter().any(|line| {
+            line.contains("warn:copilot override:") && line.contains("duplicate account name")
+        }),
+        "expected validation warning in logs, got: {:?}",
+        logs
+    );
+
+    assert_eq!(result.outputs.len(), 1, "expected one error output");
+}
+
+#[test]
 fn copilot_override_preserves_original_auth_priority() {
     let (result, obs) = run_copilot_probe(
         r#"
