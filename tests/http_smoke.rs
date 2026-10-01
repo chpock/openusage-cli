@@ -45,6 +45,7 @@ async fn http_api_smoke_for_plugins_and_usage_refresh() {
         existing_instance_policy: "error".to_string(),
         plugins_dir: Some(vendor_plugins_dir()),
         enabled_plugins: vec!["mock".to_string()],
+        enabled_auth_sources: Default::default(),
         available_plugins: AvailablePlugins {
             active: vec!["mock".to_string()],
             inactive: vec![
@@ -210,6 +211,10 @@ async fn http_api_smoke_for_plugins_and_usage_refresh() {
     assert_eq!(config_json["existingInstancePolicy"], "error");
     assert_eq!(config_json["enabledPlugins"], serde_json::json!(["mock"]));
     assert_eq!(
+        config_json["enabledAuthSources"],
+        serde_json::json!({ "default": ["native", "opencode"] })
+    );
+    assert_eq!(
         config_json["availablePlugins"]["active"],
         serde_json::json!(["mock"])
     );
@@ -333,6 +338,7 @@ async fn single_provider_returns_sole_custom_account() {
             existing_instance_policy: "error".to_string(),
             plugins_dir: None,
             enabled_plugins: vec!["custom-account-provider".to_string()],
+            enabled_auth_sources: Default::default(),
             available_plugins: AvailablePlugins {
                 active: vec!["custom-account-provider".to_string()],
                 inactive: vec![],
@@ -459,6 +465,7 @@ async fn http_two_non_default_accounts_filter_and_single_provider() {
             existing_instance_policy: "error".to_string(),
             plugins_dir: None,
             enabled_plugins: vec!["multi-account-provider".to_string()],
+            enabled_auth_sources: Default::default(),
             available_plugins: AvailablePlugins {
                 active: vec!["multi-account-provider".to_string()],
                 inactive: vec![],

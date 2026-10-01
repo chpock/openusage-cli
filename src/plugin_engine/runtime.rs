@@ -1,3 +1,4 @@
+use crate::config::{AuthSource, DEFAULT_AUTH_SOURCES};
 use crate::plugin_engine::host_api;
 use crate::plugin_engine::manifest::LoadedPlugin;
 use crate::plugin_engine::override_lifecycle;
@@ -116,10 +117,11 @@ pub use crate::restart_watcher::FileSubscription;
 /// be declared during plugin entry script evaluation, override evaluation,
 /// or the probe/discovery call itself.
 ///
-/// In single-account mode (no `discoverAccounts`), `outputs` contains one item.
-/// In discovery mode, `outputs` contains one item per discovered account
-/// (or zero for an empty valid discovery list, or one error output on
-/// discovery failure).
+/// In single-account mode (no `discoverAccounts`), `outputs` contains one item
+/// when native authentication is enabled, or zero when it is disabled.
+/// In discovery mode, `outputs` includes enabled accounts except policy-suppressed
+/// errors. An empty selection produces zero outputs; a discovery failure produces
+/// one provider-level error output.
 #[derive(Debug, Clone)]
 pub struct ProbeResult {
     pub outputs: Vec<PluginOutput>,
@@ -204,7 +206,15 @@ pub fn run_probe_in_sandbox(
             };
         }
 
-        execute_provider_in_context(&ctx, plugin, override_source, &subs, None, None)
+        execute_provider_in_context(
+            &ctx,
+            plugin,
+            override_source,
+            &subs,
+            DEFAULT_AUTH_SOURCES,
+            None,
+            None,
+        )
     })
 }
 ///
@@ -224,6 +234,7 @@ pub fn execute_provider_in_context<'js>(
     plugin: &LoadedPlugin,
     override_script: Option<&str>,
     subs: &Arc<std::sync::Mutex<Vec<FileSubscription>>>,
+    auth_sources: &[AuthSource],
     before_plugin: Option<&dyn Fn(&Ctx<'_>) -> Result<(), override_lifecycle::JsError>>,
     after_lifecycle: Option<&dyn Fn(&Ctx<'_>) -> Result<(), override_lifecycle::JsError>>,
 ) -> ProbeResult {
@@ -335,8 +346,15 @@ pub fn execute_provider_in_context<'js>(
             plugin_id,
             display_name,
             icon_url,
+            auth_sources,
         )
     } else if discover_val.is_null() || discover_val.is_undefined() {
+        if !auth_sources.contains(&AuthSource::Native) {
+            return ProbeResult {
+                outputs: Vec::new(),
+                subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
+            };
+        }
         run_single_account_probe(
             ctx,
             plugin,
@@ -363,6 +381,23 @@ pub fn run_probe(
     app_data_dir: &Path,
     app_version: &str,
     plugin_overrides_dir: Option<&Path>,
+) -> ProbeResult {
+    run_probe_with_auth_sources(
+        plugin,
+        app_data_dir,
+        app_version,
+        plugin_overrides_dir,
+        DEFAULT_AUTH_SOURCES,
+    )
+}
+
+/// Run discovery as usual, then probe only accounts whose origin is enabled.
+pub fn run_probe_with_auth_sources(
+    plugin: &LoadedPlugin,
+    app_data_dir: &Path,
+    app_version: &str,
+    plugin_overrides_dir: Option<&Path>,
+    auth_sources: &[AuthSource],
 ) -> ProbeResult {
     let subs = Arc::new(std::sync::Mutex::new(Vec::new()));
     let fallback_subs = Arc::clone(&subs);
@@ -442,7 +477,15 @@ pub fn run_probe(
             };
         }
 
-        execute_provider_in_context(&ctx, plugin, override_source, &subs, None, None)
+        execute_provider_in_context(
+            &ctx,
+            plugin,
+            override_source,
+            &subs,
+            auth_sources,
+            None,
+            None,
+        )
     })
 }
 
@@ -500,7 +543,7 @@ fn run_single_account_probe<'js>(
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Discovery mode: call discoverAccounts, validate, then probe each account.
+/// Discovery mode: validate and normalize all accounts, then probe enabled origins.
 fn run_discovery_mode<'js>(
     ctx: &Ctx<'js>,
     plugin: &LoadedPlugin,
@@ -511,6 +554,7 @@ fn run_discovery_mode<'js>(
     plugin_id: &str,
     display_name: &str,
     icon_url: &str,
+    auth_sources: &[AuthSource],
 ) -> ProbeResult {
     // Call discoverAccounts with the base context.
     let discovery_result_value: Value = match discover_fn.call((base_ctx.clone(),)) {
@@ -609,9 +653,21 @@ fn run_discovery_mode<'js>(
         }
     }
 
-    // Probe each discovered account sequentially.
+    // Filter only after validating and canonicalizing the full discovery result.
+    // This preserves account IDs even when another colliding origin is disabled.
+    let is_enabled = |descriptor: &DiscoveryDescriptor| {
+        auth_sources
+            .iter()
+            .any(|source| source.as_str() == descriptor.origin)
+    };
+    let enabled_account_count = descriptors.iter().filter(|d| is_enabled(d)).count();
+
+    // Probe enabled discovered accounts sequentially, preserving discovery order.
     let mut outputs: Vec<(usize, PluginOutput)> = Vec::with_capacity(descriptors.len());
     for (desc_idx, descriptor) in descriptors.iter().enumerate() {
+        if !is_enabled(descriptor) {
+            continue;
+        }
         let duplicate_probe_id_exists = probe_id_counts
             .get(descriptor.probe_id.as_str())
             .copied()
@@ -683,10 +739,10 @@ fn run_discovery_mode<'js>(
     }
 
     // Apply soft-fail: errorPolicy=hide-if-other-account hides that descriptor's
-    // error whenever ANY OTHER descriptor exists, whether that other account
+    // error whenever ANY OTHER enabled descriptor exists, whether that other account
     // succeeds or errors. It applies only to the descriptor carrying the policy.
     // Opencode errors stay visible regardless.
-    let has_any_other_descriptor = descriptors.len() > 1;
+    let has_any_other_descriptor = enabled_account_count > 1;
 
     let final_outputs: Vec<PluginOutput> = outputs
         .into_iter()

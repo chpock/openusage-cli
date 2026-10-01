@@ -131,6 +131,10 @@ struct SharedRuntimeArgs {
     #[arg(long)]
     enabled_plugins: Option<String>,
 
+    /// YAML/JSON object of allowed auth sources by plugin ID (replaces config value)
+    #[arg(long, value_parser = parse_enabled_auth_sources)]
+    enabled_auth_sources: Option<config::EnabledAuthSources>,
+
     /// Directory for application data and cache [default: platform default]
     #[arg(long)]
     app_data_dir: Option<PathBuf>,
@@ -490,6 +494,10 @@ async fn initialize_runtime_context(
     );
     log::debug!("loaded plugin ids: {:?}", loaded_plugin_ids);
 
+    shared
+        .enabled_auth_sources
+        .validate_plugin_ids(&loaded_plugin_ids)?;
+
     let enabled_plugins_matcher = EnabledPluginsMatcher::from_csv(&shared.enabled_plugins)
         .with_context(|| {
             format!(
@@ -540,13 +548,16 @@ async fn initialize_runtime_context(
         log::info!("plugin overrides disabled (no overrides dir found)");
     }
 
-    let daemon = Arc::new(DaemonState::new(
-        plugins,
-        app_data_dir.clone(),
-        app_version.to_string(),
-        plugin_overrides_dir.clone(),
-        monitor_cmd_tx.clone(),
-    ));
+    let daemon = Arc::new(
+        DaemonState::new(
+            plugins,
+            app_data_dir.clone(),
+            app_version.to_string(),
+            plugin_overrides_dir.clone(),
+            monitor_cmd_tx.clone(),
+        )
+        .with_enabled_auth_sources(shared.enabled_auth_sources.clone()),
+    );
 
     if perform_initial_refresh {
         log::info!("running initial plugin refresh");
@@ -644,6 +655,7 @@ struct RuntimeConfigState {
     existing_instance_policy: ExistingInstancePolicy,
     plugins_dir: PathBuf,
     enabled_plugins: String,
+    enabled_auth_sources: config::EnabledAuthSources,
     active_plugin_ids: Vec<String>,
     inactive_plugin_ids: Vec<String>,
     app_data_dir: PathBuf,
@@ -677,6 +689,7 @@ impl RuntimeConfigState {
             existing_instance_policy: runtime.existing_instance_policy,
             plugins_dir: initialized.plugins_dir.clone(),
             enabled_plugins: runtime.shared.enabled_plugins.clone(),
+            enabled_auth_sources: runtime.shared.enabled_auth_sources.clone(),
             active_plugin_ids: initialized.active_plugin_ids.clone(),
             inactive_plugin_ids: initialized.inactive_plugin_ids.clone(),
             app_data_dir: initialized.app_data_dir.clone(),
@@ -700,6 +713,7 @@ impl RuntimeConfigState {
             existing_instance_policy: runtime.existing_instance_policy,
             plugins_dir: initialized.plugins_dir.clone(),
             enabled_plugins: runtime.shared.enabled_plugins.clone(),
+            enabled_auth_sources: runtime.shared.enabled_auth_sources.clone(),
             active_plugin_ids: initialized.active_plugin_ids.clone(),
             inactive_plugin_ids: initialized.inactive_plugin_ids.clone(),
             app_data_dir: initialized.app_data_dir.clone(),
@@ -719,6 +733,7 @@ impl RuntimeConfigState {
             existing_instance_policy: self.existing_instance_policy.to_string(),
             plugins_dir: Some(self.plugins_dir.clone()),
             enabled_plugins: self.enabled_plugins_list(),
+            enabled_auth_sources: self.enabled_auth_sources.clone(),
             available_plugins: AvailablePlugins {
                 active: self.active_plugin_ids.clone(),
                 inactive: self.inactive_plugin_ids.clone(),
@@ -1254,6 +1269,7 @@ fn restart_outcome_for_service_mode(_service_mode: ServiceMode) -> RunOutcome {
 struct SharedRuntimeCli {
     plugins_dir: Option<PathBuf>,
     enabled_plugins: String,
+    enabled_auth_sources: config::EnabledAuthSources,
     app_data_dir: Option<PathBuf>,
     plugin_overrides_dir: Option<PathBuf>,
     test_mode: bool,
@@ -1433,6 +1449,11 @@ fn resolve_shared_runtime(
     SharedRuntimeCli {
         plugins_dir: mode_args.plugins_dir.or(config.plugins_dir.clone()),
         enabled_plugins,
+        enabled_auth_sources: mode_args
+            .enabled_auth_sources
+            .or_else(|| config.enabled_auth_sources.clone())
+            .unwrap_or_default()
+            .with_builtin_default(),
         app_data_dir: mode_args.app_data_dir.or(config.app_data_dir.clone()),
         plugin_overrides_dir: mode_args
             .plugin_overrides_dir
@@ -1440,6 +1461,12 @@ fn resolve_shared_runtime(
         test_mode,
         log_level,
     }
+}
+
+fn parse_enabled_auth_sources(
+    value: &str,
+) -> std::result::Result<config::EnabledAuthSources, String> {
+    serde_yaml::from_str(value).map_err(|err| format!("invalid enabled_auth_sources: {err}"))
 }
 
 fn resolve_query_existing_instance_policy(config: &config::AppConfig) -> ExistingInstancePolicy {
@@ -2865,6 +2892,61 @@ mod tests {
         );
         assert_eq!(runtime.service_mode, ServiceMode::Standalone);
         assert_eq!(runtime.shared.log_level, config::DEFAULT_LOG_LEVEL);
+        assert_eq!(
+            runtime.shared.enabled_auth_sources,
+            config::EnabledAuthSources::default()
+        );
+    }
+
+    #[test]
+    fn runtime_cli_auth_sources_precedence_in_both_modes() {
+        for mode in ["query", "run-daemon"] {
+            let config: config::AppConfig =
+                serde_yaml::from_str("enabled_auth_sources:\n  default: [native]\n  codex: []\n")
+                    .expect("parse config");
+            let cli = Cli::try_parse_from(["openusage-cli", mode]).expect("parse mode");
+            let runtime = RuntimeCli::from_sources(cli, config.clone()).expect("resolve config");
+            let shared = match runtime {
+                RuntimeCli::Query(runtime) => runtime.shared,
+                RuntimeCli::RunDaemon(runtime) => runtime.shared,
+            };
+            assert_eq!(
+                shared.enabled_auth_sources.for_plugin("cursor"),
+                &[config::AuthSource::Native]
+            );
+            assert!(shared.enabled_auth_sources.for_plugin("codex").is_empty());
+
+            let cli = Cli::try_parse_from([
+                "openusage-cli",
+                mode,
+                "--enabled-auth-sources={default: [opencode]}",
+            ])
+            .expect("parse CLI sources");
+            let runtime = RuntimeCli::from_sources(cli, config).expect("resolve CLI sources");
+            let shared = match runtime {
+                RuntimeCli::Query(runtime) => runtime.shared,
+                RuntimeCli::RunDaemon(runtime) => runtime.shared,
+            };
+            assert_eq!(
+                shared.enabled_auth_sources.for_plugin("codex"),
+                &[config::AuthSource::Opencode]
+            );
+        }
+    }
+
+    #[test]
+    fn cli_rejects_invalid_auth_sources() {
+        for value in [
+            "{default: [unknown]}",
+            "{default: native}",
+            "[native]",
+            "null",
+        ] {
+            let error =
+                Cli::try_parse_from(["openusage-cli", "query", "--enabled-auth-sources", value])
+                    .expect_err("invalid CLI sources should be rejected");
+            assert!(error.to_string().contains("invalid enabled_auth_sources"));
+        }
     }
 
     #[test]
@@ -2896,6 +2978,7 @@ mod tests {
             port: Some(9000),
             plugins_dir: Some(PathBuf::from("/tmp/plugins")),
             enabled_plugins: Some(vec!["codex".to_string(), "cur*".to_string()]),
+            enabled_auth_sources: None,
             app_data_dir: Some(PathBuf::from("/tmp/data")),
             plugin_overrides_dir: Some(PathBuf::from("/tmp/overrides")),
             refresh_interval_secs: Some(42),
@@ -2975,6 +3058,7 @@ mod tests {
                     shared: SharedRuntimeArgs {
                         plugins_dir: Some(PathBuf::from("/cli/plugins")),
                         enabled_plugins: Some("mock".to_string()),
+                        enabled_auth_sources: None,
                         app_data_dir: Some(PathBuf::from("/cli/data")),
                         plugin_overrides_dir: Some(PathBuf::from("/cli/overrides")),
                     },
@@ -2992,6 +3076,7 @@ mod tests {
             port: Some(9000),
             plugins_dir: Some(PathBuf::from("/cfg/plugins")),
             enabled_plugins: Some(vec!["codex".to_string()]),
+            enabled_auth_sources: None,
             app_data_dir: Some(PathBuf::from("/cfg/data")),
             plugin_overrides_dir: Some(PathBuf::from("/cfg/overrides")),
             refresh_interval_secs: Some(60),
@@ -3132,6 +3217,7 @@ mod tests {
         let shared = SharedRuntimeCli {
             plugins_dir: None,
             enabled_plugins: config::DEFAULT_ENABLED_PLUGINS.to_string(),
+            enabled_auth_sources: config::EnabledAuthSources::default(),
             app_data_dir: None,
             plugin_overrides_dir: None,
             test_mode: false,

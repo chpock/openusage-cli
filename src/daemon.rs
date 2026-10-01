@@ -1,3 +1,4 @@
+use crate::config::{AuthSource, EnabledAuthSources};
 use crate::plugin_engine::manifest::{LoadedPlugin, ManifestLine, PluginLink};
 use crate::plugin_engine::runtime::{self, MetricLine};
 use crate::restart_watcher::ProviderWatchCommand;
@@ -65,6 +66,7 @@ pub struct DaemonState {
     app_data_dir: PathBuf,
     app_version: String,
     plugin_overrides_dir: Option<PathBuf>,
+    enabled_auth_sources: EnabledAuthSources,
     cache: RwLock<HashMap<String, Vec<CachedPluginSnapshot>>>,
     refresh_lock: Mutex<()>,
     /// Optional command sender for the provider file-monitor actor.
@@ -95,10 +97,16 @@ impl DaemonState {
             app_data_dir,
             app_version,
             plugin_overrides_dir,
+            enabled_auth_sources: EnabledAuthSources::default(),
             cache: RwLock::new(HashMap::new()),
             refresh_lock: Mutex::new(()),
             monitor_cmd_tx,
         }
+    }
+
+    pub fn with_enabled_auth_sources(mut self, enabled_auth_sources: EnabledAuthSources) -> Self {
+        self.enabled_auth_sources = enabled_auth_sources;
+        self
     }
 
     pub fn plugins_meta(&self) -> Vec<PluginMeta> {
@@ -201,6 +209,8 @@ impl DaemonState {
             let data_dir = self.app_data_dir.clone();
             let app_version = self.app_version.clone();
             let plugin_overrides_dir = self.plugin_overrides_dir.clone();
+            let auth_sources: Vec<AuthSource> =
+                self.enabled_auth_sources.for_plugin(&plugin_id).to_vec();
 
             // --- Provider file-monitor: clear subscriptions before probe ---
             if let Some(cmd_tx) = &self.monitor_cmd_tx {
@@ -229,11 +239,12 @@ impl DaemonState {
 
             log::debug!("running probe for plugin {}", plugin_id);
             let probe_result = tokio::task::spawn_blocking(move || {
-                runtime::run_probe(
+                runtime::run_probe_with_auth_sources(
                     &plugin,
                     &data_dir,
                     &app_version,
                     plugin_overrides_dir.as_deref(),
+                    &auth_sources,
                 )
             })
             .await
@@ -1665,6 +1676,97 @@ mod tests {
         assert_eq!(snapshots.len(), 2);
         assert_eq!(snapshots[0].account.id, "a");
         assert_eq!(snapshots[1].account.id, "b");
+    }
+
+    #[tokio::test]
+    async fn auth_sources_refresh_filters_probes_and_clears_cache_without_losing_discovery_watches()
+    {
+        let plugin = test_plugin(
+            r#"
+            globalThis.__openusage_plugin = {
+                discoverAccounts(ctx) {
+                    ctx.host.fs.subscribeFile(ctx.app.appDataDir + "/discovery.json");
+                    return [{id: "local"}, {id: "remote", origin: "opencode"}];
+                },
+                probe(ctx) {
+                    ctx.host.fs.subscribeFile(ctx.app.appDataDir + "/probe-" + ctx.account.id + ".json");
+                    return {lines: [ctx.line.text({label: "Status", value: "ok"})]};
+                }
+            };
+        "#,
+        );
+        let tmp = tempfile::tempdir().expect("temporary app data");
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let sources = serde_yaml::from_str("default: [native]").expect("parse sources");
+        let mut state = DaemonState::new(
+            vec![plugin],
+            tmp.path().to_path_buf(),
+            "0.0.0-test".to_string(),
+            None,
+            Some(cmd_tx),
+        )
+        .with_enabled_auth_sources(sources);
+
+        let monitor = tokio::spawn(async move {
+            for expected in [
+                vec!["discovery.json", "probe-local.json"],
+                vec!["discovery.json"],
+            ] {
+                let clear = cmd_rx.recv().await.expect("clear command");
+                let ProviderWatchCommand::ClearProvider { provider_id, ack } = clear else {
+                    panic!("expected clear before discovery");
+                };
+                assert_eq!(provider_id, "test");
+                ack.send(()).expect("acknowledge clear");
+                let replace = cmd_rx.recv().await.expect("replace command");
+                let ProviderWatchCommand::ReplaceProvider {
+                    provider_id,
+                    files,
+                    ack,
+                } = replace
+                else {
+                    panic!("expected replace after probing");
+                };
+                assert_eq!(provider_id, "test");
+                let names: Vec<&str> = files
+                    .iter()
+                    .map(|file| {
+                        file.path
+                            .file_name()
+                            .expect("filename")
+                            .to_str()
+                            .expect("UTF-8 filename")
+                    })
+                    .collect();
+                assert_eq!(
+                    names, expected,
+                    "excluded probes must not register dependencies"
+                );
+                ack.send(()).expect("acknowledge replace");
+            }
+        });
+
+        let first = tokio::time::timeout(Duration::from_secs(5), state.refresh(None))
+            .await
+            .expect("first refresh timeout")
+            .expect("first refresh");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].account.id, "local");
+        assert_eq!(state.cached(None).await.len(), 1);
+
+        state.enabled_auth_sources = serde_yaml::from_str("default: []").expect("disable sources");
+        let empty = tokio::time::timeout(Duration::from_secs(5), state.refresh(None))
+            .await
+            .expect("empty refresh timeout")
+            .expect("empty refresh");
+        assert!(empty.is_empty());
+        assert!(state.cached(None).await.is_empty());
+        assert!(state.cached_one("test").await.is_none());
+        assert!(
+            state.has_plugin("test"),
+            "source selection must not disable the plugin"
+        );
+        monitor.await.expect("monitor assertions");
     }
 
     #[tokio::test]

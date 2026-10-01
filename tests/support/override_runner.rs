@@ -14,6 +14,7 @@
 /// Both runners share the same context setup (`setup_quickjs_context`) and
 /// the same JS evaluation/result helper (`eval_and_decode_script`),
 /// eliminating duplicated harness/setup/Promise/JSON/decode logic.
+use openusage_cli::config::{AuthSource, DEFAULT_AUTH_SOURCES};
 use openusage_cli::plugin_engine::manifest::{LoadedPlugin, PluginManifest};
 use openusage_cli::plugin_engine::override_lifecycle::{self, JsError, LifecycleStage};
 use openusage_cli::plugin_engine::runtime::{self as runtime_mod, FileSubscription, ProbeResult};
@@ -311,6 +312,14 @@ pub enum ProviderOutcome {
 /// 2. Creates a minimal `LoadedPlugin` and calls `execute_provider_in_context`
 /// 3. Optional post-probe assertion JS evaluated after probing
 pub fn run_provider_probe(spec: &ProviderSpec<'_>) -> ProviderOutcome {
+    run_provider_probe_with_auth_sources(spec, DEFAULT_AUTH_SOURCES)
+}
+
+/// Run the production probe path with explicit credential-source selection.
+pub fn run_provider_probe_with_auth_sources(
+    spec: &ProviderSpec<'_>,
+    auth_sources: &[AuthSource],
+) -> ProviderOutcome {
     let display_name = if spec.plugin_name.is_empty() {
         spec.plugin_id
     } else {
@@ -363,6 +372,7 @@ pub fn run_provider_probe(spec: &ProviderSpec<'_>) -> ProviderOutcome {
             &plugin,
             spec.override_source,
             &subs,
+            auth_sources,
             Some(&before_fn),
             None,
         );

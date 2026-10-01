@@ -38,6 +38,7 @@ pub struct RuntimeConfig {
     pub existing_instance_policy: String,
     pub plugins_dir: Option<PathBuf>,
     pub enabled_plugins: Vec<String>,
+    pub enabled_auth_sources: crate::config::EnabledAuthSources,
     pub available_plugins: AvailablePlugins,
     pub app_data_dir: Option<PathBuf>,
     pub plugin_overrides_dir: Option<PathBuf>,

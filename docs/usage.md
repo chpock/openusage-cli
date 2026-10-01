@@ -62,8 +62,13 @@ Runtime flags (`query`, `run-daemon`):
 
 - `--plugins-dir <path>`
 - `--enabled-plugins <csv-globs>` (default: `*`)
+- `--enabled-auth-sources <yaml-or-json-object>` (default: `{"default":["native","opencode"]}`)
 - `--app-data-dir <path>`
 - `--plugin-overrides-dir <path>`
+
+Authentication source entries replace the `default` list for exact plugin
+IDs. See [Authentication sources](configuration.md#authentication-sources)
+for configuration examples and discovery/probe boundaries.
 
 `query` flags:
 
@@ -138,7 +143,7 @@ http://127.0.0.1:6738
   **`origin` field:** Every account object carries an `origin` string that
   identifies the credential source:
 
-  - `"native"` — credentials supplied by the original plugin (no override active).
+  - `"native"` — credentials supplied by the original plugin.
   - `"opencode"` — current Codex and Copilot override accounts that read from
     OpenCode auth files.
   - Future releases may introduce additional source identifiers (e.g.
@@ -149,7 +154,7 @@ http://127.0.0.1:6738
   serialized API responses.
 
   When a discovery account has `errorPolicy: "hide-if-other-account"` and at
-  least one other account descriptor exists, policy-suppressed probe failures
+  least one other enabled account descriptor exists, policy-suppressed probe failures
   (context construction errors, probe exceptions, promise rejections, and
   invalid returned probe objects/lines) are intentionally omitted from output.
   Non-policy errors and unmarked account failures are always included.
@@ -164,6 +169,9 @@ http://127.0.0.1:6738
   assigns `{ id: "default", origin: "native" }` on every output. The probe
   returns only `plan` and `lines` — any `account` field in the probe result
   is ignored.
+
+  If `native` is excluded by `enabled_auth_sources`, this implicit account
+  receives no probe call and produces no usage snapshot.
 
   ### Multi-account discovery
 
@@ -217,6 +225,13 @@ http://127.0.0.1:6738
   **Empty list:** A valid empty array produces zero outputs for that
   provider, clearing any previously cached snapshots.
 
+  **Authentication source selection:** After validating and normalizing the
+  full discovery result, the core probes only accounts whose `origin` is
+  enabled for that plugin. An absent `origin` defaults to `native`.
+  Excluded descriptors do not produce snapshots or affect probe error
+  suppression. If every descriptor is excluded, the provider's snapshots
+  are cleared. Discovery reads and subscriptions still occur.
+
   **Host-authoritative identity:** In discovery mode, the runtime assigns
   account identity from the discovered descriptor (including `origin`). The
   probe result's `account` field is ignored and never used to override,
@@ -225,7 +240,7 @@ http://127.0.0.1:6738
   **Failure isolation:** A per-account probe failure produces an error
   snapshot carrying that account's identity. Other accounts are unaffected.
   However, when a discovery account has `errorPolicy: "hide-if-other-account"`
-  and at least one other account descriptor exists, the policy-suppressed
+  and at least one other enabled account descriptor exists, the policy-suppressed
   failure snapshot is intentionally omitted from output (see
   [Discovery error policy](plugin-overrides.md#discovery-error-policy)).
 

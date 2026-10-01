@@ -179,6 +179,7 @@ pub(super) fn option_requires_separate_value(option: &str) -> bool {
             | "--port"
             | "--plugins-dir"
             | "--enabled-plugins"
+            | "--enabled-auth-sources"
             | "--app-data-dir"
             | "--plugin-overrides-dir"
             | "--refresh-interval-secs"

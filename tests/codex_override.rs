@@ -11,12 +11,15 @@
 
 mod support;
 
+use openusage_cli::config::{AuthSource, DEFAULT_AUTH_SOURCES};
 use openusage_cli::plugin_engine::runtime::ProbeResult;
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
 
-use support::override_runner::{ProviderOutcome, ProviderSpec, run_provider_probe};
+use support::override_runner::{
+    ProviderOutcome, ProviderSpec, run_provider_probe, run_provider_probe_with_auth_sources,
+};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -39,7 +42,14 @@ fn codex_override_script() -> String {
 ///
 /// Returns the `ProbeResult` and an option to inspect assertion JSON.
 fn run_codex_probe(setup_js: &str) -> (ProbeResult, Option<Value>) {
-    let outcome = run_provider_probe(&ProviderSpec {
+    run_codex_probe_with_sources(setup_js, DEFAULT_AUTH_SOURCES)
+}
+
+fn run_codex_probe_with_sources(
+    setup_js: &str,
+    sources: &[AuthSource],
+) -> (ProbeResult, Option<Value>) {
+    let spec = ProviderSpec {
         plugin_id: "codex",
         plugin_name: "Codex",
         plugin_source: &codex_plugin_script(),
@@ -48,7 +58,12 @@ fn run_codex_probe(setup_js: &str) -> (ProbeResult, Option<Value>) {
         setup: setup_js,
         assertion: Some(ASSERTION_SCRIPT),
         // probe_mode removed — ProviderSpec has no such field
-    });
+    };
+    let outcome = if sources == DEFAULT_AUTH_SOURCES {
+        run_provider_probe(&spec)
+    } else {
+        run_provider_probe_with_auth_sources(&spec, sources)
+    };
     match outcome {
         ProviderOutcome::Probe { result, assertion } => {
             let obs = assertion.ok();
@@ -96,6 +111,67 @@ fn account_is_active(result: &ProbeResult, account_id: &str) -> Option<bool> {
 // ═══════════════════════════════════════════════════════════════════════
 // Test suite
 // ═══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn codex_override_filters_auth_sources_before_requests() {
+    let setup = r#"
+        __test_state.files["~/.config/codex/auth.json"] = JSON.stringify({tokens: {access_token: "native-token"}});
+        __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({openai: {access: "opencode-token"}});
+        __test_state.files["~/.local/share/opencode/accounts.json"] = JSON.stringify({openai: [
+            {accountId: "default", isActive: true},
+            {accountId: "inactive", isActive: false, data: {access: "inactive-token"}}
+        ]});
+        for (var i = 0; i < 3; i++) {
+            __test_state.responses.usage.push({status: 200, headers: {}, bodyText: "{}"});
+        }
+    "#;
+    for (sources, tokens) in [
+        (
+            DEFAULT_AUTH_SOURCES,
+            vec!["native-token", "opencode-token", "inactive-token"],
+        ),
+        (&[AuthSource::Native][..], vec!["native-token"]),
+        (
+            &[AuthSource::Opencode][..],
+            vec!["opencode-token", "inactive-token"],
+        ),
+        (&[][..], vec![]),
+    ] {
+        let (result, observed) = run_codex_probe_with_sources(setup, sources);
+        let observed = observed.expect("request counters");
+        let authorizations: Vec<&str> = observed["requests"]
+            .as_array()
+            .expect("requests")
+            .iter()
+            .map(|request| request["authorization"].as_str().expect("authorization"))
+            .collect();
+        let expected: Vec<String> = tokens
+            .iter()
+            .map(|token| format!("Bearer {token}"))
+            .collect();
+        assert_eq!(authorizations, expected);
+        assert_eq!(result.outputs.len(), tokens.len());
+        assert_subscriptions(
+            &observed,
+            &[
+                "~/.local/share/opencode/auth.json",
+                "~/.local/share/opencode/accounts.json",
+                "~/.config/opencode/auth.json",
+                "~/.config/opencode/accounts.json",
+            ],
+        );
+        if sources == [AuthSource::Opencode] {
+            assert!(
+                result
+                    .outputs
+                    .iter()
+                    .all(|o| o.account.origin == "opencode")
+            );
+            assert_eq!(result.outputs[0].account.name.as_deref(), Some("default"));
+            assert_ne!(result.outputs[0].account.id, "default");
+        }
+    }
+}
 
 #[test]
 fn codex_override_native_default_source() {

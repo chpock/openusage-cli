@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use reqwest::Proxy;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -14,6 +15,63 @@ pub const DEFAULT_REFRESH_INTERVAL_SECS: u64 = 180;
 pub const DEFAULT_AGGRESSIVE_REFRESH_INTERVAL_SECS: u64 = 10;
 pub const DEFAULT_ENABLED_PLUGINS: &str = "*";
 pub const DEFAULT_LOG_LEVEL: &str = "error";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthSource {
+    Native,
+    Opencode,
+}
+
+impl AuthSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Opencode => "opencode",
+        }
+    }
+}
+
+pub const DEFAULT_AUTH_SOURCES: &[AuthSource] = &[AuthSource::Native, AuthSource::Opencode];
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct EnabledAuthSources(BTreeMap<String, Vec<AuthSource>>);
+
+impl Default for EnabledAuthSources {
+    fn default() -> Self {
+        Self(BTreeMap::from([(
+            "default".to_string(),
+            DEFAULT_AUTH_SOURCES.to_vec(),
+        )]))
+    }
+}
+
+impl EnabledAuthSources {
+    pub fn with_builtin_default(mut self) -> Self {
+        self.0
+            .entry("default".to_string())
+            .or_insert_with(|| DEFAULT_AUTH_SOURCES.to_vec());
+        self
+    }
+
+    pub fn for_plugin(&self, plugin_id: &str) -> &[AuthSource] {
+        self.0
+            .get(plugin_id)
+            .or_else(|| self.0.get("default"))
+            .map(Vec::as_slice)
+            .unwrap_or(DEFAULT_AUTH_SOURCES)
+    }
+
+    pub fn validate_plugin_ids(&self, plugin_ids: &[String]) -> Result<()> {
+        for id in self.0.keys() {
+            if id != "default" && !plugin_ids.contains(id) {
+                anyhow::bail!("enabled_auth_sources contains unknown plugin id '{}'", id);
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonEndpointPath {
@@ -33,6 +91,7 @@ pub struct AppConfig {
     pub port: Option<u16>,
     pub plugins_dir: Option<PathBuf>,
     pub enabled_plugins: Option<Vec<String>>,
+    pub enabled_auth_sources: Option<EnabledAuthSources>,
     pub app_data_dir: Option<PathBuf>,
     pub plugin_overrides_dir: Option<PathBuf>,
     pub refresh_interval_secs: Option<u64>,
@@ -150,6 +209,11 @@ plugins_dir: null
 enabled_plugins:
   - "*"
 
+# Allowed credential sources, matched against discovered account origin.
+# Plugin ID entries replace default; [] disables all sources for that plugin.
+enabled_auth_sources:
+  default: [native, opencode]
+
 # Directory for provider data/cache. null = platform default.
 # app_data_dir: /path/to/app-data
 app_data_dir: null
@@ -237,6 +301,10 @@ mod tests {
             Some(vec![DEFAULT_ENABLED_PLUGINS.to_string()])
         );
         assert_eq!(
+            parsed.enabled_auth_sources,
+            Some(EnabledAuthSources::default())
+        );
+        assert_eq!(
             parsed.refresh_interval_secs,
             Some(DEFAULT_REFRESH_INTERVAL_SECS)
         );
@@ -251,6 +319,40 @@ mod tests {
         let proxy = parsed.proxy.expect("proxy section must exist");
         assert!(!proxy.enabled);
         assert!(proxy.url.is_empty());
+    }
+
+    #[test]
+    fn auth_sources_resolves_defaults_overrides_and_empty_lists() {
+        let sources: EnabledAuthSources =
+            serde_yaml::from_str("default: [opencode]\ncodex: [native, native]\ncopilot: []\n")
+                .expect("parse sources");
+        assert_eq!(sources.for_plugin("cursor"), &[AuthSource::Opencode]);
+        assert_eq!(
+            sources.for_plugin("codex"),
+            &[AuthSource::Native, AuthSource::Native]
+        );
+        assert!(sources.for_plugin("copilot").is_empty());
+        let sources: EnabledAuthSources =
+            serde_yaml::from_str("codex: [opencode]").expect("parse sources without default");
+        assert_eq!(sources.for_plugin("cursor"), DEFAULT_AUTH_SOURCES);
+        assert_eq!(sources.for_plugin("codex"), &[AuthSource::Opencode]);
+        assert_eq!(
+            serde_json::to_value(sources.with_builtin_default()).expect("serialize sources"),
+            serde_json::json!({ "default": ["native", "opencode"], "codex": ["opencode"] })
+        );
+    }
+
+    #[test]
+    fn auth_sources_validates_plugin_ids_including_disabled_plugins() {
+        let sources: EnabledAuthSources =
+            serde_yaml::from_str("default: []\ncodex: [opencode]").expect("parse sources");
+        sources
+            .validate_plugin_ids(&["codex".to_string(), "mock".to_string()])
+            .expect("discovered plugin should be valid even when disabled");
+        let error = sources
+            .validate_plugin_ids(&["mock".to_string()])
+            .expect_err("unknown plugin should be rejected");
+        assert!(error.to_string().contains("unknown plugin id 'codex'"));
     }
 
     #[test]

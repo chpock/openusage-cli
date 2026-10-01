@@ -73,7 +73,7 @@ fields:
   `ctx.account.id`.
 - `origin` (optional string) — identifies the credential source. If absent,
   the runtime assigns `"native"` as the default. Known values:
-  - `"native"` — credentials supplied by the original plugin (no override active).
+  - `"native"` — credentials supplied by the original plugin.
   - `"opencode"` — OpenCode auth file credentials (Codex/Copilot overrides).
   - Future releases may introduce additional identifiers.
 - `name` (optional string) — display label propagated to output
@@ -97,6 +97,26 @@ Output identity rules:
 - If output ids still collide after normalization, the runtime returns a
   provider-level duplicate-output-id error.
 
+### Authentication source selection
+
+The core applies `enabled_auth_sources` to account descriptor `origin`
+values before calling `probe`. Overrides describe all discovered accounts;
+they do not interpret this configuration. An absent `origin` is `native`.
+Plugins without discovery have a single implicit native account, which is
+probed only when native authentication is enabled.
+
+Validation and ID normalization use the complete discovery result before
+filtering. Excluded accounts receive no probe call and produce no snapshot;
+filtering all accounts clears the provider's cached snapshots. Discovery
+still runs, so reads, logs, and file subscriptions from discovery or script
+evaluation may include disabled sources. Discovery exceptions and contract
+errors are provider-level errors and are not hidden by source selection.
+
+A probe must use the source declared by its descriptor without falling
+back to a different source. Reporting `origin` only in a probe result is
+too late for selection and does not change the discovered account identity.
+See [configuration.md](configuration.md#authentication-sources) for examples.
+
 ### Discovery error policy
 
 Account descriptors may include an optional `errorPolicy` field that
@@ -107,7 +127,7 @@ private runtime directive only.
 Supported values:
 
 - `"hide-if-other-account"` — if this account's probe fails and the
-  discovery yielded at least one other account descriptor, the error
+  discovery yielded at least one other enabled account descriptor, the error
   snapshot is suppressed. If it succeeds, the result is retained. If
   no other descriptors exist, the error is retained.
 - Any other string value or a non-string value is a discovery validation
@@ -144,7 +164,7 @@ available.
 - Per-account probe failures produce an error snapshot carrying that
   account's identity; other accounts are unaffected. When a discovery
   account has `errorPolicy: "hide-if-other-account"` and at least one
-  other account descriptor exists, the policy-suppressed failure snapshot
+  other enabled account descriptor exists, the policy-suppressed failure snapshot
   is intentionally omitted from output (see
   [Discovery error policy](#discovery-error-policy)).
 - In discovery mode, account identity is host-authoritative and comes from the
