@@ -27,7 +27,7 @@ use main_cli_preparse::*;
 use main_path_resolution::*;
 use main_systemd::*;
 
-const SYSTEM_PLUGINS_DIR: &str = "/usr/share/openusage-cli/openusage-plugins";
+const SYSTEM_PLUGINS_DIR: &str = "/usr/share/openusage-cli/plugins";
 const SYSTEM_PLUGIN_OVERRIDES_DIR: &str = "/usr/share/openusage-cli/plugin-overrides";
 const USER_SYSTEMD_SERVICE_NAME: &str = "openusage-cli.service";
 const EXISTING_INSTANCE_SHUTDOWN_TIMEOUT_SECS: u64 = 15;
@@ -249,7 +249,7 @@ enum ModeCommand {
 
 #[derive(Debug, Parser)]
 #[command(name = "openusage-cli")]
-#[command(about = "Local daemon and CLI for AI provider usage/quota via OpenUsage plugins")]
+#[command(about = "Local daemon and CLI for AI provider usage/quota via CrossUsage plugins")]
 #[command(version = APP_VERSION)]
 #[command(propagate_version = true)]
 #[command(disable_help_flag = true)]
@@ -478,7 +478,7 @@ async fn initialize_runtime_context(
     let loaded_plugins = manifest::load_plugins_from_dir(&plugins_dir);
     if loaded_plugins.is_empty() {
         anyhow::bail!(
-            "no plugins found in {} (set --plugins-dir or install plugin data under <prefix>/share/openusage-cli/openusage-plugins)",
+            "no plugins found in {} (set --plugins-dir or install plugin data under <prefix>/share/openusage-cli/plugins)",
             plugins_dir.display()
         );
     }
@@ -3526,12 +3526,12 @@ mod tests {
         assert_eq!(
             candidates,
             vec![
-                PathBuf::from("/repo/vendor/openusage/plugins"),
+                PathBuf::from("/repo/vendor/crossusage/plugins"),
                 PathBuf::from("/repo/plugins"),
-                PathBuf::from("/repo/target/debug/vendor/openusage/plugins"),
+                PathBuf::from("/repo/target/debug/vendor/crossusage/plugins"),
                 PathBuf::from("/repo/target/debug/plugins"),
-                PathBuf::from("/repo/target/share/openusage-cli/openusage-plugins"),
-                PathBuf::from(SYSTEM_PLUGINS_DIR),
+                PathBuf::from("/repo/target/share/openusage-cli/plugins"),
+                PathBuf::from("/usr/share/openusage-cli/plugins"),
             ]
         );
     }
@@ -3546,8 +3546,8 @@ mod tests {
         assert_eq!(
             candidates,
             vec![
-                PathBuf::from("/opt/openusage-cli/share/openusage-cli/openusage-plugins"),
-                PathBuf::from(SYSTEM_PLUGINS_DIR),
+                PathBuf::from("/opt/openusage-cli/share/openusage-cli/plugins"),
+                PathBuf::from("/usr/share/openusage-cli/plugins"),
             ]
         );
     }

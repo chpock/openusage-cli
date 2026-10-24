@@ -68,7 +68,7 @@ impl std::fmt::Display for LifecycleStage {
 
 /// Detailed JS exception information with typed stage.
 ///
-/// Handles both thrown strings (which are common in OpenUsage plugin code) and
+/// Handles both thrown strings (which are common in CrossUsage plugin code) and
 /// proper Error objects with name/message/stack trace.
 #[derive(Debug, Clone)]
 pub struct JsError {
@@ -157,7 +157,7 @@ pub fn extract_js_error(ctx: &Ctx<'_>, stage: LifecycleStage) -> JsError {
         };
     }
 
-    // Try as a String first (most common in OpenUsage plugin code: `throw "msg"`)
+    // Try as a String first (most common in CrossUsage plugin code: `throw "msg"`)
     if let Some(s) = caught.as_string()
         && let Ok(text) = s.to_string()
         && !text.is_empty()

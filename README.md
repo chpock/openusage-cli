@@ -2,18 +2,18 @@
 
 `openusage-cli` is a Linux-first backend for AI usage tracking.
 
-It runs provider plugins from [OpenUsage](https://github.com/robinebers/openusage), collects usage and quota data, and exposes normalized snapshots through a local REST API and CLI.
+It runs provider plugins from [CrossUsage](https://github.com/barramee27/crossusage), collects usage and quota data, and exposes normalized snapshots through a local REST API and CLI.
 
 ## Why this project exists
 
-The upstream OpenUsage project is a macOS menu-bar app that combines UI and backend logic. `openusage-cli` focuses on the backend side only, following a Unix-style design: do one thing well.
+CrossUsage combines a desktop interface with provider integrations. `openusage-cli` reuses its JavaScript plugins and focuses on the backend side only, following a Unix-style design: do one thing well.
 
 That one thing is reliable data collection from AI providers, so other tools can build UI and automation on top.
 
 ## What it gives you
 
 - One local source of truth for usage/quota data across multiple AI providers
-- Reuse of the OpenUsage plugin ecosystem instead of custom per-provider integrations
+- Reuse of the CrossUsage plugin ecosystem instead of custom per-provider integrations
 - A headless data source for other tools: dashboards, notifications, alerts, scripts, and machine-to-machine integrations via local REST API
 
 ## Operating modes
@@ -100,9 +100,11 @@ curl http://127.0.0.1:6738/v1/usage
 - Configuration and daemon discovery: [docs/configuration.md](docs/configuration.md)
 - Plugin overrides and AST patching: [docs/plugin-overrides.md](docs/plugin-overrides.md)
 - Development, testing, packaging, releases: [docs/development.md](docs/development.md)
-- Known intentional behavior differences: [openusage_differences.md](docs/openusage_differences.md)
+- Known intentional behavior differences: [crossusage_differences.md](docs/crossusage_differences.md)
 
-For upstream project [OpenUsage](https://github.com/robinebers/openusage) plugin contracts, see vendored upstream docs:
+The vendored source revision and synchronization policy are recorded in [docs/crossusage-upstream.md](docs/crossusage-upstream.md).
 
-- [vendor/openusage/docs/plugins/api.md](vendor/openusage/docs/plugins/api.md)
-- [vendor/openusage/docs/plugins/schema.md](vendor/openusage/docs/plugins/schema.md)
+For upstream project [CrossUsage](https://github.com/barramee27/crossusage) plugin contracts, see vendored upstream docs:
+
+- [vendor/crossusage/docs/plugins/api.md](vendor/crossusage/docs/plugins/api.md)
+- [vendor/crossusage/docs/plugins/schema.md](vendor/crossusage/docs/plugins/schema.md)

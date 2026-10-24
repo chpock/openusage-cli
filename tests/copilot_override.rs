@@ -26,7 +26,7 @@ fn repo_root() -> PathBuf {
 }
 
 fn copilot_plugin_script() -> String {
-    let path = repo_root().join("vendor/openusage/plugins/copilot/plugin.js");
+    let path = repo_root().join("vendor/crossusage/plugins/copilot/plugin.js");
     fs::read_to_string(path).expect("read copilot plugin")
 }
 

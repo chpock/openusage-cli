@@ -4,7 +4,7 @@ use rquickjs::{Context, Ctx, Function, Object, Runtime, Value};
 use std::path::PathBuf;
 
 fn vendor_plugins_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor/openusage/plugins")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor/crossusage/plugins")
 }
 
 #[test]
@@ -12,7 +12,7 @@ fn vendor_plugins_are_loadable() {
     let plugins = manifest::load_plugins_from_dir(&vendor_plugins_dir());
     assert!(
         plugins.len() >= 10,
-        "expected openusage plugins to be vendored"
+        "expected CrossUsage plugins to be vendored"
     );
     assert!(plugins.iter().any(|p| p.manifest.id == "claude"));
     assert!(plugins.iter().any(|p| p.manifest.id == "codex"));

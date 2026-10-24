@@ -9,12 +9,12 @@ pub(super) fn plugins_dir_candidates(cwd: &Path, exec_dir: &Path) -> Vec<PathBuf
     if let Some(source_root) = source_root {
         push_unique_path(
             &mut candidates,
-            source_root.join("vendor/openusage/plugins"),
+            source_root.join("vendor/crossusage/plugins"),
         );
         push_unique_path(&mut candidates, source_root.join("plugins"));
-        push_unique_path(&mut candidates, cwd.join("vendor/openusage/plugins"));
+        push_unique_path(&mut candidates, cwd.join("vendor/crossusage/plugins"));
         push_unique_path(&mut candidates, cwd.join("plugins"));
-        push_unique_path(&mut candidates, exec_dir.join("vendor/openusage/plugins"));
+        push_unique_path(&mut candidates, exec_dir.join("vendor/crossusage/plugins"));
         push_unique_path(&mut candidates, exec_dir.join("plugins"));
     }
 
@@ -66,7 +66,7 @@ pub(super) fn source_checkout_root_from_exec_dir(exec_dir: &Path) -> Option<Path
 pub(super) fn packaged_plugins_dir_from_exec_dir(exec_dir: &Path) -> Option<PathBuf> {
     exec_dir
         .parent()
-        .map(|prefix| prefix.join("share/openusage-cli/openusage-plugins"))
+        .map(|prefix| prefix.join("share/openusage-cli/plugins"))
 }
 
 pub(super) fn packaged_overrides_dir_from_exec_dir(exec_dir: &Path) -> Option<PathBuf> {

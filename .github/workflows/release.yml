@@ -60,7 +60,7 @@ jobs:
         run: cargo build --release
 
       - name: Exclude mock plugin from Linux package payload
-        run: rm -rf vendor/openusage/plugins/mock
+        run: rm -rf vendor/crossusage/plugins/mock
 
       - name: Build deb package
         run: cargo deb --no-build

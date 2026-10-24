@@ -112,17 +112,17 @@ If `--plugins-dir` is not set, default discovery order is:
 
 When running from source (`target/{debug,release}`):
 
-1. `<repo_root>/vendor/openusage/plugins`
+1. `<repo_root>/vendor/crossusage/plugins`
 2. `<repo_root>/plugins`
-3. `<executable_dir>/vendor/openusage/plugins`
+3. `<executable_dir>/vendor/crossusage/plugins`
 4. `<executable_dir>/plugins`
-5. `<prefix>/share/openusage-cli/openusage-plugins`
-6. `/usr/share/openusage-cli/openusage-plugins`
+5. `<prefix>/share/openusage-cli/plugins`
+6. `/usr/share/openusage-cli/plugins`
 
 When running as installed Linux binary (FHS layout):
 
-1. `<prefix>/share/openusage-cli/openusage-plugins`
-2. `/usr/share/openusage-cli/openusage-plugins`
+1. `<prefix>/share/openusage-cli/plugins`
+2. `/usr/share/openusage-cli/plugins`
 
 ## Daemon discovery file
 

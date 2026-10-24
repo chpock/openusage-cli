@@ -1,10 +1,10 @@
-# openusage vs openusage-cli: behavior differences
+# CrossUsage vs openusage-cli: behavior differences
 
-This file documents intentional behavior differences between upstream `openusage` and this repository (`openusage-cli`).
+This file documents intentional behavior differences between the pinned CrossUsage plugin host and this repository (`openusage-cli`). The upstream revision is recorded in [crossusage-upstream.md](crossusage-upstream.md).
 
 ## Environment variable resolution
 
-- **Upstream `openusage` behavior**: `host.env.get(name)` first checks the process environment, then falls back to launching shell commands (for example `printenv` through login/interactive shell modes) to discover variables that are only present in user shell initialization.
+- **Upstream CrossUsage behavior**: `host.env.get(name)` first checks the process environment, then falls back to launching shell commands (for example `printenv` through login/interactive shell modes) to discover variables that are only present in user shell initialization.
 - **`openusage-cli` behavior**: `host.env.get(name)` reads from the process environment only. It does not launch a shell and does not run `printenv` fallback commands.
 
 ### Why upstream implemented shell fallback
@@ -23,7 +23,7 @@ For predictability and safety, `openusage-cli` treats the daemon process environ
 
 ## Provider file monitoring
 
-- **Upstream `openusage` behavior**: the plugin API does not include a file
+- **Upstream CrossUsage behavior**: the plugin API does not include a file
   subscription mechanism.  Plugins read local files during each probe via
   `ctx.host.fs.*` synchronous I/O, and no reactive refresh occurs on file
   changes.
@@ -37,7 +37,7 @@ For detailed documentation, see [Provider file monitoring](provider-file-monitor
 
 ## Multi-account discovery
 
-- **Upstream `openusage` behavior**: no account discovery mechanism exists.
+- **Upstream CrossUsage behavior**: no account discovery mechanism exists.
   Each plugin runs one probe per refresh and produces a single result.
 - **`openusage-cli` behavior**: extends the plugin API with an optional
   `discoverAccounts(ctx)` export. When present, the runtime calls it to

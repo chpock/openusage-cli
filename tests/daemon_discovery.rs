@@ -48,7 +48,7 @@ impl DaemonProcess {
         service_mode: &str,
     ) -> Self {
         let daemon_bin = PathBuf::from(env!("CARGO_BIN_EXE_openusage-cli"));
-        let plugins_dir = workspace_root.join("vendor/openusage/plugins");
+        let plugins_dir = workspace_root.join("vendor/crossusage/plugins");
 
         let child = Command::new(daemon_bin)
             .arg("run-daemon")
@@ -583,7 +583,7 @@ fn query_mode_use_daemon_false_skips_daemon_and_reports_direct_with_state() {
     wait_for_health_ok(&endpoint_url, daemon.child_mut());
 
     let daemon_bin = PathBuf::from(env!("CARGO_BIN_EXE_openusage-cli"));
-    let plugins_dir = workspace_root.join("vendor/openusage/plugins");
+    let plugins_dir = workspace_root.join("vendor/crossusage/plugins");
     let query_output = Command::new(daemon_bin)
         .arg("query")
         .arg("--use-daemon=false")
@@ -650,7 +650,7 @@ fn query_mode_falls_back_to_local_execution_when_no_daemon() {
 
     // No daemon running - query should fall back to local plugin execution
     let daemon_bin = PathBuf::from(env!("CARGO_BIN_EXE_openusage-cli"));
-    let plugins_dir = workspace_root.join("vendor/openusage/plugins");
+    let plugins_dir = workspace_root.join("vendor/crossusage/plugins");
 
     let query_output = Command::new(daemon_bin)
         .arg("query")
@@ -708,7 +708,7 @@ fn query_mode_plugins_falls_back_to_local_generation_when_no_daemon() {
     fs::create_dir_all(&app_data_dir).expect("create app data dir");
 
     let daemon_bin = PathBuf::from(env!("CARGO_BIN_EXE_openusage-cli"));
-    let plugins_dir = workspace_root.join("vendor/openusage/plugins");
+    let plugins_dir = workspace_root.join("vendor/crossusage/plugins");
 
     let query_output = Command::new(daemon_bin)
         .arg("query")
@@ -758,7 +758,7 @@ fn query_mode_config_falls_back_to_local_generation_when_no_daemon() {
     fs::create_dir_all(&app_data_dir).expect("create app data dir");
 
     let daemon_bin = PathBuf::from(env!("CARGO_BIN_EXE_openusage-cli"));
-    let plugins_dir = workspace_root.join("vendor/openusage/plugins");
+    let plugins_dir = workspace_root.join("vendor/crossusage/plugins");
 
     let query_output = Command::new(daemon_bin)
         .arg("query")
@@ -830,7 +830,7 @@ fn query_mode_plugins_with_state_reports_direct_when_local_fallback_is_used() {
     fs::create_dir_all(&app_data_dir).expect("create app data dir");
 
     let daemon_bin = PathBuf::from(env!("CARGO_BIN_EXE_openusage-cli"));
-    let plugins_dir = workspace_root.join("vendor/openusage/plugins");
+    let plugins_dir = workspace_root.join("vendor/crossusage/plugins");
 
     let query_output = Command::new(daemon_bin)
         .arg("query")
@@ -891,7 +891,7 @@ fn query_mode_falls_back_when_daemon_endpoint_file_exists_but_daemon_dead() {
 
     // Query should fail to connect, then fall back to local execution
     let daemon_bin = PathBuf::from(env!("CARGO_BIN_EXE_openusage-cli"));
-    let plugins_dir = workspace_root.join("vendor/openusage/plugins");
+    let plugins_dir = workspace_root.join("vendor/crossusage/plugins");
 
     let query_output = Command::new(daemon_bin)
         .arg("query")
@@ -996,7 +996,7 @@ fn daemon_mode_errors_when_existing_instance_is_already_running_by_default() {
     wait_for_health_ok(&endpoint_url, daemon.child_mut());
 
     let daemon_bin = PathBuf::from(env!("CARGO_BIN_EXE_openusage-cli"));
-    let plugins_dir = workspace_root.join("vendor/openusage/plugins");
+    let plugins_dir = workspace_root.join("vendor/crossusage/plugins");
     let output = Command::new(daemon_bin)
         .arg("run-daemon")
         .arg("--test-mode")
@@ -1050,7 +1050,7 @@ fn daemon_replace_policy_replaces_running_standalone_instance() {
     wait_for_health_ok(&old_endpoint_url, old_daemon.child_mut());
 
     let daemon_bin = PathBuf::from(env!("CARGO_BIN_EXE_openusage-cli"));
-    let plugins_dir = workspace_root.join("vendor/openusage/plugins");
+    let plugins_dir = workspace_root.join("vendor/crossusage/plugins");
     let output = Command::new(daemon_bin)
         .arg("run-daemon")
         .arg("--existing-instance")
@@ -1108,7 +1108,7 @@ fn daemon_replace_policy_requests_restart_for_systemd_managed_instance() {
     wait_for_health_ok(&endpoint_url, old_daemon.child_mut());
 
     let daemon_bin = PathBuf::from(env!("CARGO_BIN_EXE_openusage-cli"));
-    let plugins_dir = workspace_root.join("vendor/openusage/plugins");
+    let plugins_dir = workspace_root.join("vendor/crossusage/plugins");
     let output = Command::new(daemon_bin)
         .arg("run-daemon")
         .arg("--existing-instance")

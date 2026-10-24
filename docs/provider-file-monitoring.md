@@ -6,7 +6,7 @@ file changes, the daemon automatically refreshes the affected providers.
 
 ## Purpose
 
-The upstream OpenUsage plugin model is stateless: every probe runs from scratch
+The upstream CrossUsage plugin model is stateless: every probe runs from scratch
 and does its own I/O.  Provider file monitoring does not reduce the number of
 file reads per probe; rather, it provides reactive targeted refresh so that
 when a credential or configuration file changes on disk, the daemon can update

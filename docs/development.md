@@ -2,12 +2,13 @@
 
 ## Compatibility strategy
 
-`openusage-cli` prioritizes compatibility with upstream OpenUsage plugin contracts.
+`openusage-cli` prioritizes compatibility with upstream CrossUsage plugin contracts.
 
-- Upstream references are vendored in `vendor/openusage/`
+- Upstream plugins and references are vendored verbatim in `vendor/crossusage/`
+- The upstream repository, pinned commit, payload paths, and synchronization policy are recorded in [crossusage-upstream.md](crossusage-upstream.md)
 - Runtime compatibility fixes should be implemented in `src/` (not by editing vendored plugin files)
 
-See [openusage_differences.md](openusage_differences.md) for intentional behavior differences.
+See [crossusage_differences.md](crossusage_differences.md) for intentional behavior differences.
 
 ## Verification
 
@@ -50,7 +51,7 @@ make packages
 Package layout:
 
 - Binary: `/usr/bin/openusage-cli`
-- Upstream plugins: `/usr/share/openusage-cli/openusage-plugins`
+- Upstream plugins: `/usr/share/openusage-cli/plugins`
 - Override plugins: `/usr/share/openusage-cli/plugin-overrides`
 
 ## Release versioning

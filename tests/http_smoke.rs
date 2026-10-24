@@ -10,7 +10,7 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 fn vendor_plugins_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor/openusage/plugins")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor/crossusage/plugins")
 }
 
 fn load_mock_only_plugins() -> Vec<manifest::LoadedPlugin> {

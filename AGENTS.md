@@ -2,7 +2,7 @@
 
 ## Non-negotiable scope
 - Active project is the root Rust crate (`Cargo.toml`, `src/`, `tests/`).
-- `openusage/` is upstream reference source; `vendor/openusage/` is runtime compatibility mirror.
+- `openusage/` is a legacy reference checkout; `vendor/crossusage/` is the runtime plugin source and compatibility reference mirror.
 - Do not edit `openusage/` or `vendor/*` during feature work; implement fixes in `src/`.
 
 ## Language policy
@@ -52,11 +52,11 @@
 ## Plugin and override resolution
 - Plugin dir resolution order (`src/main.rs`):
   1) `--plugins-dir`
-  2) source checkout roots (`vendor/openusage/plugins`, then `plugins`)
-  3) current working dir (`vendor/openusage/plugins`, then `plugins`)
-  4) executable dir (`vendor/openusage/plugins`, then `plugins`)
-  5) packaged path (`<prefix>/share/openusage-cli/openusage-plugins`)
-  6) `/usr/share/openusage-cli/openusage-plugins`
+  2) source checkout roots (`vendor/crossusage/plugins`, then `plugins`)
+  3) current working dir (`vendor/crossusage/plugins`, then `plugins`)
+  4) executable dir (`vendor/crossusage/plugins`, then `plugins`)
+  5) packaged path (`<prefix>/share/openusage-cli/plugins`)
+  6) `/usr/share/openusage-cli/plugins`
 - Override dir resolution order (`src/main.rs`):
   1) `--plugin-overrides-dir`
   2) source checkout root `plugin-overrides`
@@ -72,13 +72,13 @@
 ## Compatibility guardrails
 - Keep upstream plugin contract compatibility first; prefer host/runtime fixes over vendored JS edits.
 - `host.env.get` is intentionally restricted: process env only, and only for `WHITELISTED_ENV_VARS` (`src/plugin_engine/host_api.rs`).
-- Intentional behavior diffs vs upstream are documented in [openusage_differences.md](docs/openusage_differences.md) (check before changing host behavior).
+- Intentional behavior diffs vs upstream are documented in [crossusage_differences.md](docs/crossusage_differences.md) (check before changing host behavior).
 - HTTP behavior enforced by tests:
   - `GET /v1/usage` returns cached snapshots unless `refresh=true`.
   - `GET /v1/usage/{provider}` unknown provider -> `404 {"error":"provider_not_found"}`.
   - Known provider with no cached snapshot and no refresh -> `204 No Content`.
 - `tests/plugin_compatibility.rs` expects vendored plugins including `mock`, `claude`, `codex`, `cursor`.
-- `tests/codex_override.rs` couples `vendor/openusage/plugins/codex/plugin.js` with `plugin-overrides/codex.js`.
+- `tests/codex_override.rs` couples `vendor/crossusage/plugins/codex/plugin.js` with `plugin-overrides/codex.js`.
 - After runtime/host API/HTTP changes, run at least `http_smoke` + `plugin_compatibility`; include `codex_override` when touching override/AST flow.
 
 ## Commit and release conventions
@@ -90,7 +90,8 @@
 - Packaging publishes `.deb` and `.rpm` artifacts for amd64/arm64.
 
 ## Vendor sync policy
-- Sync `vendor/openusage/*` only from upstream `https://github.com/robinebers/openusage.git`.
+- Sync `vendor/crossusage/*` only from `https://github.com/barramee27/crossusage.git`, using one commit for the entire payload.
+- Keep vendored files unmodified, including upstream documentation and attribution. Record the revision and payload in [crossusage-upstream.md](docs/crossusage-upstream.md).
 - Keep vendor sync changes isolated from feature changes.
 - Do not hand-edit vendored plugin files to fix runtime behavior; implement compatibility in `src/`.
 - Ensure expected vendored plugin ids remain present (`mock`, `claude`, `codex`, `cursor`) because compatibility tests rely on them.

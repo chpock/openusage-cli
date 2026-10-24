@@ -26,7 +26,7 @@ fn repo_root() -> PathBuf {
 }
 
 fn codex_plugin_script() -> String {
-    let path = repo_root().join("vendor/openusage/plugins/codex/plugin.js");
+    let path = repo_root().join("vendor/crossusage/plugins/codex/plugin.js");
     fs::read_to_string(path).expect("read codex plugin")
 }
 
