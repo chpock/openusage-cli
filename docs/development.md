@@ -6,6 +6,7 @@
 
 - Upstream plugins and references are vendored verbatim in `vendor/crossusage/`
 - The upstream repository, pinned commit, payload paths, and synchronization policy are recorded in [crossusage-upstream.md](crossusage-upstream.md)
+- Follow [crossusage-update-workflow.md](crossusage-update-workflow.md) for plugin updates; execute it only with operator authorization
 - Runtime compatibility fixes should be implemented in `src/` (not by editing vendored plugin files)
 
 See [crossusage_differences.md](crossusage_differences.md) for intentional behavior differences.

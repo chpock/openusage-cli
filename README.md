@@ -100,6 +100,7 @@ curl http://127.0.0.1:6738/v1/usage
 - Configuration and daemon discovery: [docs/configuration.md](docs/configuration.md)
 - Plugin overrides and AST patching: [docs/plugin-overrides.md](docs/plugin-overrides.md)
 - Development, testing, packaging, releases: [docs/development.md](docs/development.md)
+- CrossUsage plugin updates: [docs/crossusage-update-workflow.md](docs/crossusage-update-workflow.md)
 - Known intentional behavior differences: [crossusage_differences.md](docs/crossusage_differences.md)
 
 The vendored source revision and synchronization policy are recorded in [docs/crossusage-upstream.md](docs/crossusage-upstream.md).

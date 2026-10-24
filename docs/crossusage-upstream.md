@@ -64,6 +64,9 @@ exact matches, not a substitute for ancestry or content comparison.
 
 ## Synchronization policy
 
+Follow [crossusage-update-workflow.md](crossusage-update-workflow.md) for the
+end-to-end update procedure and required evidence.
+
 1. Choose a CrossUsage commit and inspect changes to plugins, host contracts,
    and functions patched by `plugin-overrides/`.
 2. Replace the entire payload listed above from that same commit, removing
