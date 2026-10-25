@@ -1,5 +1,8 @@
 # Usage
 
+For complete response schemas, field presence, units, account identity, error
+handling and examples, see the [JSON output reference](json-output.md).
+
 ## Basic commands
 
 ```bash
@@ -81,7 +84,7 @@ for configuration examples and discovery/probe boundaries.
 - `--refresh-interval-secs <seconds>` (default: `180`)
 - `--aggressive-refresh-interval-secs <seconds>` (default: `10`)
 
-  When a provider plan includes a `resetAt` timestamp, the daemon switches to the
+  When a progress line includes a `resetsAt` timestamp, the daemon switches to the
   aggressive interval for that provider after the reset time is reached, polling
   more frequently so the new quota snapshot is available promptly.
 - `--existing-instance <error|ignore|replace>` (default: `error`)
@@ -98,60 +101,15 @@ http://127.0.0.1:6738
 ```
 
 - `GET /health`: service health and loaded plugin count.
-- `GET /v1/plugins`: plugin metadata for discovered plugins.
+- `GET /v1/plugins`: metadata for successfully loaded, enabled plugins.
 - `GET /v1/usage[?refresh=true][&pluginIds=codex,cursor]`: usage snapshots.
   - `refresh` (optional, default `false`): trigger fresh probe before returning data.
   - `pluginIds` (optional): comma-separated plugin IDs filter.
 
-  Response shape (JSON array of objects):
-
-  ```json
-  {
-    "providerId": "codex",
-    "displayName": "Codex",
-    "plan": null,
-    "lines": [
-      {
-        "type": "text",
-        "label": "Status",
-        "value": "ok"
-      }
-    ],
-    "iconUrl": "data:image/svg+xml;base64,...",
-    "fetchedAt": "2026-07-30T12:00:00Z",
-    "account": {
-      "id": "default",
-      "origin": "native"
-    }
-  }
-  ```
-
-  The `account` object is present on every usage snapshot. Most providers
-  return only `"id": "default"`.
-
-  `account.id` is a provider-scoped unique identifier in output. For current
-  bundled plugins, explicit discovery ids are preserved when they are already
-  unique. When discovery returns colliding ids, the runtime emits a
-  deterministic host-generated id (`acc_v1_<hash>`) to keep output ids unique.
-
-  `account.name` is optional and intended for display labels from discovery.
-  It does not participate in routing or identity checks.
-
-  `ctx.account.id` used inside plugin/override probe logic may remain the
-  descriptor id even when output `account.id` is canonicalized for uniqueness.
-
-  **`origin` field:** Every account object carries an `origin` string that
-  identifies the credential source:
-
-  - `"native"` — credentials supplied by the original plugin.
-  - `"opencode"` — current Codex and Copilot override accounts that read from
-    OpenCode auth files.
-  - Future releases may introduce additional source identifiers (e.g.
-    `"jetbrains"`, `"vscode"`).
-
-  The `origin` is assigned by the runtime based on the account descriptor or
-  override context. It is preserved unchanged through the daemon cache and
-  serialized API responses.
+  The response is a flat JSON array of account-bearing usage snapshots. See
+  [Usage snapshots](json-output.md#usage-snapshots) for the complete schema and
+  examples, including `account.isActive`, account IDs and credential origins.
+  Icons are returned in plugin metadata, not usage snapshots.
 
   When a discovery account has `errorPolicy: "hide-if-other-account"` and at
   least one other enabled account descriptor exists, policy-suppressed probe failures
@@ -285,7 +243,8 @@ http://127.0.0.1:6738
      selection is deferred; a future account selector will resolve this).
 
 - `GET /v1/config`: return the daemon's active runtime configuration (host, port, refresh intervals, enabled plugins, etc.).
-- `POST /v1/probe`: force refresh. Optional JSON body:
+- `POST /v1/probe`: force refresh. A JSON object body is required; use `{}` to
+  refresh all providers. The `pluginIds` property is optional:
 
   ```json
   {

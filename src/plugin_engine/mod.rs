@@ -1,7 +1,14 @@
+mod analytics;
+mod chromium_cookies;
+mod cursor_remote;
+mod fireworks;
 pub mod host_api;
 pub mod manifest;
+#[cfg(target_os = "linux")]
+mod os_credentials;
 pub(crate) mod override_api;
 pub mod override_lifecycle;
+mod process_io;
 pub mod runtime;
 pub mod script_patch;
 use manifest::LoadedPlugin;

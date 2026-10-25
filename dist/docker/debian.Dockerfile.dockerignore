@@ -1,0 +1,15 @@
+**
+!Cargo.toml
+!Cargo.lock
+!README.md
+!LICENSE
+!src/
+!src/**
+!vendor/
+!vendor/crossusage/
+!vendor/crossusage/**
+!plugin-overrides/
+!plugin-overrides/**
+!dist/
+!dist/scripts/
+!dist/scripts/check-deb-dependencies.sh

@@ -2,7 +2,7 @@
 
 // Integration tests for the Copilot plugin override.
 //
-// Every test calls the single shared `RunSpec { probe_mode: true }` path,
+// Harness tests call the shared `ProviderSpec` runner,
 // which calls `execute_provider_in_context` (production probe code).
 // No manual Runtime/Context/override_api injection or discovery/probe loops.
 //
@@ -12,7 +12,7 @@
 mod support;
 
 use openusage_cli::config::{AuthSource, DEFAULT_AUTH_SOURCES};
-use openusage_cli::plugin_engine::runtime::ProbeResult;
+use openusage_cli::plugin_engine::runtime::{MetricLine, ProbeResult, ProgressFormat};
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
@@ -52,7 +52,6 @@ fn run_copilot_probe_with_sources(
         harness: HARNESS_SCRIPT,
         setup: setup_js,
         assertion: Some(ASSERTION_SCRIPT),
-        // probe_mode removed — ProviderSpec has no such field
     };
     let outcome = if sources == DEFAULT_AUTH_SOURCES {
         run_provider_probe(&spec)
@@ -74,6 +73,55 @@ fn assert_subscriptions(obs: &Value, expected: &[&str]) {
         .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
         .unwrap_or_default();
     assert_eq!(subs, expected, "subscription mismatch");
+    assert_eq!(obs["writes"], serde_json::json!([]), "no credential writes");
+}
+
+fn assert_requests(obs: &Value, tokens: &[&str]) {
+    let requests = obs["requests"].as_array().expect("requests");
+    assert_eq!(requests.len(), tokens.len(), "exact request count");
+    for (request, token) in requests.iter().zip(tokens) {
+        assert_eq!(request["method"], "GET");
+        assert_eq!(
+            request["url"],
+            "https://api.github.com/copilot_internal/user"
+        );
+        assert_eq!(request["authorization"], format!("token {token}"));
+    }
+    assert_eq!(obs["writes"], serde_json::json!([]), "no credential writes");
+}
+
+fn assert_credits(result: &ProbeResult, id: &str, origin: &str, name: Option<&str>, active: bool) {
+    let output = result
+        .outputs
+        .iter()
+        .find(|o| o.account.id == id)
+        .unwrap_or_else(|| panic!("missing {id}: {:?}", result.outputs));
+    assert_eq!(output.provider_id, "copilot");
+    assert_eq!(output.display_name, "Copilot");
+    assert_eq!(output.account.origin, origin);
+    assert_eq!(output.account.name.as_deref(), name);
+    assert_eq!(output.account.is_active, active);
+    assert_eq!(output.plan.as_deref(), Some("Pro"));
+    assert_eq!(output.lines.len(), 1, "exact successful metric count");
+    match &output.lines[0] {
+        MetricLine::Progress {
+            label,
+            used,
+            limit,
+            format,
+            resets_at,
+            period_duration_ms,
+            ..
+        } => {
+            assert_eq!(label, "Credits");
+            assert_eq!(*used, 25.0);
+            assert_eq!(*limit, 100.0);
+            assert!(matches!(format, ProgressFormat::Percent));
+            assert_eq!(resets_at.as_deref(), Some("2099-01-15T00:00:00.000Z"));
+            assert_eq!(*period_duration_ms, Some(2_592_000_000));
+        }
+        other => panic!("expected non-error Credits quota for {id}, got {other:?}"),
+    }
 }
 
 fn first_request_auth(obs: &Value) -> String {
@@ -124,6 +172,101 @@ fn assert_default_origin(result: &ProbeResult) {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
+fn copilot_override_private_state_stays_inside_closure() {
+    let (result, obs) = run_copilot_probe(
+        r#"
+        __test_state.inspectPrivacy = true;
+        __test_state.keychain["OpenUsage-copilot"] = JSON.stringify({token: "native-token"});
+        __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({"github-copilot": {access: "opencode-token"}});
+        __test_state.responses.usage.push({status: 200, bodyText: JSON.stringify(__test_state.successUsage)});
+        __test_state.responses.usage.push({status: 200, bodyText: JSON.stringify(__test_state.successUsage)});
+    "#,
+    );
+    let obs = obs.expect("privacy observation");
+    for binding in obs["privacy"]
+        .as_array()
+        .expect("private bindings checked during native request")
+    {
+        assert_eq!(
+            binding["visibility"], "undefined",
+            "private binding leaked: {}",
+            binding["name"]
+        );
+    }
+    assert_eq!(result.outputs.len(), 2);
+    assert_credits(&result, "default", "native", None, true);
+    assert_credits(&result, "opencode-0", "opencode", Some("OpenCode 2"), true);
+    assert_requests(&obs, &["native-token", "opencode-token"]);
+}
+
+#[test]
+fn copilot_override_http_200_without_usage_is_an_error() {
+    for sources in [&[AuthSource::Native][..], &[AuthSource::Opencode][..]] {
+        let (result, obs) = run_copilot_probe_with_sources(
+            r#"
+            __test_state.keychain["OpenUsage-copilot"] = JSON.stringify({token: "native-token"});
+            __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({"github-copilot": {access: "opencode-token"}});
+            __test_state.responses.usage.push({status: 200, headers: {}, bodyText: "{}"});
+        "#,
+            sources,
+        );
+        assert_eq!(
+            result.outputs.len(),
+            1,
+            "selected account error is not suppressed by disabled accounts"
+        );
+        let output = &result.outputs[0];
+        let (id, origin, token) = if sources == [AuthSource::Native] {
+            ("default", "native", "native-token")
+        } else {
+            ("opencode-0", "opencode", "opencode-token")
+        };
+        assert_eq!(output.account.id, id);
+        assert_eq!(output.account.origin, origin);
+        match &output.lines[..] {
+            [MetricLine::Badge { label, text, .. }] => {
+                assert_eq!(label, "Error");
+                assert_eq!(text, "Copilot usage data is unavailable for this account.");
+            }
+            other => panic!("expected no-data error, got {other:?}"),
+        }
+        assert_requests(&obs.expect("request observation"), &[token]);
+    }
+}
+
+#[test]
+fn copilot_override_selected_opencode_auth_error_never_uses_native_or_other_file() {
+    let (result, obs) = run_copilot_probe_with_sources(
+        r#"
+        __test_state.keychain["OpenUsage-copilot"] = JSON.stringify({token: "native-token"});
+        __test_state.keychain["gh:github.com"] = "gh-token";
+        __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({"github-copilot": {access: "selected-token"}});
+        __test_state.files["~/.config/opencode/auth.json"] = JSON.stringify({"github-copilot": {access: "other-token"}});
+        __test_state.responses.usage.push({status: 401, bodyText: "{}"});
+        __test_state.responses.usage.push({status: 200, bodyText: JSON.stringify(__test_state.successUsage)});
+    "#,
+        &[AuthSource::Opencode],
+    );
+    let obs = obs.expect("request observation");
+    assert_eq!(result.outputs.len(), 2);
+    let selected = &result.outputs[0];
+    assert_eq!(selected.account.id, "opencode-0");
+    assert_eq!(selected.account.origin, "opencode");
+    match &selected.lines[..] {
+        [MetricLine::Badge { label, text, .. }] => {
+            assert_eq!(label, "Error");
+            assert_eq!(
+                text,
+                "Token invalid. Run `gh auth login` to re-authenticate."
+            );
+        }
+        other => panic!("expected selected source failure, got {other:?}"),
+    }
+    assert_credits(&result, "opencode-1", "opencode", Some("OpenCode 3"), true);
+    assert_requests(&obs, &["selected-token", "other-token"]);
+}
+
+#[test]
 fn copilot_override_filters_auth_sources_before_requests() {
     let setup = r#"
         __test_state.keychain["OpenUsage-copilot"] = JSON.stringify({token: "native-token"});
@@ -133,7 +276,7 @@ fn copilot_override_filters_auth_sources_before_requests() {
             {accountId: "inactive", isActive: false, data: {access: "inactive-token"}}
         ]});
         for (var i = 0; i < 3; i++) {
-            __test_state.responses.usage.push({status: 200, headers: {}, bodyText: "{}"});
+            __test_state.responses.usage.push({status: 200, headers: {}, bodyText: JSON.stringify(__test_state.successUsage)});
         }
     "#;
     for (sources, tokens) in [
@@ -162,6 +305,16 @@ fn copilot_override_filters_auth_sources_before_requests() {
             .collect();
         assert_eq!(authorizations, expected);
         assert_eq!(result.outputs.len(), tokens.len());
+        assert_requests(&observed, &tokens);
+        for output in &result.outputs {
+            let (origin, name, active) = match output.account.id.as_str() {
+                "default" => ("native", None, true),
+                "opencode-0" => ("opencode", Some("default"), true),
+                "inactive" => ("opencode", Some("inactive"), false),
+                other => panic!("unexpected account {other}"),
+            };
+            assert_credits(&result, &output.account.id, origin, name, active);
+        }
         assert_subscriptions(
             &observed,
             &[
@@ -192,10 +345,13 @@ fn copilot_override_native_default_source() {
         __test_state.keychain["OpenUsage-copilot"] = JSON.stringify({
           token: "native-token"
         });
+        // percent_remaining takes precedence over the entitlement fallback.
+        __test_state.successUsage.quota_snapshots.premium_interactions.percent_remaining = 75;
+        __test_state.successUsage.quota_snapshots.premium_interactions.remaining = 0;
         __test_state.responses.usage.push({
           status: 200,
           headers: {},
-          bodyText: JSON.stringify({})
+          bodyText: JSON.stringify(__test_state.successUsage)
         });
         "#,
     );
@@ -213,12 +369,15 @@ fn copilot_override_native_default_source() {
     );
 
     assert_eq!(first_request_auth(&obs), "token native-token");
+    assert_eq!(result.outputs.len(), 1);
+    assert_credits(&result, "default", "native", None, true);
+    assert_requests(&obs, &["native-token"]);
 
     assert!(!result.outputs.is_empty());
     assert_eq!(result.outputs[0].provider_id, "copilot");
     assert!(result.outputs[0].account.is_active);
 
-    // Default account has no origin
+    // Native default account retains its origin.
     assert_default_origin(&result);
 }
 
@@ -238,7 +397,7 @@ fn copilot_override_uses_opencode_fallback_auth_when_primary_auth_missing() {
         __test_state.responses.usage.push({
           status: 200,
           headers: {},
-          bodyText: JSON.stringify({})
+          bodyText: JSON.stringify(__test_state.successUsage)
         });
         "#,
     );
@@ -256,12 +415,15 @@ fn copilot_override_uses_opencode_fallback_auth_when_primary_auth_missing() {
     );
 
     assert_eq!(first_request_auth(&obs), "token fallback-access");
+    assert_eq!(result.outputs.len(), 1);
+    assert_credits(&result, "opencode-0", "opencode", Some("OpenCode 2"), true);
+    assert_requests(&obs, &["fallback-access"]);
 
     assert!(!result.outputs.is_empty());
     assert_eq!(result.outputs[0].provider_id, "copilot");
     assert_eq!(account_is_active(&result, "opencode-0"), Some(true));
 
-    // OpenCode error account has origin: opencode
+    // OpenCode account retains its source origin.
     assert_opencode_origin(&result, "opencode-0");
 }
 
@@ -299,7 +461,7 @@ fn copilot_override_accounts_json_inactive_entry_uses_entry_credentials() {
         __test_state.responses.usage.push({
           status: 200,
           headers: {},
-          bodyText: JSON.stringify({})
+          bodyText: JSON.stringify(__test_state.successUsage)
         });
         "#,
     );
@@ -336,6 +498,19 @@ fn copilot_override_accounts_json_inactive_entry_uses_entry_credentials() {
     assert!(!result.outputs.is_empty());
     assert_eq!(result.outputs[0].provider_id, "copilot");
     assert_opencode_origin(&result, "account-name-1");
+    assert_eq!(
+        result.outputs.len(),
+        2,
+        "active error plus inactive success"
+    );
+    assert_credits(
+        &result,
+        "account-name-1",
+        "opencode",
+        Some("account-name-1"),
+        false,
+    );
+    assert_requests(&obs, &["inactive-access"]);
     assert_eq!(account_is_active(&result, "account-name-1"), Some(false));
 }
 
@@ -369,7 +544,7 @@ fn copilot_override_accounts_json_active_entry_uses_auth_json_credentials() {
         __test_state.responses.usage.push({
           status: 200,
           headers: {},
-          bodyText: JSON.stringify({})
+          bodyText: JSON.stringify(__test_state.successUsage)
         });
         "#,
     );
@@ -387,6 +562,15 @@ fn copilot_override_accounts_json_active_entry_uses_auth_json_credentials() {
     );
 
     assert_eq!(first_request_auth(&obs), "token auth-access");
+    assert_eq!(result.outputs.len(), 1);
+    assert_credits(
+        &result,
+        "account-name-2",
+        "opencode",
+        Some("account-name-2"),
+        true,
+    );
+    assert_requests(&obs, &["auth-access"]);
 
     assert!(!result.outputs.is_empty());
     assert_eq!(result.outputs[0].provider_id, "copilot");
@@ -426,6 +610,8 @@ fn copilot_override_accounts_json_provider_key_not_array_creates_error_account()
         .map(|l| format!("{}", l))
         .collect::<Vec<_>>()
         .join(" ");
+    assert_eq!(result.outputs.len(), 1);
+    assert_requests(&obs, &[]);
     assert!(
         error_text.contains("must be a list of account entries"),
         "expected array validation error, got: {}",
@@ -480,6 +666,7 @@ fn copilot_override_accounts_json_without_active_creates_single_error_account() 
         .map(|l| format!("{}", l))
         .collect::<Vec<_>>()
         .join(" ");
+    assert_requests(&obs, &[]);
     assert!(
         error_text.contains("no active account selected"),
         "expected no-active validation error, got: {}",
@@ -531,6 +718,7 @@ fn copilot_override_accounts_json_multiple_active_creates_single_error_account()
         .map(|l| format!("{}", l))
         .collect::<Vec<_>>()
         .join(" ");
+    assert_requests(&obs, &[]);
     assert!(
         error_text.contains("multiple active accounts selected"),
         "expected multiple-active validation error, got: {}",
@@ -583,6 +771,8 @@ fn copilot_override_accounts_json_active_entry_uses_auth_and_errors_when_auth_in
         .map(|l| format!("{}", l))
         .collect::<Vec<_>>()
         .join(" ");
+    assert_eq!(result.outputs.len(), 1);
+    assert_requests(&obs, &[]);
     assert!(
         error_text.contains("Invalid") || error_text.contains("credentials"),
         "expected auth.json-derived credential error, got: {}",
@@ -619,11 +809,6 @@ fn copilot_override_accounts_json_duplicate_account_id_creates_error_route() {
             }
           ]
         });
-        __test_state.responses.usage.push({
-          status: 200,
-          headers: {},
-          bodyText: JSON.stringify({})
-        });
         "#,
     );
 
@@ -656,6 +841,7 @@ fn copilot_override_accounts_json_duplicate_account_id_creates_error_route() {
             .to_lowercase()
             .contains("duplicate account name")
     });
+    assert_requests(&obs, &[]);
     assert!(
         duplicate_error,
         "expected duplicate-account error output, got: {:?}",
@@ -688,7 +874,7 @@ fn copilot_override_accounts_json_duplicate_default_does_not_conflict_with_nativ
         __test_state.responses.usage.push({
           status: 200,
           headers: {},
-          bodyText: JSON.stringify({})
+          bodyText: JSON.stringify(__test_state.successUsage)
         });
         "#,
     );
@@ -717,6 +903,9 @@ fn copilot_override_accounts_json_duplicate_default_does_not_conflict_with_nativ
             .join(" ")
             .contains("Duplicate accountId in discovery results")
     });
+    assert_eq!(result.outputs.len(), 1);
+    assert_credits(&result, "opencode-0", "opencode", Some("default"), true);
+    assert_requests(&obs, &["fallback-access"]);
     assert!(
         !has_duplicate_discovery_error,
         "same id as native default must not trigger discovery duplicate error: {:?}",
@@ -760,6 +949,7 @@ fn copilot_override_logs_accounts_validation_errors() {
     );
 
     assert_eq!(result.outputs.len(), 1, "expected one error output");
+    assert_requests(&obs, &[]);
 }
 
 #[test]
@@ -769,6 +959,8 @@ fn copilot_override_preserves_original_auth_priority() {
         __test_state.keychain["OpenUsage-copilot"] = JSON.stringify({
           token: "primary-token"
         });
+        __test_state.keychain["gh:github.com"] = "lower-priority-gh-token";
+        __test_state.files["~/.config/openusage/plugins/copilot/auth.json"] = JSON.stringify({token: "lower-priority-state-token"});
         __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({
           "github-copilot": {
             type: "oauth",
@@ -780,7 +972,9 @@ fn copilot_override_preserves_original_auth_priority() {
         __test_state.responses.usage.push({
           status: 200,
           headers: {},
-          bodyText: JSON.stringify({})
+          bodyText: JSON.stringify(__test_state.successUsage)
+        }, {
+          status: 200, headers: {}, bodyText: JSON.stringify(__test_state.successUsage)
         });
         "#,
     );
@@ -798,11 +992,15 @@ fn copilot_override_preserves_original_auth_priority() {
     );
 
     assert_eq!(first_request_auth(&obs), "token primary-token");
+    assert_eq!(result.outputs.len(), 2);
+    assert_credits(&result, "default", "native", None, true);
+    assert_credits(&result, "opencode-0", "opencode", Some("OpenCode 2"), true);
+    assert_requests(&obs, &["primary-token", "fallback-access"]);
 
     assert!(!result.outputs.is_empty());
     assert_eq!(result.outputs[0].provider_id, "copilot");
 
-    // Default account has no origin
+    // Native default account retains its origin.
     assert_default_origin(&result);
 }
 
@@ -830,7 +1028,7 @@ fn copilot_override_tries_multiple_opencode_auth_paths() {
         __test_state.responses.usage.push({
           status: 200,
           headers: {},
-          bodyText: JSON.stringify({})
+          bodyText: JSON.stringify(__test_state.successUsage)
         });
         "#,
     );
@@ -848,6 +1046,9 @@ fn copilot_override_tries_multiple_opencode_auth_paths() {
     );
 
     assert_eq!(first_request_auth(&obs), "token fallback-access-2");
+    assert_eq!(result.outputs.len(), 1);
+    assert_credits(&result, "opencode-1", "opencode", Some("OpenCode 2"), true);
+    assert_requests(&obs, &["fallback-access-2"]);
 
     assert!(!result.outputs.is_empty());
     assert_eq!(result.outputs[0].provider_id, "copilot");
@@ -886,6 +1087,9 @@ fn copilot_override_keeps_not_logged_in_error_without_valid_fallback_payload() {
         .map(|l| format!("{}", l))
         .collect::<Vec<_>>()
         .join(" ");
+    assert_eq!(result.outputs.len(), 1);
+    assert_eq!(result.outputs[0].account.id, "opencode-0");
+    assert_requests(&obs, &[]);
     assert!(
         error_text.contains("Invalid JSON")
             || error_text.contains("Invalid auth")
@@ -913,7 +1117,7 @@ fn copilot_override_exact_token_request_source() {
         __test_state.responses.usage.push({
           status: 200,
           headers: {},
-          bodyText: JSON.stringify({})
+          bodyText: JSON.stringify(__test_state.successUsage)
         });
         "#,
     );
@@ -932,17 +1136,21 @@ fn copilot_override_exact_token_request_source() {
 
     // Token source: opencode auth has "github-copilot" key.
     assert_eq!(first_request_auth(&obs), "token opencode-access");
+    assert_eq!(result.outputs.len(), 1);
+    assert_credits(&result, "opencode-0", "opencode", Some("OpenCode 2"), true);
+    assert_requests(&obs, &["opencode-access"]);
 
     assert!(!result.outputs.is_empty());
     assert_eq!(result.outputs[0].provider_id, "copilot");
 
-    // OpenCode error account has origin: opencode
+    // OpenCode account retains its source origin.
     assert_opencode_origin(&result, "opencode-0");
 }
 
 #[test]
 fn copilot_override_only_default_soft_fail() {
     // Only one account — no suppression even if error policy is set.
+    // HTTP 200 without quota data is a genuine native probe failure.
     let outcome = run_provider_probe(&ProviderSpec {
         plugin_id: "copilot",
         plugin_name: "Copilot",
@@ -956,17 +1164,25 @@ fn copilot_override_only_default_soft_fail() {
         __test_state.responses.usage.push({
           status: 200,
           headers: {},
-          bodyText: JSON.stringify({})
+          bodyText: "{}"
         });
         "#,
         assertion: Some(ASSERTION_SCRIPT),
-        // probe_mode removed — ProviderSpec has no such field
     });
     match outcome {
         ProviderOutcome::Probe { result, assertion } => {
             assert!(!result.outputs.is_empty(), "expected probe outputs");
             assert_eq!(result.outputs[0].provider_id, "copilot");
-            assertion.expect("assertion should produce state");
+            let obs = assertion.expect("assertion should produce state");
+            assert_eq!(result.outputs.len(), 1);
+            match &result.outputs[0].lines[..] {
+                [MetricLine::Badge { label, text, .. }] => {
+                    assert_eq!(label, "Error");
+                    assert_eq!(text, "Copilot usage data is unavailable for this account.");
+                }
+                other => panic!("expected visible native failure, got {other:?}"),
+            }
+            assert_requests(&obs, &["native-token"]);
             assert_default_origin(&result);
         }
         other => panic!("expected Probe outcome, got {:?}", other),
@@ -978,7 +1194,6 @@ fn copilot_override_empty_source_no_account() {
     let (result, obs) = run_copilot_probe(
         r#"
         __test_state.files["~/.local/share/opencode/auth.json"] = "";
-        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify({}) });
         "#,
     );
     let obs = obs.expect("assertion should produce state");
@@ -994,8 +1209,10 @@ fn copilot_override_empty_source_no_account() {
     assert!(!result.outputs.is_empty());
     assert_eq!(result.outputs[0].provider_id, "copilot");
 
-    // Default account has no origin
+    // Native default account retains its origin.
     assert_default_origin(&result);
+    assert_eq!(result.outputs.len(), 1, "empty source creates no account");
+    assert_requests(&obs, &[]);
 }
 
 #[test]
@@ -1004,7 +1221,6 @@ fn copilot_override_unreadable_source_creates_error_account() {
         r#"
         __test_state.files["~/.local/share/opencode/auth.json"] = "throw-on-read";
         __test_state.readErrors["~/.local/share/opencode/auth.json"] = true;
-        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify({}) });
         "#,
     );
     let obs = obs.expect("assertion should produce state");
@@ -1020,7 +1236,7 @@ fn copilot_override_unreadable_source_creates_error_account() {
     assert!(!result.outputs.is_empty());
     assert_eq!(result.outputs[0].provider_id, "copilot");
 
-    // OpenCode error account has origin: opencode
+    // OpenCode account retains its source origin.
     assert_opencode_origin(&result, "opencode-0");
     let error_text: String = result.outputs[0]
         .lines
@@ -1028,6 +1244,8 @@ fn copilot_override_unreadable_source_creates_error_account() {
         .map(|l| format!("{}", l))
         .collect::<Vec<_>>()
         .join(" ");
+    assert_eq!(result.outputs.len(), 1);
+    assert_requests(&obs, &[]);
     assert!(
         error_text.contains("read error") || error_text.contains("Failed to read"),
         "got: {}",
@@ -1040,7 +1258,6 @@ fn copilot_override_missing_provider_key_omits_candidate() {
     let (result, obs) = run_copilot_probe(
         r#"
         __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({ google: { type: "oauth", access: "g", expires: 1 } });
-        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify({}) });
         "#,
     );
     let obs = obs.expect("assertion should produce state");
@@ -1056,8 +1273,10 @@ fn copilot_override_missing_provider_key_omits_candidate() {
     assert!(!result.outputs.is_empty());
     assert_eq!(result.outputs[0].provider_id, "copilot");
 
-    // Default account has no origin
+    // Native default account retains its origin.
     assert_default_origin(&result);
+    assert_eq!(result.outputs.len(), 1, "missing provider is omitted");
+    assert_requests(&obs, &[]);
 }
 
 #[test]
@@ -1065,7 +1284,6 @@ fn copilot_override_malformed_provider_block_null_error() {
     let (result, obs) = run_copilot_probe(
         r#"
         __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({ "github-copilot": null });
-        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify({}) });
         "#,
     );
     let obs = obs.expect("assertion should produce state");
@@ -1081,7 +1299,7 @@ fn copilot_override_malformed_provider_block_null_error() {
     assert!(!result.outputs.is_empty());
     assert_eq!(result.outputs[0].provider_id, "copilot");
 
-    // OpenCode error account has origin: opencode
+    // OpenCode account retains its source origin.
     assert_opencode_origin(&result, "opencode-0");
     let error_text: String = result.outputs[0]
         .lines
@@ -1089,6 +1307,8 @@ fn copilot_override_malformed_provider_block_null_error() {
         .map(|l| format!("{}", l))
         .collect::<Vec<_>>()
         .join(" ");
+    assert_eq!(result.outputs.len(), 1);
+    assert_requests(&obs, &[]);
     assert!(
         error_text.contains("Invalid") || error_text.contains("invalid"),
         "got: {}",
@@ -1101,7 +1321,6 @@ fn copilot_override_malformed_provider_block_array_error() {
     let (result, obs) = run_copilot_probe(
         r#"
         __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({ "github-copilot": ["not", "valid"] });
-        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify({}) });
         "#,
     );
     let obs = obs.expect("assertion should produce state");
@@ -1117,7 +1336,7 @@ fn copilot_override_malformed_provider_block_array_error() {
     assert!(!result.outputs.is_empty());
     assert_eq!(result.outputs[0].provider_id, "copilot");
 
-    // OpenCode error account has origin: opencode
+    // OpenCode account retains its source origin.
     assert_opencode_origin(&result, "opencode-0");
     let error_text: String = result.outputs[0]
         .lines
@@ -1125,6 +1344,8 @@ fn copilot_override_malformed_provider_block_array_error() {
         .map(|l| format!("{}", l))
         .collect::<Vec<_>>()
         .join(" ");
+    assert_eq!(result.outputs.len(), 1);
+    assert_requests(&obs, &[]);
     assert!(
         error_text.contains("Invalid") || error_text.contains("invalid"),
         "got: {}",
@@ -1137,7 +1358,6 @@ fn copilot_override_missing_access_token_error() {
     let (result, obs) = run_copilot_probe(
         r#"
         __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({ "github-copilot": { type: "oauth", refresh: "r", expires: 0 } });
-        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify({}) });
         "#,
     );
     let obs = obs.expect("assertion should produce state");
@@ -1153,7 +1373,7 @@ fn copilot_override_missing_access_token_error() {
     assert!(!result.outputs.is_empty());
     assert_eq!(result.outputs[0].provider_id, "copilot");
 
-    // OpenCode error account has origin: opencode
+    // OpenCode account retains its source origin.
     assert_opencode_origin(&result, "opencode-0");
     let error_text: String = result.outputs[0]
         .lines
@@ -1161,6 +1381,8 @@ fn copilot_override_missing_access_token_error() {
         .map(|l| format!("{}", l))
         .collect::<Vec<_>>()
         .join(" ");
+    assert_eq!(result.outputs.len(), 1);
+    assert_requests(&obs, &[]);
     assert!(
         error_text.contains("access") || error_text.contains("Invalid"),
         "got: {}",
@@ -1172,7 +1394,6 @@ fn copilot_override_missing_access_token_error() {
 fn copilot_override_default_native_error_visible_when_alone() {
     let (result, obs) = run_copilot_probe(
         r#"
-        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify({}) });
         "#,
     );
     let obs = obs.expect("assertion should produce state");
@@ -1188,7 +1409,7 @@ fn copilot_override_default_native_error_visible_when_alone() {
     assert!(!result.outputs.is_empty());
     assert_eq!(result.outputs[0].provider_id, "copilot");
 
-    // Default account has no origin
+    // Native default account retains its origin.
     assert_default_origin(&result);
 
     let error_text: String = result.outputs[0]
@@ -1197,6 +1418,8 @@ fn copilot_override_default_native_error_visible_when_alone() {
         .map(|l| format!("{}", l))
         .collect::<Vec<_>>()
         .join(" ");
+    assert_eq!(result.outputs.len(), 1);
+    assert_requests(&obs, &[]);
     assert!(
         error_text.contains("Not logged in") || error_text.contains("error"),
         "got: {}",
@@ -1209,7 +1432,6 @@ fn copilot_override_default_suppressed_when_opencode_exists() {
     let (result, obs) = run_copilot_probe(
         r#"
         __test_state.files["~/.local/share/opencode/auth.json"] = "{bad-json";
-        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify({}) });
         "#,
     );
     let obs = obs.expect("assertion should produce state");
@@ -1225,8 +1447,10 @@ fn copilot_override_default_suppressed_when_opencode_exists() {
     assert!(!result.outputs.is_empty());
     assert_eq!(result.outputs[0].provider_id, "copilot");
 
-    // OpenCode error account has origin: opencode
+    // OpenCode account retains its source origin.
     assert_opencode_origin(&result, "opencode-0");
+    assert_eq!(result.outputs.len(), 1, "native error is suppressed");
+    assert_requests(&obs, &[]);
 }
 
 #[test]
@@ -1236,7 +1460,7 @@ fn copilot_override_no_cross_source_fallback() {
         __test_state.account = "opencode-0";
         __test_state.keychain["OpenUsage-copilot"] = JSON.stringify({ token: "native" });
         __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({ "github-copilot": { type: "oauth", access: "oc-access", expires: 0 } });
-        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify({}) });
+        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify(__test_state.successUsage) }, { status: 200, headers: {}, bodyText: JSON.stringify(__test_state.successUsage) });
         "#,
     );
     let obs = obs.expect("assertion should produce state");
@@ -1252,8 +1476,12 @@ fn copilot_override_no_cross_source_fallback() {
     assert!(!result.outputs.is_empty());
     assert_eq!(result.outputs[0].provider_id, "copilot");
 
-    // OpenCode error account has origin: opencode
+    // OpenCode account retains its source origin.
     assert_opencode_origin(&result, "opencode-0");
+    assert_eq!(result.outputs.len(), 2);
+    assert_credits(&result, "default", "native", None, true);
+    assert_credits(&result, "opencode-0", "opencode", Some("OpenCode 2"), true);
+    assert_requests(&obs, &["native", "oc-access"]);
 }
 
 #[test]
@@ -1262,8 +1490,8 @@ fn copilot_override_two_valid_files_stable_ids() {
         r#"
         __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({ "github-copilot": { type: "oauth", access: "token-0", expires: 0 } });
         __test_state.files["~/.config/opencode/auth.json"] = JSON.stringify({ "github-copilot": { type: "oauth", access: "token-1", expires: 0 } });
-        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify({}) });
-        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify({}) });
+        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify(__test_state.successUsage) });
+        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify(__test_state.successUsage) });
         "#,
     );
     let obs = obs.expect("assertion should produce state");
@@ -1282,6 +1510,10 @@ fn copilot_override_two_valid_files_stable_ids() {
         .filter(|o| o.account.id.starts_with("opencode-"))
         .map(|o| o.account.id.clone())
         .collect();
+    assert_eq!(result.outputs.len(), 2);
+    assert_credits(&result, "opencode-0", "opencode", Some("OpenCode 2"), true);
+    assert_credits(&result, "opencode-1", "opencode", Some("OpenCode 3"), true);
+    assert_requests(&obs, &["token-0", "token-1"]);
     assert!(
         accounts.contains(&"opencode-0".to_string()),
         "expected opencode-0, got: {:?}",
@@ -1299,7 +1531,7 @@ fn copilot_override_first_missing_second_valid_opencode_1() {
     let (result, obs) = run_copilot_probe(
         r#"
         __test_state.files["~/.config/opencode/auth.json"] = JSON.stringify({ "github-copilot": { type: "oauth", access: "second-token", expires: 0 } });
-        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify({}) });
+        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify(__test_state.successUsage) });
         "#,
     );
     let obs = obs.expect("assertion should produce state");
@@ -1318,6 +1550,9 @@ fn copilot_override_first_missing_second_valid_opencode_1() {
         .filter(|o| o.account.id.starts_with("opencode-"))
         .map(|o| o.account.id.clone())
         .collect();
+    assert_eq!(result.outputs.len(), 1);
+    assert_credits(&result, "opencode-1", "opencode", Some("OpenCode 2"), true);
+    assert_requests(&obs, &["second-token"]);
     assert!(
         accounts.contains(&"opencode-1".to_string()),
         "expected opencode-1 when first missing, got: {:?}",
@@ -1375,123 +1610,171 @@ fn copilot_override_run_probe_lifecycle() {
     let Some(paths) = support::hermetic::enter("copilot_override_run_probe_lifecycle") else {
         return;
     };
-
-    // Use the public production `run_probe` entrypoint with a temporary
-    // override directory and HOME, exercising the real override file and
-    // real host API (filesystem, env) without network.
     use openusage_cli::plugin_engine::manifest::{LoadedPlugin, PluginManifest};
-    use openusage_cli::plugin_engine::runtime::{MetricLine, PluginOutput, run_probe_in_sandbox};
+    use openusage_cli::plugin_engine::runtime::run_probe_in_sandbox;
 
-    // Synthetic plugin with all AST patch targets required by the copilot override.
-    let plugin_script = r#"
-(function() {
-  function loadToken(ctx) { return null; }
-  function probe(ctx) {
-    var cred = loadToken(ctx);
-    if (!cred) {
-      throw "Not logged in. Run `gh auth login` first.";
-    }
-    return {
-      plan: "Individual",
-      lines: [ctx.line.badge({ label: "Status", text: "Authenticated" })]
-    };
-  }
-  globalThis.__openusage_plugin = { id: "copilot", probe: probe };
-})();
-"#;
-
-    // Write the real override file
-    let override_path = paths.overrides.join("copilot.js");
-    std::fs::write(&override_path, copilot_override_script()).expect("write override file");
-
-    // Create a valid OpenCode auth candidate in HOME
-    let opencode_dir = paths.root.join(".local/share/opencode");
-    std::fs::create_dir_all(&opencode_dir).expect("create opencode dir");
-    let auth_json = serde_json::json!({
-        "github-copilot": {
-            "type": "oauth",
-            "access": "test-access-token",
-            "refresh": "test-refresh-token",
-            "expires": 9999999999999i64
-        }
-    });
-    std::fs::write(
-        opencode_dir.join("auth.json"),
-        serde_json::to_string_pretty(&auth_json).expect("serialize auth"),
+    // The pinned plugin, native credential loading and normal HTTP wrapper run
+    // unchanged; only the transport is fixture-only, with no network fallback.
+    let plugin_script = format!(
+        "{}{}",
+        copilot_plugin_script(),
+        r#"
+        ;(function () {
+          var ctx = globalThis.__openusage_ctx;
+          var writeText = ctx.host.fs.writeText;
+          var requests = [];
+          var writes = [];
+          function observe() {
+            writeText(ctx.app.appDataDir + "/fixture-observed.json", JSON.stringify({requests: requests, writes: writes}));
+          }
+          ctx.host.fs.writeText = function (path, text) {
+            writes.push(path);
+            observe();
+            return writeText(path, text);
+          };
+          ctx.host.http.request = function (opts) {
+            requests.push({method: opts.method, url: opts.url, authorization: opts.headers.Authorization});
+            observe();
+            if (opts.method !== "GET" || opts.url !== "https://api.github.com/copilot_internal/user" ||
+                ["token test-access-token", "token native-state-token"].indexOf(opts.headers.Authorization) === -1) {
+              throw new Error("unexpected fixture request");
+            }
+            return {status: 200, headers: {}, bodyText: JSON.stringify({
+              copilot_plan: "pro", quota_reset_date: "2099-01-15T00:00:00Z",
+              quota_snapshots: {premium_interactions: {entitlement: 300, remaining: 225}}
+            })};
+          };
+        })();
+    "#
+    );
+    fs::write(
+        paths.overrides.join("copilot.js"),
+        copilot_override_script(),
     )
-    .expect("write auth.json");
-
+    .expect("write override");
+    let opencode_dir = paths.root.join(".local/share/opencode");
+    fs::create_dir_all(&opencode_dir).expect("create OpenCode directory");
+    let auth_text =
+        serde_json::json!({"github-copilot": {"type": "oauth", "access": "test-access-token"}})
+            .to_string();
+    let auth_path = opencode_dir.join("auth.json");
+    fs::write(&auth_path, &auth_text).expect("write OpenCode auth");
+    let native_path = paths.app_data.join("plugins_data/copilot/auth.json");
     let plugin = LoadedPlugin {
         manifest: PluginManifest {
             schema_version: 1,
-            id: "copilot".to_string(),
-            name: "Copilot".to_string(),
-            version: "0.0.0".to_string(),
-            entry: "plugin.js".to_string(),
-            icon: "icon.svg".to_string(),
+            id: "copilot".into(),
+            name: "Copilot".into(),
+            version: "0.0.0".into(),
+            entry: "plugin.js".into(),
+            icon: "icon.svg".into(),
             brand_color: None,
             lines: vec![],
             links: vec![],
         },
-        plugin_dir: std::path::PathBuf::from("."),
-        entry_script: plugin_script.to_string(),
-        icon_data_url: "data:image/svg+xml;base64,".to_string(),
+        plugin_dir: repo_root().join("vendor/crossusage/plugins/copilot"),
+        entry_script: plugin_script,
+        icon_data_url: "data:image/svg+xml;base64,".into(),
     };
 
+    for native_present in [false, true] {
+        if native_present {
+            fs::create_dir_all(native_path.parent().unwrap())
+                .expect("create native state directory");
+            fs::write(&native_path, r#"{"token":"native-state-token"}"#)
+                .expect("write native state");
+        }
+        let result = run_probe_in_sandbox(
+            &plugin,
+            &paths.app_data,
+            "test",
+            Some(&paths.overrides),
+            &paths.root,
+        );
+        assert_eq!(result.outputs.len(), if native_present { 2 } else { 1 });
+        assert_credits(&result, "opencode-0", "opencode", Some("OpenCode 2"), true);
+        if native_present {
+            assert_credits(&result, "default", "native", None, true);
+        } else {
+            assert!(
+                result.outputs.iter().all(|o| o.account.id != "default"),
+                "native error suppressed when OpenCode exists"
+            );
+        }
+        let observed: Value = serde_json::from_str(
+            &fs::read_to_string(paths.app_data.join("fixture-observed.json"))
+                .expect("transport observation"),
+        )
+        .unwrap();
+        let tokens = if native_present {
+            vec!["native-state-token", "test-access-token"]
+        } else {
+            vec!["test-access-token"]
+        };
+        assert_requests(&observed, &tokens);
+        assert_eq!(
+            fs::read_to_string(&auth_path).unwrap(),
+            auth_text,
+            "OpenCode credentials unchanged"
+        );
+        assert_eq!(native_path.exists(), native_present, "no native writeback");
+        if native_present {
+            assert_eq!(
+                fs::read_to_string(&native_path).unwrap(),
+                r#"{"token":"native-state-token"}"#
+            );
+        }
+        assert_eq!(result.subscriptions.len(), 4);
+        for candidate in [
+            ".local/share/opencode/auth.json",
+            ".local/share/opencode/accounts.json",
+            ".config/opencode/auth.json",
+            ".config/opencode/accounts.json",
+        ] {
+            let path = paths.root.join(candidate);
+            let sub = result
+                .subscriptions
+                .iter()
+                .find(|s| s.path == path)
+                .expect("candidate subscription collected by production lifecycle");
+            assert_eq!(sub.existed_at_declaration, path.exists());
+        }
+    }
+
+    let mut observed_plugin = plugin;
+    observed_plugin.entry_script.push_str(
+        r#"
+        ;(function () {
+          var probe = globalThis.__openusage_plugin.probe;
+          globalThis.__openusage_plugin.probe = function (ctx) {
+            var output = probe(ctx);
+            ctx.host.fs.writeText(ctx.app.appDataDir + "/late-write.txt", "fixture write after response");
+            return output;
+          };
+        })();
+        "#,
+    );
     let result = run_probe_in_sandbox(
-        &plugin,
+        &observed_plugin,
         &paths.app_data,
-        "0.0.0-test",
+        "test",
         Some(&paths.overrides),
         &paths.root,
     );
-
-    // Assert: override file was loaded (discoverAccounts produced opencode-0)
-    assert!(!result.outputs.is_empty(), "expected at least one output");
-
-    // Find the opencode-0 output
-    let opencode_outputs: Vec<&PluginOutput> = result
-        .outputs
-        .iter()
-        .filter(|o| o.account.id == "opencode-0")
-        .collect();
+    assert_eq!(result.outputs.len(), 2);
+    assert_credits(&result, "default", "native", None, true);
+    assert_credits(&result, "opencode-0", "opencode", Some("OpenCode 2"), true);
+    let observed: Value = serde_json::from_str(
+        &fs::read_to_string(paths.app_data.join("fixture-observed.json"))
+            .expect("complete write observation"),
+    )
+    .unwrap();
+    let write_path = paths.app_data.join("late-write.txt");
     assert_eq!(
-        opencode_outputs.len(),
-        1,
-        "expected exactly one opencode-0 output, got {:?}",
-        result
-            .outputs
-            .iter()
-            .map(|o| &o.account.id)
-            .collect::<Vec<_>>()
+        observed["writes"],
+        serde_json::json!([write_path, write_path]),
+        "writes after the last HTTP response must remain observable"
     );
-
-    let output = opencode_outputs[0];
-
-    // Assert: native/default failure is soft-suppressed
-    // (the "default" account with hide-if-other-account should not appear)
-    let default_outputs: Vec<&PluginOutput> = result
-        .outputs
-        .iter()
-        .filter(|o| o.account.id == "default")
-        .collect();
-    assert!(
-        default_outputs.is_empty(),
-        "default account should be suppressed when opencode-0 exists"
-    );
-
-    // Assert: resulting output is exactly the expected opencode-0 account with successful output
-    assert_eq!(output.provider_id, "copilot");
-    assert_eq!(output.display_name, "Copilot");
-    assert_eq!(output.plan.as_deref(), Some("Individual"));
-    assert_eq!(output.lines.len(), 1, "expected exactly one line");
-    match &output.lines[0] {
-        MetricLine::Badge { label, text, .. } => {
-            assert_eq!(label, "Status");
-            assert_eq!(text, "Authenticated");
-        }
-        other => panic!("expected badge line, got: {:?}", other),
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1503,6 +1786,13 @@ const HARNESS_SCRIPT: &str = r#"
     files: {},
     keychain: {},
     requests: [],
+    writes: [],
+    privacy: null,
+    successUsage: {
+      copilot_plan: "pro",
+      quota_reset_date: "2099-01-15T00:00:00Z",
+      quota_snapshots: {premium_interactions: {entitlement: 300, remaining: 225}}
+    },
     logs: [],
     subscriptions: [],
     readErrors: {},
@@ -1559,6 +1849,7 @@ const HARNESS_SCRIPT: &str = r#"
           return globalThis.__test_state.files[path];
         },
         writeText: function (path, text) {
+          globalThis.__test_state.writes.push({kind: "file", path: path});
           globalThis.__test_state.files[path] = String(text);
         },
         listDir: function () { return []; },
@@ -1576,15 +1867,28 @@ const HARNESS_SCRIPT: &str = r#"
           return null;
         },
         writeGenericPassword: function (service, value) {
+          globalThis.__test_state.writes.push({kind: "keychain", service: service});
           globalThis.__test_state.keychain[service] = String(value);
         },
         deleteGenericPassword: function (service) {
+          globalThis.__test_state.writes.push({kind: "delete", service: service});
           delete globalThis.__test_state.keychain[service];
         }
       },
       http: {
         request: function (opts) {
           opts = opts || {};
+          if (__test_state.inspectPrivacy && __test_state.privacy === null) {
+            var privateNames = ["ROUTE_REGISTRY", "OPENCODE_SOURCES", "COPILOT_PROVIDER_KEY",
+              "isNonEmptyString", "isPlainObject", "logWarn", "parseJsonLoose", "parseCopilotCredential", "discoverAccounts", "sj"];
+            __test_state.privacy = privateNames.map(function (name) {
+              var visibility = (0, eval)("typeof " + name);
+              globalThis[name] = function () { throw new Error("poisoned private global: " + name); };
+              return {name: name, visibility: visibility};
+            });
+            globalThis.ROUTE_REGISTRY = {"opencode-0": {token: "poisoned-token"}};
+            globalThis.OPENCODE_SOURCES = [];
+          }
           var headers = cloneHeaders(opts.headers);
           var url = String(opts.url || "");
           globalThis.__test_state.requests.push({
@@ -1675,7 +1979,7 @@ const HARNESS_SCRIPT: &str = r#"
       badge: function (opts) { return { type: "badge", label: opts.label, text: opts.text }; }
     },
     fmt: {
-      planLabel: function (value) { return String(value || ""); }
+      planLabel: function (value) { return value === "pro" ? "Pro" : String(value || ""); }
     }
   };
 
@@ -1692,6 +1996,8 @@ const ASSERTION_SCRIPT: &str = r#"
     subscriptions: state.subscriptions,
     requests: state.requests,
     files: state.files,
+    writes: state.writes,
+    privacy: state.privacy,
     logs: state.logs
   });
 })();

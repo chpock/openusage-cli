@@ -1143,3 +1143,176 @@ fn daemon_replace_policy_requests_restart_for_systemd_managed_instance() {
     shutdown_daemon_via_http(&restarted_endpoint_url);
     wait_for_endpoint_file_removal(&endpoint_path);
 }
+
+fn spawn_probe_free_lifecycle_daemon(
+    home: &Path,
+    app_data: &Path,
+    service_mode: &str,
+    notify_socket: Option<&Path>,
+) -> DaemonProcess {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    fs::create_dir_all(home).expect("create lifecycle HOME");
+    fs::create_dir_all(app_data).expect("create lifecycle app data");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_openusage-cli"));
+    command
+        .args([
+            "run-daemon",
+            "--daemon-child",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--refresh-interval-secs",
+            "0",
+            "--test-mode",
+            "--enabled-plugins",
+            "mock",
+            "--enabled-auth-sources",
+            "{default: []}",
+            "--log-level",
+            "debug",
+            "--service-mode",
+            service_mode,
+        ])
+        .arg("--plugins-dir")
+        .arg(workspace.join("vendor/crossusage/plugins"))
+        .arg("--plugin-overrides-dir")
+        .arg(workspace.join("plugin-overrides"))
+        .arg("--app-data-dir")
+        .arg(app_data)
+        .env("HOME", home)
+        .env("CODEX_HOME", home.join(".codex"))
+        .env_remove("NOTIFY_SOCKET")
+        .env_remove("WATCHDOG_USEC")
+        .env_remove("WATCHDOG_PID")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(home.join("daemon.log")).expect("create lifecycle log"));
+    for (name, relative) in [
+        ("XDG_CONFIG_HOME", ".config"),
+        ("XDG_DATA_HOME", ".local/share"),
+        ("XDG_CACHE_HOME", ".cache"),
+        ("XDG_STATE_HOME", ".local/state"),
+        ("XDG_RUNTIME_DIR", ".run"),
+        ("TMPDIR", "tmp"),
+        ("TEMPDIR", "tmp"),
+    ] {
+        let path = home.join(relative);
+        fs::create_dir_all(&path).expect("create lifecycle environment directory");
+        command.env(name, path);
+    }
+    if let Some(socket) = notify_socket {
+        command
+            .env("NOTIFY_SOCKET", socket)
+            .env("WATCHDOG_USEC", "1000000");
+    }
+    DaemonProcess {
+        child: command.spawn().expect("spawn probe-free lifecycle daemon"),
+        terminated: false,
+    }
+}
+
+#[test]
+fn daemon_probe_free_external_health_then_signal_or_http_stop_cleans_discovery() {
+    for signal in [true, false] {
+        let temp = tempfile::tempdir().expect("lifecycle fixture");
+        let home = temp.path().join("home");
+        let app_data = temp.path().join("app-data");
+        let mut daemon = spawn_probe_free_lifecycle_daemon(&home, &app_data, "standalone", None);
+        let endpoint_path = app_data
+            .join(RUNTIME_DIR_NAME)
+            .join(DAEMON_ENDPOINT_FILE_NAME);
+        wait_for_endpoint_file(&endpoint_path, daemon.child_mut());
+        let endpoint = read_endpoint_url(&endpoint_path);
+        wait_for_health_ok(&endpoint, daemon.child_mut());
+        if signal {
+            daemon.terminate_gracefully();
+        } else {
+            shutdown_daemon_via_http(&endpoint);
+            wait_for_process_exit_success(daemon.child_mut());
+            daemon.terminated = true;
+        }
+        assert!(!endpoint_path.exists(), "stop must remove owned discovery");
+        eprintln!(
+            "probe-free lifecycle signal={signal}:\n{}",
+            fs::read_to_string(home.join("daemon.log")).expect("read lifecycle log")
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn daemon_probe_free_systemd_restart_keeps_reloading_ready_watchdog_and_stopping() {
+    use std::os::unix::net::UnixDatagram;
+    let temp = tempfile::tempdir().expect("systemd lifecycle fixture");
+    // Keep the Unix socket basename short enough for sockaddr_un.
+    let socket_path = temp.path().join("notify");
+    let socket = UnixDatagram::bind(&socket_path).expect("bind synthetic systemd socket");
+    socket
+        .set_read_timeout(Some(STARTUP_TIMEOUT))
+        .expect("notification timeout");
+    let home = temp.path().join("home");
+    let app_data = temp.path().join("app-data");
+    let mut daemon =
+        spawn_probe_free_lifecycle_daemon(&home, &app_data, "systemd", Some(&socket_path));
+    let endpoint_path = app_data
+        .join(RUNTIME_DIR_NAME)
+        .join(DAEMON_ENDPOINT_FILE_NAME);
+    wait_for_endpoint_file(&endpoint_path, daemon.child_mut());
+    let endpoint = read_endpoint_url(&endpoint_path);
+    wait_for_health_ok(&endpoint, daemon.child_mut());
+    let response = reqwest::blocking::Client::new()
+        .post(format!("{endpoint}/v1/restart"))
+        .send()
+        .expect("request restart after external health");
+    assert!(response.status().is_success());
+    drop(response);
+
+    let mut notifications = Vec::new();
+    let mut receive_until = |expected: &str, forbidden: &[&str]| {
+        let deadline = Instant::now() + STARTUP_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for {expected}: {notifications:?}"
+            );
+            socket
+                .set_read_timeout(Some(remaining))
+                .expect("notification deadline");
+            let mut buf = [0; 4096];
+            let count = socket
+                .recv(&mut buf)
+                .expect("receive lifecycle notification");
+            let message = String::from_utf8(buf[..count].to_vec()).expect("notification UTF-8");
+            for forbidden in forbidden {
+                assert!(
+                    !message.lines().any(|line| line == *forbidden),
+                    "unexpected {forbidden} while waiting for {expected}: {message}"
+                );
+            }
+            let found = message.lines().any(|line| line == expected);
+            notifications.push(message);
+            if found {
+                break;
+            }
+        }
+    };
+    receive_until("RELOADING=1", &["STOPPING=1"]);
+    receive_until("READY=1", &["STOPPING=1", "WATCHDOG=1"]);
+    receive_until("WATCHDOG=1", &["STOPPING=1", "RELOADING=1"]);
+    let restarted_endpoint = read_endpoint_url(&endpoint_path);
+    wait_for_health_ok(&restarted_endpoint, daemon.child_mut());
+    shutdown_daemon_via_http(&restarted_endpoint);
+    receive_until("STOPPING=1", &["RELOADING=1"]);
+    wait_for_process_exit_success(daemon.child_mut());
+    daemon.terminated = true;
+    assert!(
+        !endpoint_path.exists(),
+        "systemd stop must remove discovery"
+    );
+    eprintln!(
+        "systemd datagrams: {notifications:?}\n{}",
+        fs::read_to_string(home.join("daemon.log")).expect("read lifecycle log")
+    );
+}

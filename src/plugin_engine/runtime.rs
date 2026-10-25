@@ -16,6 +16,26 @@ pub enum ProgressFormat {
     Percent,
     Dollars,
     Count { suffix: String },
+    Currency { currency: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BarChartPoint {
+    pub label: String,
+    pub value: f64,
+    #[serde(rename = "valueLabel", skip_serializing_if = "Option::is_none")]
+    pub value_label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSpendBreakdown {
+    pub model: String,
+    pub tokens: u64,
+    #[serde(rename = "costUsd", skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    pub percent: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +46,17 @@ pub enum MetricLine {
         value: String,
         color: Option<String>,
         subtitle: Option<String>,
+        #[serde(rename = "modelBreakdown", skip_serializing_if = "Option::is_none")]
+        model_breakdown: Option<Vec<ModelSpendBreakdown>>,
+        #[serde(rename = "statusDot", skip_serializing_if = "Option::is_none")]
+        status_dot: Option<String>,
+        #[serde(rename = "expiryTooltip", skip_serializing_if = "Option::is_none")]
+        expiry_tooltip: Option<String>,
+        #[serde(
+            rename = "resetCreditExpiries",
+            skip_serializing_if = "Option::is_none"
+        )]
+        reset_credit_expiries: Option<Vec<String>>,
     },
     Progress {
         label: String,
@@ -37,12 +68,23 @@ pub enum MetricLine {
         #[serde(rename = "periodDurationMs")]
         period_duration_ms: Option<u64>,
         color: Option<String>,
+        #[serde(rename = "sessionStartSignal", skip_serializing_if = "Option::is_none")]
+        session_start_signal: Option<String>,
     },
     Badge {
         label: String,
         text: String,
         color: Option<String>,
         subtitle: Option<String>,
+    },
+    #[serde(rename = "barChart")]
+    BarChart {
+        label: String,
+        points: Vec<BarChartPoint>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        color: Option<String>,
     },
 }
 
@@ -56,6 +98,9 @@ impl fmt::Display for MetricLine {
                 label, used, limit, ..
             } => {
                 write!(f, "{}: {}/{}", label, used, limit)
+            }
+            MetricLine::BarChart { label, points, .. } => {
+                write!(f, "{}: {} points", label, points.len())
             }
             MetricLine::Badge { label, text, .. } => {
                 write!(f, "{}: {}", label, text)
@@ -104,6 +149,8 @@ pub struct PluginOutput {
     pub provider_id: String,
     pub display_name: String,
     pub plan: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
     pub lines: Vec<MetricLine>,
     pub icon_url: String,
     #[serde(default)]
@@ -194,6 +241,16 @@ pub fn run_probe_in_sandbox(
                 outputs: vec![error_output(
                     plugin,
                     "host api injection failed".to_string(),
+                )],
+                subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
+            };
+        }
+
+        if host_api::patch_http_wrapper(&ctx).is_err() {
+            return ProbeResult {
+                outputs: vec![error_output(
+                    plugin,
+                    "http wrapper patch failed".to_string(),
                 )],
                 subscriptions: std::mem::take(&mut *subs.lock().unwrap()),
             };
@@ -1158,6 +1215,10 @@ fn build_plugin_output(
         provider_id: plugin_id.to_string(),
         display_name: display_name.to_string(),
         plan,
+        warning: result
+            .get::<_, String>("warning")
+            .ok()
+            .filter(|s| !s.trim().is_empty()),
         lines,
         icon_url: icon_url.to_string(),
         account,
@@ -1173,6 +1234,7 @@ fn error_output_with_account(
         provider_id: plugin.manifest.id.clone(),
         display_name: plugin.manifest.name.clone(),
         plan: None,
+        warning: None,
         lines: vec![error_line(message)],
         icon_url: plugin.icon_data_url.clone(),
         account: account.clone(),
@@ -1324,6 +1386,165 @@ fn inject_override_api(ctx: &Ctx<'_>, plugin_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn parse_model_breakdown(line: &Object) -> Option<Vec<ModelSpendBreakdown>> {
+    let arr: Array = line.get("modelBreakdown").ok()?;
+    let mut out = Vec::new();
+    for idx in 0..arr.len() {
+        let row: Object = arr.get(idx).ok()?;
+        let model = row.get::<_, String>("model").unwrap_or_default();
+        let tokens = row
+            .get::<_, f64>("tokens")
+            .ok()
+            .filter(|v| v.is_finite())
+            .map(|v| v.max(0.0) as u64)
+            .unwrap_or(0);
+        let percent = row
+            .get::<_, f64>("percent")
+            .ok()
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.0);
+        let cost_usd = row.get::<_, f64>("costUsd").ok().filter(|v| v.is_finite());
+        if model.trim().is_empty() {
+            continue;
+        }
+        out.push(ModelSpendBreakdown {
+            model,
+            tokens,
+            cost_usd,
+            percent,
+        });
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+fn parse_reset_credit_expiries(line: &Object) -> Option<Vec<String>> {
+    let arr: Array = line.get("resetCreditExpiries").ok()?;
+    let mut out = Vec::new();
+    for idx in 0..arr.len() {
+        let Ok(text) = arr.get::<String>(idx) else {
+            log::warn!(
+                "invalid resetCreditExpiries entry at index {} (non-string), omitting",
+                idx
+            );
+            continue;
+        };
+        let trimmed = text.trim();
+        if time::OffsetDateTime::parse(trimmed, &time::format_description::well_known::Rfc3339)
+            .is_ok()
+        {
+            out.push(trimmed.to_string());
+        } else {
+            log::warn!(
+                "invalid resetCreditExpiries timestamp at index {}, omitting",
+                idx
+            );
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+// Native parsing is not interruptible by QuickJS; bound the input scan as well
+// as the emitted chart, including invalid points in the limit.
+const MAX_BAR_CHART_POINTS: usize = 366;
+
+fn parse_bar_chart_line(
+    line: &Object,
+    idx: usize,
+    label: String,
+    color: Option<String>,
+) -> (Option<MetricLine>, Vec<String>) {
+    let mut errors = Vec::new();
+    let points_array: Array = match line.get("points") {
+        Ok(points) => points,
+        Err(_) => {
+            errors.push(format!("barChart line at index {} missing points", idx));
+            return (None, errors);
+        }
+    };
+    let total_points = points_array.len();
+    if total_points > MAX_BAR_CHART_POINTS {
+        log::warn!(
+            "barChart line at index {} has {} points; capping at {}",
+            idx,
+            total_points,
+            MAX_BAR_CHART_POINTS
+        );
+    }
+    let mut points = Vec::new();
+    for point_idx in 0..total_points.min(MAX_BAR_CHART_POINTS) {
+        let point: Object = match points_array.get(point_idx) {
+            Ok(point) => point,
+            Err(_) => {
+                errors.push(format!(
+                    "barChart line at index {} has invalid point at index {}",
+                    idx, point_idx
+                ));
+                continue;
+            }
+        };
+        let point_label = point.get::<_, String>("label").unwrap_or_default();
+        let point_label = point_label.trim().to_string();
+        if point_label.is_empty() {
+            errors.push(format!(
+                "barChart line at index {} has empty point label at index {}",
+                idx, point_idx
+            ));
+            continue;
+        }
+        let value: Value = match point.get("value") {
+            Ok(value) => value,
+            Err(_) => {
+                errors.push(format!(
+                    "barChart line at index {} point {} missing value",
+                    idx, point_idx
+                ));
+                continue;
+            }
+        };
+        let value = match value.as_number() {
+            Some(value) if value.is_finite() && value >= 0.0 => value,
+            _ => {
+                errors.push(format!(
+                    "barChart line at index {} point {} invalid value",
+                    idx, point_idx
+                ));
+                continue;
+            }
+        };
+        let value_label = point
+            .get::<_, String>("valueLabel")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        points.push(BarChartPoint {
+            label: point_label,
+            value,
+            value_label,
+        });
+    }
+    if points.is_empty() {
+        errors.push(format!(
+            "barChart line at index {} has no valid points",
+            idx
+        ));
+        return (None, errors);
+    }
+    let note = line
+        .get::<_, String>("note")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    (
+        Some(MetricLine::BarChart {
+            label,
+            points,
+            note,
+            color,
+        }),
+        errors,
+    )
+}
+
 fn parse_lines(result: &Object) -> Result<Vec<MetricLine>, String> {
     let lines: Array = result
         .get("lines")
@@ -1349,6 +1570,10 @@ fn parse_lines(result: &Object) -> Result<Vec<MetricLine>, String> {
                     value,
                     color,
                     subtitle,
+                    model_breakdown: parse_model_breakdown(&line),
+                    status_dot: line.get::<_, String>("statusDot").ok(),
+                    expiry_tooltip: line.get::<_, String>("expiryTooltip").ok(),
+                    reset_credit_expiries: parse_reset_credit_expiries(&line),
                 });
             }
             "progress" => {
@@ -1451,6 +1676,19 @@ fn parse_lines(result: &Object) -> Result<Vec<MetricLine>, String> {
                         ProgressFormat::Percent
                     }
                     "dollars" => ProgressFormat::Dollars,
+                    "currency" => {
+                        let currency = format_obj.get::<_, String>("currency").ok();
+                        let Some(currency) = currency.filter(|code| {
+                            code.len() == 3 && code.bytes().all(|byte| byte.is_ascii_uppercase())
+                        }) else {
+                            out.push(error_line(format!(
+                                "progress line at index {}: currency format requires a three-letter uppercase currency code",
+                                idx
+                            )));
+                            continue;
+                        };
+                        ProgressFormat::Currency { currency }
+                    }
                     "count" => {
                         let suffix_value: Value = match format_obj.get("suffix") {
                             Ok(v) => v,
@@ -1585,6 +1823,7 @@ fn parse_lines(result: &Object) -> Result<Vec<MetricLine>, String> {
                     resets_at,
                     period_duration_ms,
                     color,
+                    session_start_signal: line.get::<_, String>("sessionStartSignal").ok(),
                 });
             }
             "badge" => {
@@ -1595,6 +1834,13 @@ fn parse_lines(result: &Object) -> Result<Vec<MetricLine>, String> {
                     color,
                     subtitle,
                 });
+            }
+            "barChart" => {
+                let (chart, errors) = parse_bar_chart_line(&line, idx, label, color);
+                out.extend(errors.into_iter().map(error_line));
+                if let Some(chart) = chart {
+                    out.push(chart);
+                }
             }
             _ => {
                 out.push(error_line(format!(
@@ -1613,6 +1859,7 @@ fn error_output(plugin: &LoadedPlugin, message: String) -> PluginOutput {
         provider_id: plugin.manifest.id.clone(),
         display_name: plugin.manifest.name.clone(),
         plan: None,
+        warning: None,
         lines: vec![error_line(message)],
         icon_url: plugin.icon_data_url.clone(),
         account: AccountRef::default_account(),
@@ -1793,6 +2040,7 @@ mod tests {
             resets_at: Some("2099-01-01T00:00:00.000Z".to_string()),
             period_duration_ms: None,
             color: None,
+            session_start_signal: None,
         };
 
         let json: JsonValue = serde_json::to_value(&line).expect("serialize");

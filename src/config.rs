@@ -3,6 +3,7 @@ use directories::ProjectDirs;
 use reqwest::Proxy;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -114,10 +115,79 @@ pub struct ResolvedProxy {
     pub proxy: Proxy,
 }
 
-static RESOLVED_PROXY: OnceLock<Option<ResolvedProxy>> = OnceLock::new();
+// Keep the helper URL private: it may contain proxy credentials.
+struct ProxySelection {
+    resolved: ResolvedProxy,
+    url: String,
+}
+
+const LOOPBACK_NO_PROXY: &str = "localhost,127.0.0.1,::1";
+static RESOLVED_PROXY: OnceLock<Option<ProxySelection>> = OnceLock::new();
 
 pub fn get_resolved_proxy() -> Option<&'static ResolvedProxy> {
-    RESOLVED_PROXY.get_or_init(load_and_resolve_proxy).as_ref()
+    RESOLVED_PROXY
+        .get_or_init(load_and_resolve_proxy)
+        .as_ref()
+        .map(|selection| &selection.resolved)
+}
+
+/// Projects the existing HTTP selection into an isolated helper's environment.
+/// With no explicit selection, mirror reqwest/hyper-util's Linux system-env
+/// first-present casing and per-scheme ALL_PROXY fallback without reparsing URLs.
+/// Malformed environment URLs and nonstandard helper transports are not equivalent.
+pub(crate) fn helper_proxy_environment() -> Vec<(OsString, OsString)> {
+    helper_proxy_environment_from(
+        RESOLVED_PROXY.get_or_init(load_and_resolve_proxy).as_ref(),
+        std::env::vars_os(),
+    )
+}
+
+fn helper_proxy_environment_from(
+    selection: Option<&ProxySelection>,
+    environment: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Vec<(OsString, OsString)> {
+    let mut result = Vec::new();
+    let mut pair = |upper: &str, lower: &str, value: &OsStr| {
+        result.push((upper.into(), value.to_owned()));
+        result.push((lower.into(), value.to_owned()));
+    };
+    if let Some(selection) = selection {
+        for (upper, lower) in [
+            ("HTTP_PROXY", "http_proxy"),
+            ("HTTPS_PROXY", "https_proxy"),
+            ("ALL_PROXY", "all_proxy"),
+        ] {
+            pair(upper, lower, OsStr::new(&selection.url));
+        }
+        pair("NO_PROXY", "no_proxy", OsStr::new(LOOPBACK_NO_PROXY));
+    } else {
+        let environment: BTreeMap<_, _> = environment.into_iter().collect();
+        // hyper-util disables its system-env proxy matcher in CGI environments.
+        if environment.contains_key(OsStr::new("REQUEST_METHOD")) {
+            return result;
+        }
+        let first = |upper: &str, lower: &str| {
+            environment
+                .get(OsStr::new(upper))
+                .or_else(|| environment.get(OsStr::new(lower)))
+        };
+        let all = first("ALL_PROXY", "all_proxy");
+        for (upper, lower) in [("HTTP_PROXY", "http_proxy"), ("HTTPS_PROXY", "https_proxy")] {
+            if let Some(value) = first(upper, lower)
+                .filter(|value| !value.is_empty())
+                .or(all)
+            {
+                pair(upper, lower, value);
+            }
+        }
+        if let Some(value) = all {
+            pair("ALL_PROXY", "all_proxy", value);
+        }
+        if let Some(value) = first("NO_PROXY", "no_proxy") {
+            pair("NO_PROXY", "no_proxy", value);
+        }
+    }
+    result
 }
 
 pub fn load_config_if_exists() -> Result<Option<LoadedConfig>> {
@@ -253,34 +323,37 @@ proxy:
 "#
 }
 
-fn load_and_resolve_proxy() -> Option<ResolvedProxy> {
+fn load_and_resolve_proxy() -> Option<ProxySelection> {
     if let Some(proxy) = proxy_from_config() {
         return Some(proxy);
     }
     proxy_from_env()
 }
 
-fn proxy_from_config() -> Option<ResolvedProxy> {
+fn proxy_from_config() -> Option<ProxySelection> {
     let loaded = load_config_if_exists().ok().flatten()?;
     let proxy_cfg = loaded.config.proxy.as_ref().filter(|p| p.enabled)?;
     build_proxy(&proxy_cfg.url)
 }
 
-fn proxy_from_env() -> Option<ResolvedProxy> {
+fn proxy_from_env() -> Option<ProxySelection> {
     ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]
         .iter()
         .find_map(|name| std::env::var(name).ok())
         .and_then(|value| build_proxy(value.trim()))
 }
 
-fn build_proxy(url: &str) -> Option<ResolvedProxy> {
+fn build_proxy(url: &str) -> Option<ProxySelection> {
     if url.is_empty() {
         return None;
     }
     let proxy = Proxy::all(url).ok()?;
-    let no_proxy = reqwest::NoProxy::from_string("localhost,127.0.0.1,::1");
-    Some(ResolvedProxy {
-        proxy: proxy.no_proxy(no_proxy),
+    let no_proxy = reqwest::NoProxy::from_string(LOOPBACK_NO_PROXY);
+    Some(ProxySelection {
+        resolved: ResolvedProxy {
+            proxy: proxy.no_proxy(no_proxy),
+        },
+        url: url.to_owned(),
     })
 }
 
@@ -391,5 +464,288 @@ mod tests {
             Some(DAEMON_ENDPOINT_FILE_NAME)
         );
         assert_eq!(path.endpoint_file.parent(), Some(path.dir.as_path()));
+    }
+}
+
+#[cfg(test)]
+mod helper_proxy_tests {
+    use super::*;
+
+    fn project(
+        selection: Option<&ProxySelection>,
+        pairs: &[(&str, &str)],
+    ) -> BTreeMap<OsString, OsString> {
+        helper_proxy_environment_from(
+            selection,
+            pairs
+                .iter()
+                .map(|(name, value)| (OsString::from(name), OsString::from(value))),
+        )
+        .into_iter()
+        .collect()
+    }
+
+    fn assert_pair(
+        environment: &BTreeMap<OsString, OsString>,
+        upper: &str,
+        lower: &str,
+        expected: &str,
+    ) {
+        assert_eq!(
+            environment.get(OsStr::new(upper)).unwrap(),
+            OsStr::new(expected)
+        );
+        assert_eq!(
+            environment.get(OsStr::new(lower)).unwrap(),
+            OsStr::new(expected)
+        );
+    }
+
+    #[test]
+    fn helper_system_environment_projects_all_proxy_and_per_scheme_overrides() {
+        let all = project(
+            None,
+            &[
+                ("ALL_PROXY", "http://all.invalid:8080"),
+                ("NO_PROXY", "internal.invalid"),
+            ],
+        );
+        assert_pair(&all, "HTTP_PROXY", "http_proxy", "http://all.invalid:8080");
+        assert_pair(
+            &all,
+            "HTTPS_PROXY",
+            "https_proxy",
+            "http://all.invalid:8080",
+        );
+        assert_pair(&all, "ALL_PROXY", "all_proxy", "http://all.invalid:8080");
+        assert_pair(&all, "NO_PROXY", "no_proxy", "internal.invalid");
+        let per_scheme = project(
+            None,
+            &[
+                ("ALL_PROXY", "http://all.invalid:8080"),
+                ("HTTP_PROXY", "http://http.invalid:8081"),
+                ("https_proxy", "http://https.invalid:8082"),
+            ],
+        );
+        assert_pair(
+            &per_scheme,
+            "HTTP_PROXY",
+            "http_proxy",
+            "http://http.invalid:8081",
+        );
+        assert_pair(
+            &per_scheme,
+            "HTTPS_PROXY",
+            "https_proxy",
+            "http://https.invalid:8082",
+        );
+        assert!(!per_scheme.contains_key(OsStr::new("NO_PROXY")));
+    }
+
+    #[test]
+    fn helper_system_environment_matches_first_present_even_when_uppercase_is_empty() {
+        let environment = project(
+            None,
+            &[
+                ("HTTPS_PROXY", ""),
+                ("https_proxy", "http://ignored.invalid:8080"),
+                ("HTTP_PROXY", "http://upper.invalid:8081"),
+                ("http_proxy", "http://lower.invalid:8082"),
+                ("ALL_PROXY", "http://all.invalid:8083"),
+                ("all_proxy", "http://ignored-all.invalid:8084"),
+                ("NO_PROXY", ""),
+                ("no_proxy", "*"),
+            ],
+        );
+        assert_pair(
+            &environment,
+            "HTTP_PROXY",
+            "http_proxy",
+            "http://upper.invalid:8081",
+        );
+        assert_pair(
+            &environment,
+            "HTTPS_PROXY",
+            "https_proxy",
+            "http://all.invalid:8083",
+        );
+        assert_pair(
+            &environment,
+            "ALL_PROXY",
+            "all_proxy",
+            "http://all.invalid:8083",
+        );
+        assert_pair(&environment, "NO_PROXY", "no_proxy", "");
+        let no_all = project(
+            None,
+            &[
+                ("HTTPS_PROXY", ""),
+                ("https_proxy", "http://ignored.invalid:8080"),
+            ],
+        );
+        assert!(no_all.is_empty());
+        let empty_all = project(
+            None,
+            &[
+                ("ALL_PROXY", ""),
+                ("all_proxy", "http://ignored.invalid:8080"),
+            ],
+        );
+        assert_pair(&empty_all, "HTTP_PROXY", "http_proxy", "");
+        assert_pair(&empty_all, "HTTPS_PROXY", "https_proxy", "");
+    }
+
+    #[test]
+    fn helper_system_environment_preserves_lowercase_and_cgi_disables_system_proxy() {
+        let environment = project(
+            None,
+            &[
+                ("all_proxy", "http://lower.invalid:8080"),
+                ("no_proxy", "local.invalid"),
+            ],
+        );
+        assert_pair(
+            &environment,
+            "HTTP_PROXY",
+            "http_proxy",
+            "http://lower.invalid:8080",
+        );
+        assert_pair(
+            &environment,
+            "HTTPS_PROXY",
+            "https_proxy",
+            "http://lower.invalid:8080",
+        );
+        assert_pair(&environment, "NO_PROXY", "no_proxy", "local.invalid");
+        assert!(
+            project(
+                None,
+                &[
+                    ("REQUEST_METHOD", ""),
+                    ("ALL_PROXY", "http://ignored.invalid:8080")
+                ]
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn explicit_proxy_view_overrides_inherited_environment_without_url_reparsing() {
+        let selected =
+            build_proxy("http://fixture-user:fixture-password@proxy.invalid:8080").unwrap();
+        let environment = project(
+            Some(&selected),
+            &[
+                ("HTTP_PROXY", "http://wrong.invalid:1"),
+                ("ALL_PROXY", "http://wrong.invalid:2"),
+                ("NO_PROXY", "*"),
+                ("REQUEST_METHOD", "GET"),
+            ],
+        );
+        for (upper, lower) in [
+            ("HTTP_PROXY", "http_proxy"),
+            ("HTTPS_PROXY", "https_proxy"),
+            ("ALL_PROXY", "all_proxy"),
+        ] {
+            assert_pair(
+                &environment,
+                upper,
+                lower,
+                "http://fixture-user:fixture-password@proxy.invalid:8080",
+            );
+        }
+        assert_pair(
+            &environment,
+            "NO_PROXY",
+            "no_proxy",
+            "localhost,127.0.0.1,::1",
+        );
+        assert!(build_proxy("").is_none());
+        assert!(build_proxy("http://fixture-user:fixture-password@[malformed").is_none());
+    }
+
+    #[test]
+    fn shared_http_proxy_still_routes_remote_hosts_and_bypasses_each_loopback_host() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+        fn serve(listener: TcpListener) -> std::thread::JoinHandle<String> {
+            listener.set_nonblocking(true).unwrap();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "fixture received no request");
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("fixture accept failed: {error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .unwrap();
+                String::from_utf8(request).unwrap()
+            })
+        }
+        let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let selection = build_proxy(&format!(
+            "http://127.0.0.1:{}",
+            proxy.local_addr().unwrap().port()
+        ))
+        .unwrap();
+        let proxy_request = serve(proxy);
+        let client = reqwest::blocking::Client::builder()
+            .proxy(selection.resolved.proxy)
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        assert_eq!(
+            client
+                .get("http://provider.invalid/fixture")
+                .send()
+                .unwrap()
+                .text()
+                .unwrap(),
+            "ok"
+        );
+        assert!(
+            proxy_request
+                .join()
+                .unwrap()
+                .starts_with("GET http://provider.invalid/fixture HTTP/1.1\r\n")
+        );
+        for host in ["localhost", "127.0.0.1", "[::1]"] {
+            let listener = TcpListener::bind(if host == "[::1]" {
+                "[::1]:0"
+            } else {
+                "127.0.0.1:0"
+            })
+            .unwrap();
+            let url = format!(
+                "http://{host}:{}/direct",
+                listener.local_addr().unwrap().port()
+            );
+            let direct = serve(listener);
+            assert_eq!(client.get(url).send().unwrap().text().unwrap(), "ok");
+            assert!(
+                direct
+                    .join()
+                    .unwrap()
+                    .starts_with("GET /direct HTTP/1.1\r\n")
+            );
+        }
     }
 }

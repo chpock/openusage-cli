@@ -75,7 +75,7 @@ curl http://127.0.0.1:6738/v1/usage
 
 ## Main commands
 
-- `query` (default): one-shot JSON query (`usage` or `plugins`)
+- `query` (default): one-shot JSON query (`usage`, `plugins` or `config`)
 - `run-daemon`: start daemon mode and expose HTTP API
 - `show-default-config`: print default `config.yaml` template
 - `install-systemd-unit`: install user systemd unit
@@ -96,9 +96,11 @@ curl http://127.0.0.1:6738/v1/usage
 
 - Installation details: [docs/installation.md](docs/installation.md)
 - CLI and runtime options: [docs/usage.md](docs/usage.md)
+- JSON output format and examples: [docs/json-output.md](docs/json-output.md)
 - Query/daemon behavior and systemd operation: [docs/daemon-modes.md](docs/daemon-modes.md)
 - Configuration and daemon discovery: [docs/configuration.md](docs/configuration.md)
 - Plugin overrides and AST patching: [docs/plugin-overrides.md](docs/plugin-overrides.md)
+- Upstream plugin defects and workaround retirement: [docs/upstream-plugin-workarounds.md](docs/upstream-plugin-workarounds.md)
 - Development, testing, packaging, releases: [docs/development.md](docs/development.md)
 - CrossUsage plugin updates: [docs/crossusage-update-workflow.md](docs/crossusage-update-workflow.md)
 - Known intentional behavior differences: [crossusage_differences.md](docs/crossusage_differences.md)

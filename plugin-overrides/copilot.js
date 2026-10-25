@@ -11,9 +11,13 @@ globalThis.__openusage_ast_patch = {
 
 globalThis.__openusage_function_overrides = {
   functions: [
-    { target: "discoverAccounts", with: "discoverAccounts", mode: "replace" }
+    { target: "discoverAccounts", with: "patchDiscoverAccounts", mode: "replace" }
   ]
 };
+
+// The AST transformer requires a top-level callback binding. Only patch
+// callbacks escape this closure; credential routes and helpers stay private.
+var patchLoadToken = (function () {
 
 // ── Helpers ───────────────────────────────────────────────────────
 
@@ -431,3 +435,7 @@ for (var sj = 0; sj < OPENCODE_SOURCES.length; sj++) {
   globalThis.__openusage_ctx.host.fs.subscribeFile(OPENCODE_SOURCES[sj].authPath);
   globalThis.__openusage_ctx.host.fs.subscribeFile(OPENCODE_SOURCES[sj].accountsPath);
 }
+
+globalThis.patchDiscoverAccounts = discoverAccounts;
+return patchLoadToken;
+})();

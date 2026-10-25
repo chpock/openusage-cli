@@ -1,6 +1,7 @@
-.PHONY: help build test ci-compact query run-daemon deb rpm packages release-tag aur clean
+.PHONY: help build test ci-compact query run-daemon deb deb-docker rpm packages release-tag aur clean
 
 CARGO ?= cargo
+DOCKER ?= docker
 HOST ?= 127.0.0.1
 PORT ?= 0
 REFRESH_INTERVAL_SECS ?= 300
@@ -37,6 +38,7 @@ help:
 	@printf "  make query        Run one-shot query mode\n"
 	@printf "  make run-daemon   Run daemon in foreground\n"
 	@printf "  make deb          Build .deb package (cargo-deb)\n"
+	@printf "  make deb-docker   Build and installation-check .deb in Debian 13\n"
 	@printf "  make rpm          Build .rpm package (cargo-generate-rpm)\n"
 	@printf "  make packages     Build both .deb and .rpm\n"
 		@printf "  make release-tag VERSION=X.Y.Z  Create release tag\n"
@@ -90,6 +92,11 @@ run-daemon:
 
 deb:
 	$(CARGO) deb
+
+deb-docker:
+	DOCKER_BUILDKIT=1 "$(DOCKER)" build \
+		--file "$(CURDIR)/dist/docker/debian.Dockerfile" \
+		--output "type=local,dest=$(CURDIR)/target/debian-docker" "$(CURDIR)"
 
 rpm:
 	$(CARGO) build --release

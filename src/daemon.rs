@@ -43,6 +43,8 @@ pub struct CachedPluginSnapshot {
     pub provider_id: String,
     pub display_name: String,
     pub plan: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
     pub lines: Vec<MetricLine>,
     pub fetched_at: String,
     pub account: crate::plugin_engine::runtime::AccountRef,
@@ -54,6 +56,7 @@ impl CachedPluginSnapshot {
             provider_id: output.provider_id,
             display_name: output.display_name,
             plan: output.plan,
+            warning: output.warning,
             lines: output.lines,
             fetched_at: now_iso(),
             account: output.account,
@@ -552,6 +555,7 @@ mod tests {
             resets_at,
             period_duration_ms: None,
             color: None,
+            session_start_signal: None,
         }
     }
 
@@ -561,6 +565,10 @@ mod tests {
             value: "ok".to_string(),
             color: None,
             subtitle: None,
+            model_breakdown: None,
+            status_dot: None,
+            expiry_tooltip: None,
+            reset_credit_expiries: None,
         }
     }
 
@@ -569,6 +577,7 @@ mod tests {
             provider_id: provider_id.to_string(),
             display_name: provider_id.to_string(),
             plan: None,
+            warning: None,
             lines,
             fetched_at: now_iso(),
             account: crate::plugin_engine::runtime::AccountRef::default_account(),
@@ -1117,6 +1126,7 @@ mod tests {
                         provider_id: "test-provider".to_string(),
                         display_name: "Test".to_string(),
                         plan: None,
+                        warning: None,
                         lines: vec![text_line()],
                         fetched_at: now_iso(),
                         account: AccountRef::default_account(),
@@ -1125,6 +1135,7 @@ mod tests {
                         provider_id: "test-provider".to_string(),
                         display_name: "Test".to_string(),
                         plan: None,
+                        warning: None,
                         lines: vec![text_line()],
                         fetched_at: now_iso(),
                         account: AccountRef {
@@ -1156,6 +1167,7 @@ mod tests {
                     provider_id: "test-provider".to_string(),
                     display_name: "Test".to_string(),
                     plan: None,
+                    warning: None,
                     lines: vec![text_line()],
                     fetched_at: now_iso(),
                     account: AccountRef::default_account(),
@@ -1188,6 +1200,7 @@ mod tests {
                     provider_id: "alpha".to_string(),
                     display_name: "Alpha".to_string(),
                     plan: None,
+                    warning: None,
                     lines: vec![text_line()],
                     fetched_at: now_iso(),
                     account: AccountRef::default_account(),
@@ -1196,6 +1209,7 @@ mod tests {
                     provider_id: "alpha".to_string(),
                     display_name: "Alpha".to_string(),
                     plan: None,
+                    warning: None,
                     lines: vec![text_line()],
                     fetched_at: now_iso(),
                     account: AccountRef {
@@ -1209,6 +1223,7 @@ mod tests {
                     provider_id: "beta".to_string(),
                     display_name: "Beta".to_string(),
                     plan: None,
+                    warning: None,
                     lines: vec![text_line()],
                     fetched_at: now_iso(),
                     account: AccountRef::default_account(),
@@ -1241,6 +1256,7 @@ mod tests {
                     provider_id: "alpha".to_string(),
                     display_name: "Alpha".to_string(),
                     plan: None,
+                    warning: None,
                     lines: vec![text_line()],
                     fetched_at: now_iso(),
                     account: AccountRef::default_account(),
@@ -1249,6 +1265,7 @@ mod tests {
                     provider_id: "alpha".to_string(),
                     display_name: "Alpha".to_string(),
                     plan: None,
+                    warning: None,
                     lines: vec![text_line()],
                     fetched_at: now_iso(),
                     account: AccountRef {
@@ -1262,6 +1279,7 @@ mod tests {
                     provider_id: "beta".to_string(),
                     display_name: "Beta".to_string(),
                     plan: None,
+                    warning: None,
                     lines: vec![text_line()],
                     fetched_at: now_iso(),
                     account: AccountRef::default_account(),
@@ -1304,6 +1322,7 @@ mod tests {
                         provider_id: "test-provider".to_string(),
                         display_name: "Test".to_string(),
                         plan: None,
+                        warning: None,
                         lines: vec![text_line()],
                         fetched_at: now_iso(),
                         account: AccountRef {
@@ -1317,6 +1336,7 @@ mod tests {
                         provider_id: "test-provider".to_string(),
                         display_name: "Test".to_string(),
                         plan: None,
+                        warning: None,
                         lines: vec![text_line()],
                         fetched_at: now_iso(),
                         account: AccountRef::default_account(),
@@ -1353,6 +1373,7 @@ mod tests {
                     provider_id: "custom-provider".to_string(),
                     display_name: "Custom".to_string(),
                     plan: None,
+                    warning: None,
                     lines: vec![text_line()],
                     fetched_at: now_iso(),
                     account: AccountRef {
@@ -1393,6 +1414,7 @@ mod tests {
                         provider_id: "multi-provider".to_string(),
                         display_name: "Multi".to_string(),
                         plan: None,
+                        warning: None,
                         lines: vec![text_line()],
                         fetched_at: now_iso(),
                         account: AccountRef {
@@ -1406,6 +1428,7 @@ mod tests {
                         provider_id: "multi-provider".to_string(),
                         display_name: "Multi".to_string(),
                         plan: None,
+                        warning: None,
                         lines: vec![text_line()],
                         fetched_at: now_iso(),
                         account: AccountRef {
@@ -1434,6 +1457,7 @@ mod tests {
                 provider_id: "mixed".to_string(),
                 display_name: "Mixed".to_string(),
                 plan: None,
+                warning: None,
                 lines: vec![text_line()],
                 fetched_at: now_iso(),
                 account: AccountRef {
@@ -1447,6 +1471,7 @@ mod tests {
                 provider_id: "mixed".to_string(),
                 display_name: "Mixed".to_string(),
                 plan: None,
+                warning: None,
                 lines: vec![text_line()],
                 fetched_at: now_iso(),
                 account: AccountRef::default_account(),
@@ -1466,6 +1491,7 @@ mod tests {
                 provider_id: "stale-provider".to_string(),
                 display_name: "Stale".to_string(),
                 plan: None,
+                warning: None,
                 lines: vec![progress_line(Some(iso_from_now(-20)))],
                 fetched_at: now_iso(),
                 account: AccountRef::default_account(),
@@ -1474,6 +1500,7 @@ mod tests {
                 provider_id: "stale-provider".to_string(),
                 display_name: "Stale".to_string(),
                 plan: None,
+                warning: None,
                 lines: vec![progress_line(Some(iso_from_now(-10)))],
                 fetched_at: now_iso(),
                 account: AccountRef {
@@ -1487,6 +1514,7 @@ mod tests {
                 provider_id: "fresh-provider".to_string(),
                 display_name: "Fresh".to_string(),
                 plan: None,
+                warning: None,
                 lines: vec![progress_line(Some(iso_from_now(120)))],
                 fetched_at: now_iso(),
                 account: AccountRef::default_account(),

@@ -1,11 +1,16 @@
 // ── Codex override: account discovery + source routing ────────────
 // This override adds opencode-* accounts to the Codex plugin.
-// It patches loadAuth, saveAuth, and refreshToken to route through
-// exact selected credential sources with no cross-file or native fallback.
+// Selected OpenCode accounts enter the native provider-auth branch with its
+// extra-account isolation guard; the default account keeps native fallback.
 
 globalThis.__openusage_ast_patch = {
   functions: [
-    { target: "loadAuth", with: "patchLoadAuth", mode: "wrap" },
+    { target: "loadAuthFromProviderAccount", with: "patchLoadAuthFromProviderAccount", mode: "wrap" },
+    { target: "isExtraAccountInstance", with: "patchIsExtraAccountInstance", mode: "wrap" },
+    { target: "reloadAuthState", with: "patchReloadAuthState", mode: "wrap" },
+    { target: "probeWithAuthState", with: "patchProbeWithAuthState", mode: "wrap" },
+    { target: "fetchUsage", with: "patchFetchUsage", mode: "wrap" },
+    { target: "fetchResetCredits", with: "patchFetchResetCredits", mode: "wrap" },
     { target: "saveAuth", with: "patchSaveAuth", mode: "wrap" },
     { target: "refreshToken", with: "patchRefreshToken", mode: "wrap" }
   ]
@@ -13,9 +18,13 @@ globalThis.__openusage_ast_patch = {
 
 globalThis.__openusage_function_overrides = {
   functions: [
-    { target: "discoverAccounts", with: "discoverAccounts", mode: "replace" }
+    { target: "discoverAccounts", with: "patchDiscoverAccounts", mode: "replace" }
   ]
 };
+
+// AST callback aliases must be declared at top level for the transformer.
+// Only these public callbacks escape the closure; credentials and helpers do not.
+var patchLoadAuthFromProviderAccount = (function () {
 
 // ── Helpers ───────────────────────────────────────────────────────
 
@@ -313,6 +322,7 @@ function discoverAccounts(ctx, originalDiscoverAccounts) {
       path: authPath,
       providerKey: OPENAI_PROVIDER_KEY,
       accountId: parsed.accountIdFromBlock,
+      credentialAccountId: parsed.accountIdFromBlock,
       credential: parsed.credential,
       type: "ready",
       persistFailed: false,
@@ -407,6 +417,7 @@ function discoverAccounts(ctx, originalDiscoverAccounts) {
         accountsPath: accountsPath,
         providerKey: OPENAI_PROVIDER_KEY,
         accountId: declaredAccountId,
+        credentialAccountId: isActive ? parsed.accountIdFromBlock : "",
         credential: parsed.credential,
         type: "ready",
         persistFailed: false,
@@ -427,7 +438,7 @@ function discoverAccounts(ctx, originalDiscoverAccounts) {
 // Each callback receives (original, ...args) and returns the result
 // directly — no factory/handler wrapping.
 
-function patchLoadAuth(originalLoadAuth, ctx) {
+function patchLoadAuthFromProviderAccount(originalLoadAuth, ctx) {
   var accountId = ctx && ctx.account && ctx.account.id;
 
   if (!accountId || accountId === "default") {
@@ -565,6 +576,51 @@ function patchRefreshToken(originalRefreshToken, ctx, authState) {
   return upstreamRefreshResult;
 }
 
+function patchIsExtraAccountInstance(original, ctx) {
+  var id = ctx && ctx.account && ctx.account.id;
+  return id && id !== "default" ? true : original(ctx);
+}
+
+function patchReloadAuthState(original, ctx, authState) {
+  if (!authState || authState.source !== "opencode") return original(ctx, authState);
+  var route = routes[ctx.account.id];
+  var credential = reloadCredentialFromRoute(ctx, route);
+  if (!credential) throw "Failed to reload auth file for account " + ctx.account.id;
+  var tokens = authState.auth.tokens;
+  if (credential.access_token === tokens.access_token && credential.refresh_token === tokens.refresh_token) {
+    return { status: "unchanged", authState: authState };
+  }
+  route.credential = credential;
+  return { status: "changed", authState: buildAuthStateFromCredential(credential, route) };
+}
+
+// Native reactive refresh retries with the new token without updating its local
+// accessToken. Bind the optional detail GET to the successful usage request, not
+// to that stale local variable, and never carry credentials across candidates.
+var probeFrame = null;
+function patchProbeWithAuthState(original, ctx, authState) {
+  var previous = probeFrame;
+  probeFrame = { successfulUsage: null };
+  try {
+    return original(ctx, authState);
+  } finally {
+    probeFrame = previous;
+  }
+}
+
+function patchFetchUsage(original, ctx, token, accountId) {
+  var response = original(ctx, token, accountId);
+  if (probeFrame && response && response.status >= 200 && response.status < 300) {
+    probeFrame.successfulUsage = { token: token, accountId: accountId };
+  }
+  return response;
+}
+
+function patchFetchResetCredits(original, ctx, token, accountId) {
+  var usage = probeFrame && probeFrame.successfulUsage;
+  return usage ? original(ctx, usage.token, usage.accountId) : original(ctx, token, accountId);
+}
+
 // ── File persistence helpers ──────────────────────────────────────
 
 function readProviderBlock(ctx, path, providerKey) {
@@ -595,7 +651,7 @@ function readProviderBlock(ctx, path, providerKey) {
   return block;
 }
 
-function readAccountsEntryData(ctx, path, providerKey, index) {
+function readAccountsEntry(ctx, path, providerKey, index) {
   var fs = ctx && ctx.host && ctx.host.fs;
   if (!fs || typeof fs.readText !== "function") return null;
 
@@ -624,28 +680,41 @@ function readAccountsEntryData(ctx, path, providerKey, index) {
   var entry = providerEntries[index];
   if (!isPlainObject(entry)) return null;
 
-  return entry.data;
+  return entry;
 }
 
 function reloadCredentialFromRoute(ctx, route) {
   if (route.readSource === "accounts") {
-    var data = readAccountsEntryData(ctx, route.accountsPath, route.providerKey, route.accountsIndex);
-    var parsedData = parseCredentialObject(data);
+    var entry = readAccountsEntry(ctx, route.accountsPath, route.providerKey, route.accountsIndex);
+    if (!entry) return null;
+    if (!isNonEmptyString(entry.accountId) || entry.accountId.trim() !== route.accountId || entry.isActive === true) {
+      throw "Token conflict. Run `codex` to log in again.";
+    }
+    var parsedData = parseCredentialObject(entry.data);
     if (parsedData.error) {
       return null;
     }
     return parsedData.credential;
   }
 
+  if (route.accountsPath) {
+    var active = readAccountsEntry(ctx, route.accountsPath, route.providerKey, route.accountsIndex);
+    if (!active || !isNonEmptyString(active.accountId) || active.accountId.trim() !== route.accountId || active.isActive !== true) {
+      throw "Token conflict. Run `codex` to log in again.";
+    }
+  }
   var block = readProviderBlock(ctx, route.path, route.providerKey);
   var parsedBlock = parseCredentialObject(block);
   if (parsedBlock.error) {
     return null;
   }
+  if (route.credentialAccountId && parsedBlock.accountIdFromBlock !== route.credentialAccountId) {
+    throw "Token conflict. Run `codex` to log in again.";
+  }
   return parsedBlock.credential;
 }
 
-function persistToAuthFile(ctx, path, providerKey, tokens) {
+function persistToAuthFile(ctx, path, providerKey, tokens, credentialAccountId) {
   var fs = ctx && ctx.host && ctx.host.fs;
   if (!fs || typeof fs.readText !== "function" || typeof fs.writeText !== "function") {
     return false;
@@ -673,6 +742,8 @@ function persistToAuthFile(ctx, path, providerKey, tokens) {
   if (!block || typeof block !== "object" || Array.isArray(block)) {
     return false;
   }
+
+  if (credentialAccountId && (!isNonEmptyString(block.accountId) || block.accountId.trim() !== credentialAccountId)) return false;
 
   if (isNonEmptyString(tokens.access_token)) {
     block.access = tokens.access_token;
@@ -725,6 +796,7 @@ function persistToAccountsFile(ctx, path, providerKey, index, tokens, declaredAc
 
   var entry = providerEntries[index];
   if (!isPlainObject(entry)) return false;
+  if (!isNonEmptyString(entry.accountId) || entry.accountId.trim() !== declaredAccountId || entry.isActive === true) return false;
 
   if (!isPlainObject(entry.data)) {
     entry.data = {};
@@ -767,7 +839,11 @@ function persistRouteTokens(ctx, route, tokens) {
     );
   }
 
-  return persistToAuthFile(ctx, route.path, route.providerKey, tokens);
+  if (route.accountsPath) {
+    var active = readAccountsEntry(ctx, route.accountsPath, route.providerKey, route.accountsIndex);
+    if (!active || !isNonEmptyString(active.accountId) || active.accountId.trim() !== route.accountId || active.isActive !== true) return false;
+  }
+  return persistToAuthFile(ctx, route.path, route.providerKey, tokens, route.credentialAccountId);
 }
 
 // ── Subscribe to candidate paths ─────────────────────────────────
@@ -775,3 +851,22 @@ for (var si = 0; si < OPENCODE_SOURCES.length; si++) {
   globalThis.__openusage_ctx.host.fs.subscribeFile(OPENCODE_SOURCES[si].authPath);
   globalThis.__openusage_ctx.host.fs.subscribeFile(OPENCODE_SOURCES[si].accountsPath);
 }
+
+globalThis.patchDiscoverAccounts = discoverAccounts;
+globalThis.patchIsExtraAccountInstance = patchIsExtraAccountInstance;
+globalThis.patchReloadAuthState = patchReloadAuthState;
+globalThis.patchSaveAuth = patchSaveAuth;
+globalThis.patchRefreshToken = patchRefreshToken;
+globalThis.patchProbeWithAuthState = patchProbeWithAuthState;
+globalThis.patchFetchUsage = patchFetchUsage;
+globalThis.patchFetchResetCredits = patchFetchResetCredits;
+return patchLoadAuthFromProviderAccount;
+})();
+
+var patchIsExtraAccountInstance = (globalThis.patchIsExtraAccountInstance);
+var patchReloadAuthState = (globalThis.patchReloadAuthState);
+var patchSaveAuth = (globalThis.patchSaveAuth);
+var patchRefreshToken = (globalThis.patchRefreshToken);
+var patchProbeWithAuthState = (globalThis.patchProbeWithAuthState);
+var patchFetchUsage = (globalThis.patchFetchUsage);
+var patchFetchResetCredits = (globalThis.patchFetchResetCredits);

@@ -2,8 +2,8 @@
 
 // Integration tests for the Codex plugin override.
 //
-// Every test calls the single shared `RunSpec { probe_mode: true }` path,
-// which calls `execute_provider_in_context` (production probe code).
+// In-memory cases use the shared ProviderSpec runner and production
+// execute_provider_in_context; filesystem cases use the sandbox or daemon.
 // No manual Runtime/Context/override_api injection or discovery/probe loops.
 //
 // Tests assert actual `ProbeResult` (typed outputs with lines, accounts)
@@ -12,7 +12,7 @@
 mod support;
 
 use openusage_cli::config::{AuthSource, DEFAULT_AUTH_SOURCES};
-use openusage_cli::plugin_engine::runtime::ProbeResult;
+use openusage_cli::plugin_engine::runtime::{MetricLine, ProbeResult};
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
@@ -57,7 +57,6 @@ fn run_codex_probe_with_sources(
         harness: HARNESS_SCRIPT,
         setup: setup_js,
         assertion: Some(ASSERTION_SCRIPT),
-        // probe_mode removed — ProviderSpec has no such field
     };
     let outcome = if sources == DEFAULT_AUTH_SOURCES {
         run_provider_probe(&spec)
@@ -108,6 +107,381 @@ fn account_is_active(result: &ProbeResult, account_id: &str) -> Option<bool> {
         .map(|o| o.account.is_active)
 }
 
+fn assert_successful_sessions(result: &ProbeResult, count: usize) {
+    assert_eq!(result.outputs.len(), count, "{result:?}");
+    for output in &result.outputs {
+        assert!(
+            output.lines.iter().any(|line| matches!(line,
+                MetricLine::Progress { label, used, limit, .. }
+                    if label == "Session" && *used == 25.0 && *limit == 100.0
+            )),
+            "expected successful quota: {output:?}"
+        );
+        assert!(
+            !output.lines.iter().any(|line| matches!(line,
+                MetricLine::Badge { label, .. } if label == "Error"
+            )),
+            "unexpected error: {output:?}"
+        );
+    }
+}
+
+#[test]
+fn codex_override_native_candidates_fallback_only_on_auth_errors() {
+    for (response, expected_tokens, success) in [
+        (
+            "{status:200, bodyText:JSON.stringify(__test_state.usageBody)}",
+            vec!["first"],
+            true,
+        ),
+        ("{status:401}", vec!["first", "second"], true),
+        ("{status:500}", vec!["first"], false),
+        (
+            "{status:200, bodyText:'invalid-json'}",
+            vec!["first"],
+            false,
+        ),
+        ("{error:'offline'}", vec!["first"], false),
+    ] {
+        let setup = format!(
+            r#"
+            __test_state.files["~/.config/codex/auth.json"] = JSON.stringify({{tokens:{{access_token:"first"}}}});
+            __test_state.files["~/.codex/auth.json"] = JSON.stringify({{tokens:{{access_token:"second"}}}});
+            __test_state.responses.usage.push({response}, {{status:200, bodyText:JSON.stringify(__test_state.usageBody)}});
+        "#
+        );
+        let (result, obs) = run_codex_probe_with_sources(&setup, &[AuthSource::Native]);
+        let obs = obs.expect("observations");
+        let tokens: Vec<_> = obs["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["authorization"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            tokens,
+            expected_tokens
+                .iter()
+                .map(|t| format!("Bearer {t}"))
+                .collect::<Vec<_>>()
+        );
+        if success {
+            assert_successful_sessions(&result, 1);
+        } else {
+            assert!(
+                result.outputs[0]
+                    .lines
+                    .iter()
+                    .any(|l| matches!(l, MetricLine::Badge {label, ..} if label == "Error")),
+                "{result:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn codex_override_native_auth_failure_can_fall_back_to_keychain() {
+    let (result, obs) = run_codex_probe_with_sources(
+        r#"
+        __test_state.files["~/.config/codex/auth.json"] = JSON.stringify({tokens:{access_token:"revoked"}});
+        __test_ctx.host.keychain.readGenericPassword = function() {
+            return JSON.stringify({tokens:{access_token:"keychain"}});
+        };
+        __test_state.responses.usage.push({status:401}, {status:200, bodyText:JSON.stringify(__test_state.usageBody)});
+    "#,
+        &[AuthSource::Native],
+    );
+    assert_successful_sessions(&result, 1);
+    let obs = obs.unwrap();
+    assert_eq!(obs["requests"].as_array().unwrap().len(), 2);
+    assert_eq!(obs["requests"][1]["authorization"], "Bearer keychain");
+}
+
+#[test]
+fn codex_override_selected_opencode_never_uses_native_or_other_file() {
+    let (result, obs) = run_codex_probe_with_sources(
+        r#"
+        __test_state.files["~/.config/codex/auth.json"] = JSON.stringify({tokens:{access_token:"native"}});
+        __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({openai:{access:"revoked", accountId:"selected"}});
+        __test_state.files["~/.config/opencode/auth.json"] = JSON.stringify({openai:{access:"other", accountId:"other"}});
+        __test_state.responses.usage.push({status:401}, {status:200, bodyText:JSON.stringify(__test_state.usageBody)});
+    "#,
+        &[AuthSource::Opencode],
+    );
+    let obs = obs.unwrap();
+    let requests = obs["requests"].as_array().unwrap();
+    assert_eq!(requests.len(), 2, "{obs}");
+    assert_eq!(requests[0]["authorization"], "Bearer revoked");
+    assert_eq!(requests[0]["accountId"], "selected");
+    assert_eq!(requests[1]["authorization"], "Bearer other");
+    assert_eq!(result.outputs.len(), 2);
+    assert_eq!(result.outputs[0].account.id, "opencode-0");
+    assert!(
+        result.outputs[0]
+            .lines
+            .iter()
+            .any(|l| matches!(l, MetricLine::Badge {label, ..} if label == "Error"))
+    );
+    assert_successful_sessions(
+        &ProbeResult {
+            outputs: vec![result.outputs[1].clone()],
+            subscriptions: vec![],
+        },
+        1,
+    );
+    assert_eq!(obs["writes"], serde_json::json!([]));
+}
+
+#[test]
+fn codex_override_reset_details_follow_successful_usage_credentials() {
+    for source in [AuthSource::Native, AuthSource::Opencode] {
+        for mode in ["reactive", "proactive", "external", "reload-then-refresh"] {
+            let setup = format!(
+                r#"
+                var path = {path:?};
+                var native = {native};
+                function put(token) {{
+                    __test_state.files[path] = JSON.stringify(native
+                        ? {{tokens:{{access_token:token, refresh_token:"refresh", account_id:"subject"}}}}
+                        : {{openai:{{access:token, refresh:"refresh", accountId:"subject"}}}});
+                }}
+                put("old");
+                if ({mode:?} === "proactive") {{
+                    __test_ctx.jwt = {{decodePayload:function(token) {{return {{exp: token === "old" ? 1 : 9999999999}};}}}};
+                }} else {{
+                    __test_state.responses.usage.push({{status:401}});
+                }}
+                if ({mode:?} === "external" || {mode:?} === "reload-then-refresh") {{
+                    var changed = false;
+                    __test_state.onRequest = function(opts) {{
+                        if (!changed && opts.url.indexOf("/wham/usage") !== -1) {{changed = true; put("external");}}
+                    }};
+                }}
+                if ({mode:?} === "reload-then-refresh") {{
+                    __test_state.responses.usage.push({{status:401}});
+                }}
+                __test_state.responses.refresh.push({{status:200, bodyText:JSON.stringify({{access_token:"new",refresh_token:"rotated"}})}});
+                __test_state.usageBody.rate_limit_reset_credits = {{available_count:1}};
+                __test_state.responses.usage.push({{status:200, bodyText:JSON.stringify(__test_state.usageBody)}});
+                __test_state.responses.details.push({{status:200, bodyText:JSON.stringify({{rate_limit_reset_credits:{{available_count:1}}}})}});
+            "#,
+                path = if source == AuthSource::Native {
+                    "~/.config/codex/auth.json"
+                } else {
+                    "~/.local/share/opencode/auth.json"
+                },
+                native = source == AuthSource::Native
+            );
+            let (result, obs) = run_codex_probe_with_sources(&setup, &[source]);
+            assert_successful_sessions(&result, 1);
+            let obs = obs.unwrap();
+            let requests = obs["requests"].as_array().unwrap();
+            let usage = requests
+                .iter()
+                .rev()
+                .find(|r| r["url"].as_str().unwrap().ends_with("/usage"))
+                .unwrap();
+            let detail = requests.last().unwrap();
+            assert!(
+                detail["url"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("/rate-limit-reset-credits")
+            );
+            let token = if mode == "external" {
+                "external"
+            } else {
+                "new"
+            };
+            assert_eq!(
+                usage["authorization"],
+                format!("Bearer {token}"),
+                "{mode} {source:?}: {obs}"
+            );
+            assert_eq!(
+                detail["authorization"], usage["authorization"],
+                "{mode} {source:?}: {obs}"
+            );
+            assert_eq!(detail["accountId"], usage["accountId"]);
+            assert_eq!(detail["method"], "GET");
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|r| r["url"].as_str().unwrap().contains("/oauth/token"))
+                    .count(),
+                usize::from(token == "new")
+            );
+        }
+    }
+}
+
+#[test]
+fn codex_override_detail_credentials_are_isolated_after_account_errors() {
+    let (result, obs) = run_codex_probe_with_sources(
+        r#"
+        __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({openai:{access:"first", accountId:"one"}});
+        __test_state.files["~/.config/opencode/auth.json"] = JSON.stringify({openai:{access:"second", refresh:"second-refresh", accountId:"two"}});
+        __test_state.responses.usage.push({status:200, bodyText:"invalid"}, {status:401},
+            {status:200, bodyText:JSON.stringify({rate_limit:{primary_window:{used_percent:25}}, rate_limit_reset_credits:{available_count:2}})});
+        __test_state.responses.refresh.push({status:200, bodyText:JSON.stringify({access_token:"second-new"})});
+        __test_state.responses.details.push({status:403});
+    "#,
+        &[AuthSource::Opencode],
+    );
+    assert_eq!(result.outputs.len(), 2);
+    assert!(
+        result.outputs[0]
+            .lines
+            .iter()
+            .any(|l| matches!(l, MetricLine::Badge {label, ..} if label == "Error"))
+    );
+    assert_successful_sessions(
+        &ProbeResult {
+            outputs: vec![result.outputs[1].clone()],
+            subscriptions: vec![],
+        },
+        1,
+    );
+    let obs = obs.unwrap();
+    let requests = obs["requests"].as_array().unwrap();
+    assert_eq!(requests.len(), 5);
+    assert_eq!(requests[4]["authorization"], "Bearer second-new");
+    assert_eq!(requests[4]["accountId"], "two");
+    assert_eq!(requests[4]["method"], "GET");
+    assert!(result.outputs[1].lines.iter().any(|l| matches!(l, MetricLine::Text {label, value, ..} if label == "Rate Limit Resets" && value == "2 available")));
+}
+
+#[test]
+fn codex_override_native_failed_candidate_does_not_leak_detail_credentials() {
+    let (result, obs) = run_codex_probe_with_sources(
+        r#"
+        __test_state.files["~/.config/codex/auth.json"] = JSON.stringify({tokens:{access_token:"first", account_id:"one"}});
+        __test_state.files["~/.codex/auth.json"] = JSON.stringify({tokens:{access_token:"second", account_id:"two"}});
+        __test_state.responses.usage.push({status:401}, {status:200, bodyText:JSON.stringify({rate_limit:{primary_window:{used_percent:25}},rate_limit_reset_credits:{available_count:1}})});
+        __test_state.responses.details.push({status:500});
+    "#,
+        &[AuthSource::Native],
+    );
+    assert_successful_sessions(&result, 1);
+    let obs = obs.unwrap();
+    let requests = obs["requests"].as_array().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[2]["authorization"], "Bearer second");
+    assert_eq!(requests[2]["accountId"], "two");
+}
+
+#[test]
+fn codex_override_reloaded_account_conflict_stops_before_refresh() {
+    for source in [AuthSource::Native, AuthSource::Opencode] {
+        let path = if source == AuthSource::Native {
+            "~/.config/codex/auth.json"
+        } else {
+            "~/.local/share/opencode/auth.json"
+        };
+        let setup = format!(
+            r#"
+            function put(subject) {{
+                __test_state.files[{path:?}] = JSON.stringify({native}
+                    ? {{tokens:{{access_token:"old", refresh_token:"refresh", account_id:subject}}}}
+                    : {{openai:{{access:"old", refresh:"refresh", accountId:subject}}}});
+            }}
+            put("original");
+            __test_state.onRequest = function() {{put("different");}};
+            __test_state.responses.usage.push({{status:401}});
+        "#,
+            native = source == AuthSource::Native
+        );
+        let (result, obs) = run_codex_probe_with_sources(&setup, &[source]);
+        let obs = obs.unwrap();
+        assert_eq!(obs["requests"].as_array().unwrap().len(), 1);
+        assert_eq!(obs["writes"], serde_json::json!([]));
+        assert!(result.outputs[0].lines.iter().any(|l| matches!(l, MetricLine::Badge {label, text, ..} if label == "Error" && text.contains("Token conflict"))), "{result:?}");
+    }
+}
+
+#[test]
+fn codex_override_native_reload_to_api_key_is_a_conflict() {
+    let (result, obs) = run_codex_probe_with_sources(
+        r#"
+        __test_state.files["~/.config/codex/auth.json"] = JSON.stringify({tokens:{access_token:"old",refresh_token:"refresh"}});
+        __test_state.onRequest = function() {
+            __test_state.files["~/.config/codex/auth.json"] = JSON.stringify({OPENAI_API_KEY:"not-an-oauth-account"});
+        };
+        __test_state.responses.usage.push({status:401});
+    "#,
+        &[AuthSource::Native],
+    );
+    let obs = obs.unwrap();
+    assert_eq!(obs["requests"].as_array().unwrap().len(), 1);
+    assert!(result.outputs[0].lines.iter().any(|l| matches!(l, MetricLine::Badge {label, text, ..} if label == "Error" && text.contains("Token conflict"))), "{result:?}");
+}
+
+#[test]
+fn codex_override_auth_subject_change_during_refresh_prevents_writeback() {
+    let (result, obs) = run_codex_probe_with_sources(
+        r#"
+        __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({openai:{access:"old",refresh:"refresh",accountId:"original"}});
+        __test_state.onRequest = function(opts) {
+            if (opts.url.indexOf("/oauth/token") !== -1) {
+                __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({openai:{access:"external",refresh:"external-refresh",accountId:"different"}});
+            }
+        };
+        __test_state.responses.usage.push({status:401});
+        __test_state.responses.refresh.push({status:200,bodyText:JSON.stringify({access_token:"new",refresh_token:"rotated"})});
+    "#,
+        &[AuthSource::Opencode],
+    );
+    let obs = obs.unwrap();
+    assert_eq!(obs["requests"].as_array().unwrap().len(), 2);
+    assert_eq!(obs["writes"], serde_json::json!([]));
+    let file: Value = serde_json::from_str(
+        obs["files"]["~/.local/share/opencode/auth.json"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(file["openai"]["access"], "external");
+    assert!(result.outputs[0].lines.iter().any(|l| matches!(l, MetricLine::Badge {label, text, ..} if label == "Error" && text.contains("persistence failed"))), "{result:?}");
+}
+
+#[test]
+fn codex_override_inactive_reordered_account_never_refreshes_other_identity() {
+    let (result, obs) = run_codex_probe_with_sources(
+        r#"
+        __test_state.files["~/.local/share/opencode/accounts.json"] = JSON.stringify({openai:[
+            {accountId:"active",isActive:true},
+            {accountId:"selected",isActive:false,data:{access:"old",refresh:"refresh",accountId:"selected"}}
+        ]});
+        __test_state.onRequest = function() {
+            __test_state.files["~/.local/share/opencode/accounts.json"] = JSON.stringify({openai:[
+                {accountId:"active",isActive:true},
+                {accountId:"different",isActive:false,data:{access:"wrong",refresh:"wrong-refresh"}}
+            ]});
+        };
+        __test_state.responses.usage.push({status:401});
+    "#,
+        &[AuthSource::Opencode],
+    );
+    let obs = obs.unwrap();
+    assert_eq!(obs["requests"].as_array().unwrap().len(), 1);
+    assert_eq!(obs["writes"], serde_json::json!([]));
+    let output = result
+        .outputs
+        .iter()
+        .find(|o| o.account.id == "selected")
+        .unwrap();
+    assert!(output.lines.iter().any(|l| matches!(l, MetricLine::Badge {label, text, ..} if label == "Error" && text.contains("Token conflict"))), "{result:?}");
+}
+
+#[test]
+fn codex_override_private_state_stays_inside_closure() {
+    let (result, obs) = run_codex_probe_with_sources("", &[]);
+    assert!(result.outputs.is_empty(), "{result:?}");
+    let obs = obs.unwrap();
+    assert_eq!(obs["privateGlobals"], serde_json::json!([]));
+    assert_eq!(obs["subscriptions"].as_array().unwrap().len(), 4);
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Test suite
 // ═══════════════════════════════════════════════════════════════════════
@@ -122,7 +496,7 @@ fn codex_override_filters_auth_sources_before_requests() {
             {accountId: "inactive", isActive: false, data: {access: "inactive-token"}}
         ]});
         for (var i = 0; i < 3; i++) {
-            __test_state.responses.usage.push({status: 200, headers: {}, bodyText: "{}"});
+            __test_state.responses.usage.push({status: 200, headers: {}, bodyText: JSON.stringify(__test_state.usageBody)});
         }
     "#;
     for (sources, tokens) in [
@@ -151,6 +525,8 @@ fn codex_override_filters_auth_sources_before_requests() {
             .collect();
         assert_eq!(authorizations, expected);
         assert_eq!(result.outputs.len(), tokens.len());
+        assert_successful_sessions(&result, tokens.len());
+        assert_eq!(observed["writes"], serde_json::json!([]));
         assert_subscriptions(
             &observed,
             &[
@@ -187,7 +563,7 @@ fn codex_override_native_default_source() {
         __test_state.responses.usage.push({
           status: 200,
           headers: {},
-          bodyText: JSON.stringify({})
+          bodyText: JSON.stringify(__test_state.usageBody)
         });
         "#,
     );
@@ -236,7 +612,7 @@ fn codex_override_uses_opencode_fallback_auth_when_primary_auth_missing() {
         __test_state.responses.usage.push({
           status: 200,
           headers: {},
-          bodyText: JSON.stringify({})
+          bodyText: JSON.stringify(__test_state.usageBody)
         });
         "#,
     );
@@ -302,7 +678,7 @@ fn codex_override_accounts_json_inactive_entry_uses_entry_credentials() {
         __test_state.responses.usage.push({
           status: 200,
           headers: {},
-          bodyText: JSON.stringify({})
+          bodyText: JSON.stringify(__test_state.usageBody)
         });
         "#,
     );
@@ -578,7 +954,7 @@ fn codex_override_accounts_json_duplicate_account_id_creates_error_route() {
         __test_state.responses.usage.push({
           status: 200,
           headers: {},
-          bodyText: JSON.stringify({})
+          bodyText: JSON.stringify(__test_state.usageBody)
         });
         "#,
     );
@@ -742,7 +1118,7 @@ fn codex_override_preserves_original_auth_path_priority() {
         __test_state.responses.usage.push({
           status: 200,
           headers: {},
-          bodyText: JSON.stringify({})
+          bodyText: JSON.stringify(__test_state.usageBody)
         });
         "#,
     );
@@ -799,7 +1175,7 @@ fn codex_override_persists_refresh_back_to_opencode_auth_file() {
         __test_state.responses.usage.push({
           status: 200,
           headers: {},
-          bodyText: JSON.stringify({})
+          bodyText: JSON.stringify(__test_state.usageBody)
         });
         "#,
     );
@@ -893,13 +1269,13 @@ fn codex_override_persists_refresh_back_to_accounts_json_for_inactive_entry() {
                 refresh: "old-refresh",
                 access: "old-access",
                 expires: 1776806966592,
-                accountId: "account-name-1"
-              }
-            }
-          ]
-        });
-        __test_state.responses.usage.push({
-          status: 401,
+                 accountId: "optional-data-subject"
+               }
+             }
+           ]
+         });
+         __test_state.responses.usage.push({
+           status: 401,
           headers: {},
           bodyText: JSON.stringify({ error: "expired" })
         });
@@ -914,7 +1290,7 @@ fn codex_override_persists_refresh_back_to_accounts_json_for_inactive_entry() {
         __test_state.responses.usage.push({
           status: 200,
           headers: {},
-          bodyText: JSON.stringify({})
+          bodyText: JSON.stringify(__test_state.usageBody)
         });
         "#,
     );
@@ -978,6 +1354,27 @@ fn codex_override_persists_refresh_back_to_accounts_json_for_inactive_entry() {
         .expect("expected output for account-name-1");
     assert_eq!(account_output.provider_id, "codex");
     assert_eq!(account_output.account.origin, "opencode");
+    assert_eq!(
+        updated_accounts["openai"][1]["data"]["accountId"],
+        "account-name-1"
+    );
+    let usage_requests: Vec<_> = requests
+        .iter()
+        .filter(|r| r["url"].as_str().unwrap().ends_with("/usage"))
+        .collect();
+    assert_eq!(usage_requests.len(), 2);
+    assert!(
+        usage_requests
+            .iter()
+            .all(|r| r["accountId"] == "account-name-1")
+    );
+    assert_successful_sessions(
+        &ProbeResult {
+            outputs: vec![account_output.clone()],
+            subscriptions: vec![],
+        },
+        1,
+    );
 }
 
 #[test]
@@ -1002,7 +1399,7 @@ fn codex_override_reloads_opencode_auth_before_refresh() {
         __test_state.responses.usage.push({
           status: 200,
           headers: {},
-          bodyText: JSON.stringify({})
+          bodyText: JSON.stringify(__test_state.usageBody)
         });
 
         __test_ctx.util.retryOnceOnAuth = function (opts) {
@@ -1106,7 +1503,7 @@ fn codex_override_preserves_other_providers_when_persisting_refresh() {
         __test_state.responses.usage.push({
           status: 200,
           headers: {},
-          bodyText: JSON.stringify({})
+          bodyText: JSON.stringify(__test_state.usageBody)
         });
         "#,
     );
@@ -1174,7 +1571,7 @@ fn codex_override_tries_multiple_opencode_auth_paths() {
         __test_state.responses.usage.push({
           status: 200,
           headers: {},
-          bodyText: JSON.stringify({})
+          bodyText: JSON.stringify(__test_state.usageBody)
         });
         "#,
     );
@@ -1261,11 +1658,10 @@ fn codex_override_only_default_soft_fail() {
         __test_state.responses.usage.push({
           status: 200,
           headers: {},
-          bodyText: JSON.stringify({})
+          bodyText: JSON.stringify(__test_state.usageBody)
         });
         "#,
         assertion: Some(ASSERTION_SCRIPT),
-        // probe_mode removed — ProviderSpec has no such field
     });
     match outcome {
         ProviderOutcome::Probe { result, .. } => {
@@ -1300,7 +1696,7 @@ fn codex_override_stable_path_index_ids() {
         __test_state.responses.usage.push({
           status: 200,
           headers: {},
-          bodyText: JSON.stringify({})
+          bodyText: JSON.stringify(__test_state.usageBody)
         });
         "#,
     );
@@ -1350,7 +1746,7 @@ fn codex_override_no_cross_source_native_fallback() {
         __test_state.responses.usage.push({
           status: 200,
           headers: {},
-          bodyText: JSON.stringify({})
+          bodyText: JSON.stringify(__test_state.usageBody)
         });
         "#,
     );
@@ -1393,7 +1789,7 @@ fn codex_override_empty_source_no_account() {
     let (result, obs) = run_codex_probe(
         r#"
         __test_state.files["~/.local/share/opencode/auth.json"] = "";
-        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify({}) });
+        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify(__test_state.usageBody) });
         "#,
     );
     let obs = obs.expect("assertion should produce state");
@@ -1422,7 +1818,7 @@ fn codex_override_unreadable_source_creates_error_account() {
         r#"
         __test_state.files["~/.local/share/opencode/auth.json"] = "throw-on-read";
         __test_state.readErrors["~/.local/share/opencode/auth.json"] = true;
-        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify({}) });
+        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify(__test_state.usageBody) });
         "#,
     );
     let obs = obs.expect("assertion should produce state");
@@ -1463,7 +1859,7 @@ fn codex_override_missing_provider_key_omits_candidate() {
         __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({
             google: { type: "oauth", access: "g-access", expires: 1776806966592 }
         });
-        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify({}) });
+        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify(__test_state.usageBody) });
         "#,
     );
     let obs = obs.expect("assertion should produce state");
@@ -1489,7 +1885,7 @@ fn codex_override_malformed_provider_block_null_error() {
         __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({
             openai: null
         });
-        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify({}) });
+        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify(__test_state.usageBody) });
         "#,
     );
     let obs = obs.expect("assertion should produce state");
@@ -1526,7 +1922,7 @@ fn codex_override_malformed_provider_block_array_error() {
         __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({
             openai: ["not", "valid"]
         });
-        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify({}) });
+        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify(__test_state.usageBody) });
         "#,
     );
     let obs = obs.expect("assertion should produce state");
@@ -1566,7 +1962,7 @@ fn codex_override_missing_access_token_error() {
         __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({
             openai: { type: "oauth", refresh: "r", expires: 1776806966592 }
         });
-        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify({}) });
+        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify(__test_state.usageBody) });
         "#,
     );
     let obs = obs.expect("assertion should produce state");
@@ -1603,7 +1999,7 @@ fn codex_override_default_native_error_visible_when_alone() {
     // No opencode files, native auth fails -> default error visible.
     let (result, obs) = run_codex_probe(
         r#"
-        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify({}) });
+        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify(__test_state.usageBody) });
         "#,
     );
     let obs = obs.expect("assertion should produce state");
@@ -1637,7 +2033,7 @@ fn codex_override_default_suppressed_when_opencode_descriptor_exists() {
     let (result, obs) = run_codex_probe(
         r#"
         __test_state.files["~/.local/share/opencode/auth.json"] = "{bad-json";
-        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify({}) });
+        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify(__test_state.usageBody) });
         "#,
     );
     let obs = obs.expect("assertion should produce state");
@@ -1668,7 +2064,7 @@ fn codex_override_no_cross_source_fallback() {
         __test_state.files["~/.local/share/opencode/auth.json"] = JSON.stringify({
             openai: { type: "oauth", access: "oc-access", expires: 1776806966592, accountId: "oc-acc" }
         });
-        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify({}) });
+        __test_state.responses.usage.push({ status: 200, headers: {}, bodyText: JSON.stringify(__test_state.usageBody) });
         "#,
     );
     let obs = obs.expect("assertion should produce state");
@@ -1761,11 +2157,24 @@ fn codex_override_persistence_failure_visible() {
         .collect::<Vec<_>>()
         .join(" ");
     assert!(
-        error_text.contains("write")
-            || error_text.contains("persist")
-            || error_text.contains("failed"),
-        "expected persistence error, got: {}",
-        error_text
+        error_text.contains("persistence failed"),
+        "expected persistence error, got: {error_text}"
+    );
+    assert_eq!(result.outputs[0].account.id, "opencode-0");
+    let file: Value = serde_json::from_str(
+        obs["files"]["~/.local/share/opencode/auth.json"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(file["openai"]["access"], "old-access");
+    assert_eq!(file["openai"]["refresh"], "old-refresh");
+    assert_eq!(obs["requests"].as_array().unwrap().len(), 2);
+    assert!(
+        obs["requests"][1]["bodyText"]
+            .as_str()
+            .unwrap()
+            .contains("refresh_token=old-refresh")
     );
 }
 // ═══════════════════════════════════════════════════════════════════════
@@ -1826,29 +2235,31 @@ fn codex_override_run_probe_lifecycle() {
     use openusage_cli::plugin_engine::manifest::{LoadedPlugin, PluginManifest};
     use openusage_cli::plugin_engine::runtime::{MetricLine, PluginOutput, run_probe_in_sandbox};
 
-    // Synthetic plugin with all AST patch targets required by the codex override.
-    let plugin_script = r#"
-(function() {
-  function loadAuth(ctx) { return null; }
-  function saveAuth(ctx, authState) { return false; }
-  function refreshToken(ctx, authState) { return null; }
-  function probe(ctx) {
-    var authState = loadAuth(ctx);
-    if (!authState || !authState.auth) {
-      throw "Not logged in. Run `codex` to authenticate.";
-    }
-    var auth = authState.auth;
-    if (auth.tokens && auth.tokens.access_token) {
-      return {
-        plan: "Pro",
-        lines: [ctx.line.badge({ label: "Status", text: "Authenticated" })]
-      };
-    }
-    throw "Not logged in. Run `codex` to authenticate.";
-  }
-  globalThis.__openusage_plugin = { id: "codex", probe: probe };
-})();
-"#;
+    // The real plugin and builders run with a fixture-only transport. Filesystem
+    // access, JWT decoding and subscription collection remain the sandbox host's.
+    let plugin_script = format!(
+        "{}{}",
+        codex_plugin_script(),
+        r#"
+      ;(function () {
+        var requests = [];
+        __openusage_ctx.util.request = function (opts) {
+          requests.push({method:opts.method, url:opts.url, authorization:opts.headers.Authorization || null, bodyText:opts.bodyText || null});
+          __openusage_ctx.host.fs.writeText(__openusage_ctx.app.appDataDir + "/fixture-requests.json", JSON.stringify(requests));
+          if (opts.method === "POST" && opts.url === "https://auth.openai.com/oauth/token" && opts.bodyText.indexOf("refresh_token=test-refresh-token") !== -1) {
+            return {status:200, headers:{}, bodyText:JSON.stringify({access_token:"test-access-token", refresh_token:"rotated-refresh"})};
+          }
+          if (opts.method !== "GET" || opts.url !== "https://chatgpt.com/backend-api/wham/usage" ||
+              opts.headers.Authorization !== "Bearer test-access-token" || opts.headers["ChatGPT-Account-Id"] !== "test-account") {
+            throw new Error("unexpected fixture request");
+          }
+          return {status:200, headers:{}, bodyText:JSON.stringify({
+            plan_type:"pro", rate_limit:{primary_window:{used_percent:25, limit_window_seconds:18000}}
+          })};
+        };
+      })();
+    "#
+    );
 
     // Write the real override file
     let override_path = paths.overrides.join("codex.js");
@@ -1860,7 +2271,7 @@ fn codex_override_run_probe_lifecycle() {
     let auth_json = serde_json::json!({
         "openai": {
             "type": "oauth",
-            "access": "test-access-token",
+            "access": "eyJhbGciOiJub25lIn0.eyJleHAiOjF9.signature",
             "refresh": "test-refresh-token",
             "expires": 9999999999999i64,
             "accountId": "test-account"
@@ -1930,15 +2341,164 @@ fn codex_override_run_probe_lifecycle() {
     // Assert: resulting output is exactly the expected opencode-0 account with successful output
     assert_eq!(output.provider_id, "codex");
     assert_eq!(output.display_name, "Codex");
-    assert_eq!(output.plan.as_deref(), Some("Pro"));
+    assert_eq!(output.plan.as_deref(), Some("Pro 200"));
+    let requests: Value = serde_json::from_str(
+        &fs::read_to_string(paths.app_data.join("fixture-requests.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        requests.as_array().unwrap().len(),
+        2,
+        "expired JWT must proactively refresh through the production decoder"
+    );
+    assert_eq!(requests[0]["method"], "POST");
+    assert_eq!(requests[1]["authorization"], "Bearer test-access-token");
+    let persisted: Value =
+        serde_json::from_str(&fs::read_to_string(opencode_dir.join("auth.json")).unwrap()).unwrap();
+    assert_eq!(persisted["openai"]["access"], "test-access-token");
+    assert_eq!(persisted["openai"]["refresh"], "rotated-refresh");
+    assert_eq!(persisted["openai"]["accountId"], "test-account");
+    let expected: Vec<_> = [
+        ".local/share/opencode/auth.json",
+        ".local/share/opencode/accounts.json",
+        ".config/opencode/auth.json",
+        ".config/opencode/accounts.json",
+    ]
+    .iter()
+    .map(|p| paths.root.join(p))
+    .collect();
+    assert_eq!(result.subscriptions.len(), 4);
+    for path in expected {
+        let sub = result
+            .subscriptions
+            .iter()
+            .find(|sub| sub.path == path)
+            .expect("candidate subscription");
+        assert_eq!(sub.existed_at_declaration, path.exists());
+    }
     assert_eq!(output.lines.len(), 1, "expected exactly one line");
     match &output.lines[0] {
-        MetricLine::Badge { label, text, .. } => {
-            assert_eq!(label, "Status");
-            assert_eq!(text, "Authenticated");
+        MetricLine::Progress {
+            label, used, limit, ..
+        } => {
+            assert_eq!(label, "Session");
+            assert_eq!(*used, 25.0);
+            assert_eq!(*limit, 100.0);
         }
-        other => panic!("expected badge line, got: {:?}", other),
+        other => panic!("expected successful quota, got: {:?}", other),
     }
+}
+
+#[tokio::test]
+async fn codex_override_daemon_disabled_sources_preserve_candidate_subscriptions() {
+    let Some(paths) = support::hermetic::enter(
+        "codex_override_daemon_disabled_sources_preserve_candidate_subscriptions",
+    ) else {
+        return;
+    };
+    use openusage_cli::daemon::DaemonState;
+    use openusage_cli::plugin_engine::manifest::{LoadedPlugin, PluginManifest};
+    use openusage_cli::restart_watcher::ProviderWatchCommand;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    fs::write(paths.overrides.join("codex.js"), codex_override_script()).unwrap();
+    let auth = paths.root.join(".local/share/opencode/auth.json");
+    fs::create_dir_all(auth.parent().unwrap()).unwrap();
+    fs::write(&auth, r#"{"openai":{"access":"synthetic-disabled-token"}}"#).unwrap();
+    let plugin = LoadedPlugin {
+        manifest: PluginManifest {
+            schema_version: 1,
+            id: "codex".into(),
+            name: "Codex".into(),
+            version: "0.0.0".into(),
+            entry: "plugin.js".into(),
+            icon: "icon.svg".into(),
+            brand_color: None,
+            lines: vec![],
+            links: vec![],
+        },
+        plugin_dir: paths.root.clone(),
+        entry_script: codex_plugin_script(),
+        icon_data_url: "data:image/svg+xml;base64,".into(),
+    };
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    // No probes are enabled: daemon evaluation/discovery is safe in this isolated
+    // child even though DaemonState has no sandbox parameter.
+    let state = Arc::new(
+        DaemonState::new(
+            vec![plugin],
+            paths.app_data.clone(),
+            "test".into(),
+            Some(paths.overrides.clone()),
+            Some(tx),
+        )
+        .with_enabled_auth_sources(serde_yaml::from_str("default: []").unwrap()),
+    );
+    let refresh_state = state.clone();
+    let refresh = tokio::spawn(async move { refresh_state.refresh(None).await });
+    let clear = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let ProviderWatchCommand::ClearProvider { provider_id, ack } = clear else {
+        panic!("expected clear before discovery");
+    };
+    assert_eq!(provider_id, "codex");
+    // Change the source only after ClearProvider was received. Its malformed
+    // provider block must be discovered, but the disabled descriptor never probes.
+    fs::write(&auth, r#"{"openai":null}"#).unwrap();
+    assert!(matches!(
+        rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    ack.send(()).unwrap();
+    let replace = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let ProviderWatchCommand::ReplaceProvider {
+        provider_id,
+        files,
+        ack,
+    } = replace
+    else {
+        panic!("expected replace after discovery");
+    };
+    assert_eq!(provider_id, "codex");
+    let expected: Vec<_> = [
+        ".local/share/opencode/auth.json",
+        ".local/share/opencode/accounts.json",
+        ".config/opencode/auth.json",
+        ".config/opencode/accounts.json",
+    ]
+    .iter()
+    .map(|p| paths.root.join(p))
+    .collect();
+    assert_eq!(files.len(), expected.len());
+    for path in expected {
+        let sub = files
+            .iter()
+            .find(|sub| sub.path == path)
+            .expect("candidate subscription");
+        assert_eq!(sub.existed_at_declaration, path.exists());
+    }
+    ack.send(()).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), refresh)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(state.cached(None).await.is_empty());
+    assert_eq!(fs::read_to_string(&auth).unwrap(), r#"{"openai":null}"#);
+    assert!(matches!(
+        rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1958,10 +2518,13 @@ const HARNESS_SCRIPT: &str = r#"
     requests: [],
     logs: [],
     subscriptions: [],
+    writes: [],
     readErrors: {},
+    usageBody: {rate_limit: {primary_window: {used_percent: 25, limit_window_seconds: 18000}}},
     responses: {
       usage: [],
-      refresh: []
+      refresh: [],
+      details: []
     },
     ccusageResult: { status: "no_runner" }
   };
@@ -2000,6 +2563,7 @@ const HARNESS_SCRIPT: &str = r#"
           return globalThis.__test_state.files[path];
         },
         writeText: function (path, text) {
+          globalThis.__test_state.writes.push(path);
           globalThis.__test_state.files[path] = String(text);
         },
         listDir: function () { return []; },
@@ -2033,17 +2597,24 @@ const HARNESS_SCRIPT: &str = r#"
             method: String(opts.method || "GET"),
             url: url,
             authorization: headers.Authorization || null,
-            accountId: headers["ChatGPT-Account-Id"] || null
+            accountId: headers["ChatGPT-Account-Id"] || null,
+            bodyText: opts.bodyText || null
           });
 
+          if (typeof globalThis.__test_state.onRequest === "function") {
+            globalThis.__test_state.onRequest(opts);
+          }
           var pool = url.indexOf("/oauth/token") !== -1
             ? globalThis.__test_state.responses.refresh
-            : globalThis.__test_state.responses.usage;
+            : url.indexOf("/rate-limit-reset-credits") !== -1
+              ? globalThis.__test_state.responses.details
+              : globalThis.__test_state.responses.usage;
           var resp = pool.length > 0 ? pool.shift() : null;
           if (!resp) {
             return { status: 500, headers: {}, bodyText: "{}" };
           }
 
+          if (resp.error) throw new Error(resp.error);
           var bodyText = typeof resp.bodyText === "string"
             ? resp.bodyText
             : JSON.stringify(resp.bodyText || {});
@@ -2146,7 +2717,11 @@ const ASSERTION_SCRIPT: &str = r#"
     subscriptions: state.subscriptions,
     requests: state.requests,
     files: state.files,
-    logs: state.logs
+    logs: state.logs,
+    writes: state.writes,
+    privateGlobals: ["routes", "OPENCODE_SOURCES", "isNonEmptyString", "discoverAccounts", "reloadCredentialFromRoute", "readProviderBlock", "probeFrame"].filter(function (name) {
+      return typeof globalThis[name] !== "undefined" || (0, eval)("typeof " + name) !== "undefined";
+    })
   });
 })();
 "#;

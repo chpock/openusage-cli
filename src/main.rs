@@ -987,100 +987,84 @@ async fn run_daemon_mode(
         log::info!("openusage-cli daemon listening on http://{}", bound_addr);
     }
     notify_systemd_status(runtime.service_mode, "starting HTTP server");
-    let lifecycle_reason_for_server = Arc::clone(&lifecycle_reason);
+    let shutdown = wait_for_daemon_shutdown(
+        shutdown_signal(),
+        lifecycle_rx,
+        Arc::clone(&lifecycle_reason),
+    );
+    let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::oneshot::channel();
     let server_task = tokio::spawn(async move {
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
-        .with_graceful_shutdown({
-            let lifecycle_reason = Arc::clone(&lifecycle_reason_for_server);
-            async move {
-                tokio::select! {
-                    _ = shutdown_signal() => {},
-                    command = lifecycle_rx => {
-                        match command {
-                            Ok(LifecycleCommand::Shutdown) => {
-                                lifecycle_reason.store(LIFECYCLE_SHUTDOWN, Ordering::Relaxed);
-                                log::info!("shutdown triggered via HTTP API");
-                            }
-                            Ok(LifecycleCommand::Restart) => {
-                                lifecycle_reason.store(LIFECYCLE_RESTART, Ordering::Relaxed);
-                                log::info!("restart triggered via HTTP API");
-                            }
-                            Err(_) => {
-                                log::warn!("lifecycle control channel closed before command was received");
-                            }
-                        }
-                    }
-                }
-            }
+        .with_graceful_shutdown(async move {
+            let _ = server_shutdown_rx.await;
         })
         .await
         .context("http server failed")
     });
 
-    if let Err(err) = wait_for_http_server_readiness(bound_addr).await {
-        server_task.abort();
-        let _ = server_task.await;
-        return Err(err).context("HTTP server did not become ready in time");
-    }
-    notify_systemd_status(
-        runtime.service_mode,
-        &format!("ready to serve requests on http://{}", bound_addr),
-    );
-    notify_systemd_ready(runtime.service_mode)
-        .context("failed to notify systemd that daemon startup completed")?;
-    let watchdog_task = spawn_systemd_watchdog_task(runtime.service_mode);
+    let mut watchdog_task = None;
+    let mut restart_watcher_handle = None;
+    let mut restart_dispatch_handle = None;
+    let mut monitor_dispatch_handle = None;
+    let on_ready = || {
+        notify_systemd_status(
+            runtime.service_mode,
+            &format!("ready to serve requests on http://{}", bound_addr),
+        );
+        notify_systemd_ready(runtime.service_mode)
+            .context("failed to notify systemd that daemon startup completed")?;
+        watchdog_task = spawn_systemd_watchdog_task(runtime.service_mode);
 
-    // --- Restart watcher (independent, always operational) ---
-    let (restart_action_tx, mut restart_action_rx) =
-        mpsc::unbounded_channel::<restart_watcher::WatchAction>();
+        // --- Restart watcher (independent, always operational) ---
+        let (restart_action_tx, mut restart_action_rx) =
+            mpsc::unbounded_channel::<restart_watcher::WatchAction>();
 
-    let restart_watcher_handle = match build_restart_watch_inputs(&runtime, &initialized)
-        .and_then(restart_watcher::build_restart_registration)
-        .and_then(|reg| restart_watcher::spawn_file_monitor(vec![reg], restart_action_tx))
-    {
-        Ok(handle) => {
-            log::info!("filesystem restart watcher enabled");
-            Some(handle)
-        }
-        Err(err) => {
-            log::warn!(
-                "filesystem restart watcher is unavailable; continuing without auto-restart-on-change: {}",
-                err
-            );
-            None
-        }
-    };
+        restart_watcher_handle = match build_restart_watch_inputs(&runtime, &initialized)
+            .and_then(restart_watcher::build_restart_registration)
+            .and_then(|reg| restart_watcher::spawn_file_monitor(vec![reg], restart_action_tx))
+        {
+            Ok(handle) => {
+                log::info!("filesystem restart watcher enabled");
+                Some(handle)
+            }
+            Err(err) => {
+                log::warn!(
+                    "filesystem restart watcher is unavailable; continuing without auto-restart-on-change: {}",
+                    err
+                );
+                None
+            }
+        };
 
-    // Restart dispatcher: immediate, independent — never blocked by refresh.
-    let restart_lifecycle_tx = Arc::clone(&lifecycle_tx);
-    let restart_dispatch_handle = tokio::spawn(async move {
-        while let Some(_action) = restart_action_rx.recv().await {
-            log::info!("daemon restart requested by filesystem watcher");
-            let mut tx_guard = restart_lifecycle_tx.lock().await;
-            if let Some(tx) = tx_guard.take() {
-                if tx.send(LifecycleCommand::Restart).is_err() {
+        // Restart dispatcher: immediate, independent — never blocked by refresh.
+        let restart_lifecycle_tx = Arc::clone(&lifecycle_tx);
+        restart_dispatch_handle = Some(tokio::spawn(async move {
+            while let Some(_action) = restart_action_rx.recv().await {
+                log::info!("daemon restart requested by filesystem watcher");
+                let mut tx_guard = restart_lifecycle_tx.lock().await;
+                if let Some(tx) = tx_guard.take() {
+                    if tx.send(LifecycleCommand::Restart).is_err() {
+                        log::warn!(
+                            "filesystem watcher could not trigger restart: lifecycle channel already closed"
+                        );
+                    }
+                } else {
                     log::warn!(
-                        "filesystem watcher could not trigger restart: lifecycle channel already closed"
+                        "filesystem watcher could not trigger restart: lifecycle command already requested"
                     );
                 }
-            } else {
-                log::warn!(
-                    "filesystem watcher could not trigger restart: lifecycle command already requested"
-                );
             }
-        }
-    });
+        }));
 
-    // --- Dynamic provider file-monitor dispatcher: owned refresh + drain ---
-    // Only spawned when the actor started successfully.
-    // Owns refresh execution inline (no detached child tasks). After each
-    // refresh, drains all queued ProvidersChanged events via try_recv, unions
-    // their IDs, and runs at most one follow-up refresh per drain cycle.
-    let monitor_dispatch_handle: Option<tokio::task::JoinHandle<()>> =
-        if let Some(mut monitor_event_rx) = monitor_event_rx {
+        // --- Dynamic provider file-monitor dispatcher: owned refresh + drain ---
+        // Only spawned when the actor started successfully.
+        // Owns refresh execution inline (no detached child tasks). After each
+        // refresh, drains all queued ProvidersChanged events via try_recv, unions
+        // their IDs, and runs at most one follow-up refresh per drain cycle.
+        monitor_dispatch_handle = if let Some(mut monitor_event_rx) = monitor_event_rx {
             let monitor_daemon = Arc::clone(&daemon);
             Some(tokio::spawn(async move {
                 let mut pending_ids: Vec<String> = Vec::new();
@@ -1139,11 +1123,17 @@ async fn run_daemon_mode(
             None
         };
 
-    log::debug!("waiting for shutdown signal");
-
-    let server_result = server_task
-        .await
-        .context("http server task failed to join")?;
+        log::debug!("waiting for shutdown signal");
+        Ok(())
+    };
+    let server_result = run_http_server_lifecycle(
+        server_task,
+        shutdown,
+        server_shutdown_tx,
+        wait_for_http_server_readiness(bound_addr),
+        on_ready,
+    )
+    .await;
 
     if let Some(task) = refresh_task {
         task.abort();
@@ -1178,13 +1168,15 @@ async fn run_daemon_mode(
         }
     }
 
-    restart_dispatch_handle.abort();
-    match restart_dispatch_handle.await {
-        Ok(()) => log::debug!("restart dispatch task exited"),
-        Err(err) if err.is_cancelled() => {
-            log::debug!("restart dispatch task cancelled during shutdown")
+    if let Some(task) = restart_dispatch_handle {
+        task.abort();
+        match task.await {
+            Ok(()) => log::debug!("restart dispatch task exited"),
+            Err(err) if err.is_cancelled() => {
+                log::debug!("restart dispatch task cancelled during shutdown")
+            }
+            Err(err) => log::warn!("restart dispatch task ended with error: {}", err),
         }
-        Err(err) => log::warn!("restart dispatch task ended with error: {}", err),
     }
 
     // --- Clean up provider file-monitor: dispatcher first, then actor ---
@@ -1239,6 +1231,63 @@ async fn run_daemon_mode(
     }
 
     Ok(RunOutcome::Completed)
+}
+
+async fn wait_for_daemon_shutdown(
+    signal: impl std::future::Future<Output = ()>,
+    lifecycle_rx: tokio::sync::oneshot::Receiver<LifecycleCommand>,
+    lifecycle_reason: Arc<AtomicU8>,
+) {
+    tokio::select! {
+        _ = signal => {},
+        command = lifecycle_rx => {
+            match command {
+                Ok(LifecycleCommand::Shutdown) => {
+                    lifecycle_reason.store(LIFECYCLE_SHUTDOWN, Ordering::Relaxed);
+                    log::info!("shutdown triggered via HTTP API");
+                }
+                Ok(LifecycleCommand::Restart) => {
+                    lifecycle_reason.store(LIFECYCLE_RESTART, Ordering::Relaxed);
+                    log::info!("restart triggered via HTTP API");
+                }
+                Err(_) => {
+                    log::warn!("lifecycle control channel closed before command was received");
+                }
+            }
+        }
+    }
+}
+
+async fn run_http_server_lifecycle(
+    mut server: tokio::task::JoinHandle<Result<()>>,
+    shutdown: impl std::future::Future<Output = ()>,
+    shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    readiness: impl std::future::Future<Output = Result<()>>,
+    on_ready: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    tokio::pin!(shutdown);
+    // Stop and server termination take precedence over a simultaneous health success.
+    // Readiness is dropped before graceful draining, which may outlive startup.
+    let startup = tokio::select! {
+        biased;
+        _ = &mut shutdown => None,
+        result = &mut server => return result.context("http server task failed to join")?,
+        result = readiness => Some(result.context("HTTP server did not become ready in time")),
+    };
+    if let Some(startup) = startup {
+        if let Err(err) = startup.and_then(|()| on_ready()) {
+            server.abort();
+            let _ = server.await;
+            return Err(err);
+        }
+        tokio::select! {
+            biased;
+            _ = shutdown => {},
+            result = &mut server => return result.context("http server task failed to join")?,
+        }
+    }
+    let _ = shutdown_tx.send(());
+    server.await.context("http server task failed to join")?
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3242,6 +3291,359 @@ mod tests {
         runtime.foreground = false;
         runtime.daemon_child = true;
         assert!(!should_spawn_daemon_parent(&runtime));
+    }
+
+    #[tokio::test]
+    async fn http_server_lifecycle_stop_before_readiness_is_not_startup_failure() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            shutdown_rx.await.expect("graceful shutdown requested");
+            let _ = closed_tx.send(());
+            Ok(())
+        });
+        let result = run_http_server_lifecycle(
+            server,
+            std::future::ready(()),
+            shutdown_tx,
+            async {
+                closed_rx.await.expect("listener closed");
+                Err(anyhow!("health endpoint closed during shutdown"))
+            },
+            || panic!("must not announce readiness during shutdown"),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "early stop must complete normally: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_server_lifecycle_cancels_readiness_before_graceful_drain_finishes() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let (stopping_tx, stopping_rx) = tokio::sync::oneshot::channel();
+        let (drain_tx, drain_rx) = tokio::sync::oneshot::channel();
+        let (readiness_drop_tx, mut readiness_drop_rx) = tokio::sync::oneshot::channel::<()>();
+        let (readiness_started_tx, readiness_started_rx) = tokio::sync::oneshot::channel();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            shutdown_rx.await.expect("graceful shutdown requested");
+            stopping_tx.send(()).expect("drain observer");
+            drain_rx.await.expect("release graceful drain");
+            Ok(())
+        });
+        let lifecycle = tokio::spawn(run_http_server_lifecycle(
+            server,
+            async {
+                stop_rx.await.expect("stop during readiness");
+            },
+            shutdown_tx,
+            async move {
+                let _drop_guard = readiness_drop_tx;
+                readiness_started_tx.send(()).expect("readiness observer");
+                std::future::pending::<Result<()>>().await
+            },
+            || panic!("early stop must not start ready-only tasks"),
+        ));
+        readiness_started_rx
+            .await
+            .expect("readiness probe in progress");
+        stop_tx
+            .send(())
+            .expect("request stop before readiness finishes");
+        stopping_rx.await.expect("server started graceful drain");
+        assert!(matches!(
+            readiness_drop_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+        assert!(
+            !lifecycle.is_finished(),
+            "must await graceful drain, not abort the server"
+        );
+        drain_tx.send(()).expect("release drain");
+        lifecycle
+            .await
+            .expect("lifecycle task")
+            .expect("clean stop");
+    }
+
+    #[tokio::test]
+    async fn http_server_lifecycle_stop_takes_precedence_over_health_success() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            shutdown_rx.await.expect("graceful shutdown requested");
+            Ok(())
+        });
+        run_http_server_lifecycle(
+            server,
+            std::future::ready(()),
+            shutdown_tx,
+            std::future::ready(Ok(())),
+            || panic!("simultaneous stop must not announce READY or start watchdog"),
+        )
+        .await
+        .expect("clean early stop");
+    }
+
+    #[tokio::test]
+    async fn http_server_lifecycle_announces_ready_only_after_health_success() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let ready_count = std::cell::Cell::new(0);
+        let server = tokio::spawn(async move {
+            shutdown_rx.await.expect("graceful shutdown requested");
+            Ok(())
+        });
+        let lifecycle = run_http_server_lifecycle(
+            server,
+            async {
+                stop_rx.await.expect("stop request");
+            },
+            shutdown_tx,
+            async { ready_rx.await.expect("health result") },
+            || {
+                ready_count.set(ready_count.get() + 1);
+                Ok(())
+            },
+        );
+        tokio::pin!(lifecycle);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(lifecycle.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(ready_count.get(), 0);
+        ready_tx.send(Ok(())).expect("deliver health success");
+        assert!(matches!(lifecycle.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(ready_count.get(), 1);
+        stop_tx.send(()).expect("deliver stop");
+        lifecycle.await.expect("normal ready then stop");
+        assert_eq!(ready_count.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn http_server_lifecycle_preserves_startup_and_ready_notification_errors() {
+        for (readiness_error, notification_error) in [
+            (Some("failed to create readiness probe HTTP client"), None),
+            (
+                Some("timeout waiting for health endpoint during daemon startup"),
+                None,
+            ),
+            (
+                None,
+                Some("failed to notify systemd that daemon startup completed"),
+            ),
+        ] {
+            let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(std::future::pending::<Result<()>>());
+            let server_abort = server.abort_handle();
+            let result = run_http_server_lifecycle(
+                server,
+                std::future::pending(),
+                shutdown_tx,
+                std::future::ready(match readiness_error {
+                    Some(message) => Err(anyhow!(message)),
+                    None => Ok(()),
+                }),
+                || {
+                    assert!(
+                        readiness_error.is_none(),
+                        "startup failure must not announce ready"
+                    );
+                    Err(anyhow!(notification_error.expect("notification error")))
+                },
+            )
+            .await
+            .expect_err("genuine startup failure");
+            assert!(
+                format!("{result:#}").contains(readiness_error.or(notification_error).unwrap())
+            );
+            assert!(
+                server_abort.is_finished(),
+                "failed startup must join the aborted server"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn http_server_lifecycle_preserves_serve_and_join_failures_before_readiness() {
+        for join_failure in [false, true] {
+            let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
+            let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let _ = finished_tx.send(());
+                if join_failure {
+                    panic!("synthetic server task panic");
+                }
+                Err(anyhow!("http server failed: synthetic serve error"))
+            });
+            // This current-thread task sends and returns/panics in one poll.
+            finished_rx.await.expect("server reached termination");
+            assert!(server.is_finished());
+            let result = run_http_server_lifecycle(
+                server,
+                std::future::pending(),
+                shutdown_tx,
+                std::future::ready(Ok(())),
+                || panic!("terminated server must not announce readiness"),
+            )
+            .await
+            .expect_err("server failure must survive startup coordination");
+            let message = format!("{result:#}");
+            assert!(
+                message.contains(if join_failure {
+                    "http server task failed to join"
+                } else {
+                    "synthetic serve error"
+                }),
+                "{message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn http_server_lifecycle_preserves_serve_and_join_failures_after_readiness() {
+        for join_failure in [false, true] {
+            let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
+            let (fail_tx, fail_rx) = tokio::sync::oneshot::channel();
+            let ready_count = std::cell::Cell::new(0);
+            let server = tokio::spawn(async move {
+                fail_rx.await.expect("fail after readiness");
+                if join_failure {
+                    panic!("synthetic server task panic after readiness");
+                }
+                Err(anyhow!("http server failed after readiness"))
+            });
+            let result = run_http_server_lifecycle(
+                server,
+                std::future::pending(),
+                shutdown_tx,
+                std::future::ready(Ok(())),
+                || {
+                    ready_count.set(ready_count.get() + 1);
+                    fail_tx.send(()).expect("release failure");
+                    Ok(())
+                },
+            )
+            .await
+            .expect_err("server failure after readiness");
+            assert_eq!(ready_count.get(), 1);
+            assert!(format!("{result:#}").contains(if join_failure {
+                "http server task failed to join"
+            } else {
+                "http server failed after readiness"
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn http_server_lifecycle_preserves_server_failure_during_early_stop() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            shutdown_rx.await.expect("graceful shutdown requested");
+            Err(anyhow!("http server failed during drain"))
+        });
+        let result = run_http_server_lifecycle(
+            server,
+            std::future::ready(()),
+            shutdown_tx,
+            std::future::pending(),
+            || panic!("must not announce readiness"),
+        )
+        .await
+        .expect_err("early stop must not mask serve errors");
+        assert_eq!(result.to_string(), "http server failed during drain");
+    }
+
+    #[tokio::test]
+    async fn http_server_lifecycle_early_signal_shutdown_and_restart_keep_distinct_reasons() {
+        for (command, expected_reason) in [
+            (None, LIFECYCLE_NONE),
+            (Some(LifecycleCommand::Shutdown), LIFECYCLE_SHUTDOWN),
+            (Some(LifecycleCommand::Restart), LIFECYCLE_RESTART),
+        ] {
+            let (command_tx, command_rx) = tokio::sync::oneshot::channel();
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+            let lifecycle_reason = Arc::new(AtomicU8::new(LIFECYCLE_NONE));
+            let is_signal = command.is_none();
+            if let Some(command) = command {
+                command_tx
+                    .send(command)
+                    .expect("queue HTTP lifecycle command");
+            }
+            let shutdown = wait_for_daemon_shutdown(
+                async {
+                    if !is_signal {
+                        std::future::pending::<()>().await;
+                    }
+                },
+                command_rx,
+                Arc::clone(&lifecycle_reason),
+            );
+            let server = tokio::spawn(async move {
+                shutdown_rx.await.expect("graceful shutdown requested");
+                Ok(())
+            });
+            run_http_server_lifecycle(
+                server,
+                shutdown,
+                shutdown_tx,
+                std::future::pending(),
+                || panic!("early lifecycle request must not announce ready"),
+            )
+            .await
+            .expect("clean early lifecycle request");
+            let reason = lifecycle_reason.load(Ordering::Relaxed);
+            assert_eq!(reason, expected_reason);
+            assert_eq!(
+                systemd_exit_notify_for_lifecycle(reason),
+                if reason == LIFECYCLE_RESTART {
+                    SystemdExitNotify::Reloading
+                } else {
+                    SystemdExitNotify::Stopping
+                }
+            );
+            for mode in [ServiceMode::Standalone, ServiceMode::Systemd] {
+                if reason == LIFECYCLE_RESTART {
+                    assert_eq!(
+                        restart_outcome_for_service_mode(mode),
+                        RunOutcome::RestartSelf
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn http_server_lifecycle_keeps_ordinary_readiness_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind unavailable health endpoint");
+        let addr = listener.local_addr().expect("bound address");
+        let app = axum::Router::new().route(
+            "/health",
+            axum::routing::get(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+        );
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .context("http server failed")
+        });
+        let result = run_http_server_lifecycle(
+            server,
+            std::future::pending(),
+            shutdown_tx,
+            wait_for_http_server_readiness(addr),
+            || panic!("unhealthy server must not announce readiness"),
+        )
+        .await
+        .expect_err("ordinary readiness timeout");
+        assert!(format!("{result:#}").contains("timeout waiting for health endpoint"));
     }
 
     #[test]

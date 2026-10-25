@@ -262,3 +262,38 @@ Invalid descriptors produce a visible error at startup:
 Each valid entry installs the named `with` function as the `discoverAccounts`
 replacement. The callback receives `(ctx, originalDiscoverAccounts)` — matching
 the existing override contract.
+
+## Bundled monetary corrections
+
+The OpenRouter override corrects monetary text to use the API's USD major units.
+It preserves native progress values, credential precedence, requests and failures.
+The shared `ctx.fmt.dollars` helper still accepts cents; its contract is unchanged.
+
+The DeepSeek override preserves USD preference when both USD and CNY balances are
+available. A CNY-only result uses `format: {kind: "currency", currency: "CNY"}`;
+USD keeps `format: {kind: "dollars"}`. Amounts are not converted or rescaled.
+`DEEPSEEK_INITIAL_BALANCE` must be the starting balance in the same currency as
+the selected API balance. It is not an exchange-rate or USD-equivalent setting.
+Currency selection is reset for each probe, including after failures, and does
+not alter unrelated USD metrics or account/source routing.
+
+These corrections target the pinned native plugin functions without modifying
+vendored files. See the [JSON output reference](json-output.md#progress-formats-and-units) for
+serialized currency units and [the update report](crossusage-updates/v1.6.1.md)
+for the originating upstream defects and validation boundaries.
+
+## Upstream repair maintenance
+
+Temporary corrections to native plugin defects are recorded in the
+[upstream plugin workaround register](upstream-plugin-workarounds.md). Each entry
+identifies the verified defective revision, root cause, local interception points,
+behavioral regressions and conditions for removing the correction after an
+upstream fix. Read that register during every plugin update and before deleting
+an override or one of its callbacks.
+
+Not every override is temporary. Codex and Copilot also implement first-party
+OpenCode multi-account behavior. A native bug fix does not justify removing
+those features. Prove corrected native behavior with only the relevant repair
+disabled, retain the regression, and record the verified-good upstream revision
+and removal disposition. Passing tests with the repair enabled is not evidence
+that upstream fixed the defect.

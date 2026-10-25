@@ -141,7 +141,18 @@ fn load_single_plugin(
 
     let icon_file = plugin_dir.join(&manifest.icon);
     let icon_bytes = std::fs::read(&icon_file)?;
-    let icon_data_url = format!("data:image/svg+xml;base64,{}", STANDARD.encode(&icon_bytes));
+    let extension = icon_file
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mime = match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        _ => "image/svg+xml",
+    };
+    let icon_data_url = format!("data:{mime};base64,{}", STANDARD.encode(&icon_bytes));
 
     Ok(LoadedPlugin {
         manifest,
@@ -186,6 +197,44 @@ mod tests {
 
     fn parse_manifest(json: &str) -> PluginManifest {
         serde_json::from_str::<PluginManifest>(json).expect("manifest parse failed")
+    }
+
+    #[test]
+    fn loaded_icons_preserve_supported_mime_and_bytes() {
+        for (extension, mime) in [
+            ("svg", "image/svg+xml"),
+            ("png", "image/png"),
+            ("PNG", "image/png"),
+            ("jpg", "image/jpeg"),
+            ("jpeg", "image/jpeg"),
+            ("webp", "image/webp"),
+        ] {
+            let dir = tempfile::tempdir().expect("create plugin fixture");
+            let icon = format!("icon.{extension}");
+            let bytes = b"\x00\x01\xfffixture icon bytes";
+            std::fs::write(dir.path().join(&icon), bytes).expect("write icon fixture");
+            std::fs::write(
+                dir.path().join("plugin.js"),
+                "globalThis.__openusage_plugin = {};",
+            )
+            .expect("write entry fixture");
+            std::fs::write(
+                dir.path().join("plugin.json"),
+                serde_json::json!({
+                    "schemaVersion": 1, "id": "fixture", "name": "Fixture",
+                    "version": "0.0.0", "entry": "plugin.js", "icon": icon,
+                    "lines": []
+                })
+                .to_string(),
+            )
+            .expect("write manifest fixture");
+            let loaded = load_single_plugin(dir.path()).expect("load plugin fixture");
+            assert_eq!(
+                loaded.icon_data_url,
+                format!("data:{mime};base64,{}", STANDARD.encode(bytes)),
+                "icon MIME for {extension}"
+            );
+        }
     }
 
     #[test]
