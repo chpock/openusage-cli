@@ -37,6 +37,24 @@ export const makeCtx = () => {
           }
           return Array.from(out).sort()
         },
+        firstExisting: (paths) => {
+          for (const path of paths || []) {
+            if (files.has(path)) return path
+          }
+          return null
+        },
+        firstExistingAppSupport: (relative) => {
+          const rel = String(relative || "").replace(/^\/+/, "")
+          const candidates = [
+            `~/.config/${rel}`,
+            `~/Library/Application Support/${rel}`,
+            `~/AppData/Roaming/${rel}`,
+          ]
+          for (const path of candidates) {
+            if (files.has(path)) return path
+          }
+          return null
+        },
       },
       env: {
         get: vi.fn(() => null),
@@ -45,6 +63,7 @@ export const makeCtx = () => {
         readGenericPassword: vi.fn(),
         readGenericPasswordForCurrentUser: vi.fn(),
         writeGenericPassword: vi.fn(),
+        writeGenericPasswordForAccount: vi.fn(),
         writeGenericPasswordForCurrentUser: vi.fn(),
         deleteGenericPassword: vi.fn(),
       },
@@ -68,19 +87,57 @@ export const makeCtx = () => {
           const tag = cipher.getAuthTag()
           return `${iv.toString("base64")}:${tag.toString("base64")}:${ciphertext.toString("base64")}`
         }),
+        sha256Hex: vi.fn((text) => crypto.createHash("sha256").update(String(text)).digest("hex")),
+        sha1Hex: vi.fn((text) => crypto.createHash("sha1").update(String(text)).digest("hex")),
       },
       sqlite: {
         query: vi.fn(() => "[]"),
         exec: vi.fn(),
       },
+      chromiumCookies: {
+        read: vi.fn(() => ({})),
+      },
       http: {
         request: vi.fn(),
+      },
+      credentials: {
+        get: vi.fn(() => null),
+        update: vi.fn(),
       },
       ls: {
         discover: vi.fn(() => null),
       },
       ccusage: {
         query: vi.fn(() => null),
+      },
+      usageDaily: {
+        ingest: vi.fn(),
+      },
+      cursorLogs: {
+        queryDaily: vi.fn(() => ({ status: "no_data", data: { daily: [] } })),
+      },
+      claudeLogs: {
+        queryDaily: vi.fn(() => ({ status: "no_data", data: { daily: [] } })),
+      },
+      codexLogs: {
+        queryDaily: vi.fn(() => ({ status: "no_data", data: { daily: [] } })),
+      },
+      antigravityLogs: {
+        queryDaily: vi.fn(() => ({ status: "no_data", data: { daily: [] } })),
+      },
+      grokLogs: {
+        queryDaily: vi.fn(() => ({ status: "no_data", data: { daily: [] } })),
+      },
+      cursorPaths: {
+        resolveStateDb: vi.fn(() => null),
+      },
+      cursorUsageExport: {
+        queryMtd: vi.fn(() => ({ status: "no_data" })),
+        queryStats: vi.fn(() => ({ status: "no_data" })),
+        queryDaily: vi.fn(() => ({ status: "no_data", data: { daily: [] } })),
+      },
+      fireworks: {
+        exportBillingMetrics: vi.fn(() => ({ status: "unavailable" })),
       },
       log: {
         trace: vi.fn(),
@@ -97,6 +154,10 @@ export const makeCtx = () => {
       const line = { type: "text", label: opts.label, value: opts.value }
       if (opts.color) line.color = opts.color
       if (opts.subtitle) line.subtitle = opts.subtitle
+      if (opts.modelBreakdown) line.modelBreakdown = opts.modelBreakdown
+      if (opts.statusDot) line.statusDot = opts.statusDot
+      if (opts.expiryTooltip) line.expiryTooltip = opts.expiryTooltip
+      if (opts.resetCreditExpiries) line.resetCreditExpiries = opts.resetCreditExpiries
       return line
     },
     progress: (opts) => {
@@ -104,12 +165,19 @@ export const makeCtx = () => {
       if (opts.resetsAt) line.resetsAt = opts.resetsAt
       if (opts.periodDurationMs) line.periodDurationMs = opts.periodDurationMs
       if (opts.color) line.color = opts.color
+      if (opts.sessionStartSignal) line.sessionStartSignal = opts.sessionStartSignal
       return line
     },
     badge: (opts) => {
       const line = { type: "badge", label: opts.label, text: opts.text }
       if (opts.color) line.color = opts.color
       if (opts.subtitle) line.subtitle = opts.subtitle
+      return line
+    },
+    barChart: (opts) => {
+      const line = { type: "barChart", label: opts.label, points: opts.points || [] }
+      if (opts.note) line.note = opts.note
+      if (opts.color) line.color = opts.color
       return line
     },
   }
@@ -198,7 +266,7 @@ export const makeCtx = () => {
   ctx.util = {
     tryParseJson: (text) => {
       if (text === null || text === undefined) return null
-      const trimmed = String(text).trim()
+      const trimmed = String(text).replace(/^\uFEFF/, "").trim()
       if (!trimmed) return null
       try {
         return JSON.parse(trimmed)
@@ -208,7 +276,7 @@ export const makeCtx = () => {
     },
     safeJsonParse: (text) => {
       if (text === null || text === undefined) return { ok: false }
-      const trimmed = String(text).trim()
+      const trimmed = String(text).replace(/^\uFEFF/, "").trim()
       if (!trimmed) return { ok: false }
       try {
         return { ok: true, value: JSON.parse(trimmed) }

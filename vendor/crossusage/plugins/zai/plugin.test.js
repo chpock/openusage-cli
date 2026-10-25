@@ -98,6 +98,35 @@ const QUOTA_RESPONSE_NO_TIME_LIMIT = {
   },
 }
 
+const QUOTA_RESPONSE_CREDIT_LIMIT = {
+  code: 200,
+  data: {
+    level: "lite",
+    limits: [
+      {
+        type: "CREDIT_LIMIT",
+        unit: 3,
+        number: 5,
+        usage: 2000,
+        currentValue: 8,
+        remaining: 1991,
+        percentage: 1,
+        nextResetTime: 1790069319040,
+      },
+      {
+        type: "CREDIT_LIMIT",
+        unit: 6,
+        number: 1,
+        usage: 10000,
+        currentValue: 7031,
+        remaining: 2968,
+        percentage: 70,
+        nextResetTime: 1790234556979,
+      },
+    ],
+  },
+}
+
 const SUBSCRIPTION_RESPONSE = {
   data: [{ productName: "GLM Coding Max", nextRenewTime: "2026-03-12" }],
 }
@@ -393,7 +422,7 @@ describe("zai plugin", () => {
     expect(result.lines.find((l) => l.label === "Session")).toBeTruthy()
   })
 
-  it("supports quota payloads where limits are top-level and optional fields are non-numeric", async () => {
+  it("supports quota payloads where limits are top-level and numeric strings are accepted", async () => {
     const ctx = makeCtx()
     mockEnvWithKey(ctx, "test-key")
     ctx.host.http.request.mockImplementation((opts) => {
@@ -413,9 +442,59 @@ describe("zai plugin", () => {
     const result = plugin.probe(ctx)
     const session = result.lines.find((l) => l.label === "Session")
     const web = result.lines.find((l) => l.label === "Web Searches")
-    expect(session.used).toBe(0)
-    expect(web.used).toBe(0)
-    expect(web.limit).toBe(0)
+    expect(session.used).toBe(10)
+    expect(web.used).toBe(1095)
+    expect(web.limit).toBe(4000)
+  })
+
+  it("rejects malformed quota values instead of coercing to zero", async () => {
+    const cases = [
+      { data: { limits: [{ type: "TOKENS_LIMIT", unit: 3, number: 5 }] } },
+      { data: { limits: [{ type: "TOKENS_LIMIT", unit: 3, number: 5, percentage: true }] } },
+      { data: { limits: [{ type: "TIME_LIMIT", usage: 1000 }] } },
+      { data: { limits: [{ type: "TIME_LIMIT", currentValue: 10 }] } },
+      { data: { limits: [{ type: "TIME_LIMIT", currentValue: -1, usage: 1000 }] } },
+    ]
+
+    for (const body of cases) {
+      const ctx = makeCtx()
+      mockEnvWithKey(ctx, "test-key")
+      ctx.host.http.request.mockImplementation((opts) => {
+        if (opts.url.includes("subscription")) {
+          return { status: 200, bodyText: JSON.stringify(SUBSCRIPTION_RESPONSE) }
+        }
+        return { status: 200, bodyText: JSON.stringify(body) }
+      })
+      const plugin = await loadPlugin()
+      expect(() => plugin.probe(ctx)).toThrow("Usage response invalid")
+    }
+  })
+
+  it("rejects malformed quota envelopes but allows explicit empty limits", async () => {
+    for (const body of [{ data: [] }, { data: {} }, { data: { limits: {} } }]) {
+      const ctx = makeCtx()
+      mockEnvWithKey(ctx, "test-key")
+      ctx.host.http.request.mockImplementation((opts) => {
+        if (opts.url.includes("subscription")) {
+          return { status: 200, bodyText: JSON.stringify(SUBSCRIPTION_RESPONSE) }
+        }
+        return { status: 200, bodyText: JSON.stringify(body) }
+      })
+      const plugin = await loadPlugin()
+      expect(() => plugin.probe(ctx)).toThrow("Usage response invalid")
+    }
+
+    const ctx = makeCtx()
+    mockEnvWithKey(ctx, "test-key")
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (opts.url.includes("subscription")) {
+        return { status: 200, bodyText: JSON.stringify(SUBSCRIPTION_RESPONSE) }
+      }
+      return { status: 200, bodyText: JSON.stringify({ data: { limits: [] } }) }
+    })
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    expect(result.lines[0].text).toBe("No usage data")
   })
 
   it("shows no-usage badge when token limit entry is missing", async () => {
@@ -425,7 +504,12 @@ describe("zai plugin", () => {
       if (opts.url.includes("subscription")) {
         return { status: 200, bodyText: JSON.stringify(SUBSCRIPTION_RESPONSE) }
       }
-      return { status: 200, bodyText: JSON.stringify({ data: { limits: [{ type: "TIME_LIMIT", usage: 10 }] } }) }
+      return {
+        status: 200,
+        bodyText: JSON.stringify({
+          data: { limits: [{ type: "FUTURE_LIMIT" }, { type: "TOKENS_LIMIT", unit: 99, number: 1, percentage: 70 }] },
+        }),
+      }
     })
 
     const plugin = await loadPlugin()
@@ -528,4 +612,69 @@ describe("zai plugin", () => {
     expect(weekly.used).toBe(75)
     expect(weekly.resetsAt).toBe(new Date(1738972800000).toISOString())
   })
+  it("renders Session and Weekly from CREDIT_LIMIT entries when TOKENS_LIMIT is absent", async () => {
+    const ctx = makeCtx()
+    mockEnvWithKey(ctx, "test-key")
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (opts.url.includes("subscription")) {
+        return { status: 200, bodyText: JSON.stringify(SUBSCRIPTION_RESPONSE) }
+      }
+      return { status: 200, bodyText: JSON.stringify(QUOTA_RESPONSE_CREDIT_LIMIT) }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    const session = result.lines.find((l) => l.label === "Session")
+    const weekly = result.lines.find((l) => l.label === "Weekly")
+    expect(session).toBeTruthy()
+    expect(session.type).toBe("progress")
+    expect(session.used).toBe(1)
+    expect(session.limit).toBe(100)
+    expect(session.format).toEqual({ kind: "percent" })
+    expect(session.periodDurationMs).toBe(5 * 60 * 60 * 1000)
+    expect(session.resetsAt).toBe(new Date(1790069319040).toISOString())
+    expect(weekly).toBeTruthy()
+    expect(weekly.used).toBe(70)
+    expect(weekly.periodDurationMs).toBe(7 * 24 * 60 * 60 * 1000)
+    expect(weekly.resetsAt).toBe(new Date(1790234556979).toISOString())
+  })
+
+  it("prefers TOKENS_LIMIT over CREDIT_LIMIT when both types are present", async () => {
+    const ctx = makeCtx()
+    mockEnvWithKey(ctx, "test-key")
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (opts.url.includes("subscription")) {
+        return { status: 200, bodyText: JSON.stringify(SUBSCRIPTION_RESPONSE) }
+      }
+      return {
+        status: 200,
+        bodyText: JSON.stringify({
+          code: 200,
+          data: {
+            limits: [
+              QUOTA_RESPONSE_CREDIT_LIMIT.data.limits[0],
+              QUOTA_RESPONSE_CREDIT_LIMIT.data.limits[1],
+              {
+                type: "TOKENS_LIMIT",
+                usage: 800000000,
+                currentValue: 1900000,
+                percentage: 42,
+                nextResetTime: 1738368000000,
+                unit: 3,
+                number: 5,
+              },
+            ],
+          },
+        }),
+      }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    const session = result.lines.find((l) => l.label === "Session")
+    expect(session).toBeTruthy()
+    expect(session.used).toBe(42)
+    expect(session.resetsAt).toBe(new Date(1738368000000).toISOString())
+  })
 })
+

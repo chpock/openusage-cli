@@ -174,7 +174,24 @@
     return null
   }
 
+  function loadAuthFromProviderAccount(ctx) {
+    const credential = ctx.util.readProviderCredential && ctx.util.readProviderCredential()
+    if (!credential || (!credential.accessToken && !credential.refreshToken)) return null
+    const auth = normalizeAuthPayload(
+      {
+        accessToken: credential.accessToken,
+        refreshToken: credential.refreshToken,
+      },
+      { allowPartial: true },
+    )
+    if (!auth) return null
+    return { auth, authPath: null, source: "provider-account" }
+  }
+
   function loadAuth(ctx) {
+    const providerAuth = loadAuthFromProviderAccount(ctx)
+    if (providerAuth) return providerAuth
+
     const fileAuth = loadAuthFromFiles(ctx)
     if (fileAuth) return fileAuth
 
@@ -227,6 +244,13 @@
         ctx.host.keychain.writeGenericPassword(authState.keychainService, JSON.stringify(auth))
         ctx.host.log.info("auth keychain item updated: " + authState.keychainService)
         return true
+      }
+
+      if (authState.source === "provider-account") {
+        return ctx.util.writeProviderCredential({
+          accessToken: auth.access_token || null,
+          refreshToken: auth.refresh_token || null,
+        })
       }
 
       ctx.host.log.warn("auth persistence skipped: unsupported source")
@@ -314,7 +338,7 @@
   }
 
   function fetchUsage(ctx, accessToken) {
-    return ctx.util.request({
+    var resp = ctx.util.request({
       method: "POST",
       url: USAGE_URL,
       headers: {
@@ -326,6 +350,20 @@
       bodyText: JSON.stringify({ useCache: true }),
       timeoutMs: 10000,
     })
+    if (resp.status === 405) {
+      ctx.host.log.info("POST returned 405, retrying with GET")
+      resp = ctx.util.request({
+        method: "GET",
+        url: USAGE_URL,
+        headers: {
+          Authorization: "Bearer " + accessToken,
+          Accept: "application/json",
+          "User-Agent": "OpenUsage",
+        },
+        timeoutMs: 10000,
+      })
+    }
+    return resp
   }
 
   function probe(ctx) {

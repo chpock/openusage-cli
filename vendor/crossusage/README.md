@@ -1,102 +1,137 @@
-# Track all your AI coding subscriptions in one place
+# CrossUsage
 
-See your usage at a glance from your menu bar. No digging through dashboards.
+Menu-bar app for AI coding subscription usage — one panel, progress bars, no dashboard digging.
 
-![OpenUsage Screenshot](screenshot.png)
+**Fork of [OpenUsage](https://github.com/robinebers/openusage)** by [Robin Ebers](https://github.com/robinebers). Credit the upstream project when you share or redistribute this work. This repo is the **Tauri app for Linux and Windows**. Upstream **0.7+** is a **Swift native macOS** app — use [upstream releases](https://github.com/robinebers/openusage/releases/latest) for macOS GUI. Maintainer porting notes: [docs/FORK-UPSTREAM.md](docs/FORK-UPSTREAM.md).
+
+| | |
+|---|---|
+| **Releases** | [github.com/barramee27/crossusage/releases](https://github.com/barramee27/crossusage/releases/latest) |
+| **Upstream** | [github.com/robinebers/openusage](https://github.com/robinebers/openusage) |
+| **Site** | [crossusage.dev](https://crossusage.dev) |
+
+**Versioning:** CrossUsage uses **`MAJOR.MINOR.PATCH`** (e.g. `1.0.10`). See [docs/VERSIONING.md](docs/VERSIONING.md) for when to bump each part. Upstream OpenUsage `0.6.x` is tracked in the changelog only, not in our app version.
+
+![CrossUsage on Linux — Modern Dashboard, Classic Overview, and Provider Detail](screenshot.png)
 
 ## Download
 
-[**Download the latest release**](https://github.com/robinebers/openusage/releases/latest) (macOS, Apple Silicon & Intel)
+Pick assets from the [latest release](https://github.com/barramee27/crossusage/releases/latest):
 
-The app auto-updates. Install once and you're set.
+| Platform | Typical files |
+|----------|----------------|
+| **Windows** | `*_x64-setup.exe` (installer), `*_windows_amd64_onefile.exe` (portable) |
+| **Linux** | `*_amd64.deb`, AppImage, or RPM |
+| **macOS GUI** | [OpenUsage](https://github.com/robinebers/openusage/releases/latest) |
+| **macOS / Linux CLI** | `crossusage-cli_*_….tar.gz` (see [Install](#install)) |
 
-## What It Does
+Desktop packages include **`crossusage-cli`** when built with the CLI sidecar.
 
-OpenUsage lives in your menu bar and shows you how much of your AI coding subscriptions you've used. Progress bars, badges, and clear labels. No mental math required.
+## Install
 
-- **One glance.** All your AI tools, one panel.
-- **Always up-to-date.** Refreshes automatically on a schedule you pick.
-- **Global shortcut.** Toggle the panel from anywhere with a customizable keyboard shortcut.
-- **Lightweight.** Opens instantly, stays out of your way.
-- **Plugin-based.** New providers get added without updating the whole app.
-- **[Local HTTP API](docs/local-http-api.md).** Other apps can read your usage data from `127.0.0.1:6736`.
-- **[Proxy support](docs/proxy.md).** Route provider HTTP requests through a SOCKS5 or HTTP proxy.
+**Linux / macOS** (`install.sh` — same command on both)
 
-## Supported Providers
+```bash
+# Linux: desktop (.deb / AppImage / RPM) + CLI when the package includes it
+curl -fsSL https://raw.githubusercontent.com/barramee27/crossusage/feat/linux-windows-native-support/scripts/install.sh | bash
 
-- [**Amp**](docs/providers/amp.md) / free tier, bonus, credits
-- [**Antigravity**](docs/providers/antigravity.md) / all models
-- [**Claude**](docs/providers/claude.md) / session, weekly, peak/off-peak, extra usage, local token usage (ccusage)
-- [**Codex**](docs/providers/codex.md) / session, weekly, reviews, credits
-- [**Copilot**](docs/providers/copilot.md) / premium, chat, completions
-- [**Cursor**](docs/providers/cursor.md) / credits, total usage, auto usage, API usage, on-demand, CLI auth
-- [**Factory / Droid**](docs/providers/factory.md) / standard, premium tokens
-- [**Gemini**](docs/providers/gemini.md) / pro, flash, workspace/free/paid tier
-- [**JetBrains AI Assistant**](docs/providers/jetbrains-ai-assistant.md) / quota, remaining
-- [**Kiro**](docs/providers/kiro.md) / credits, bonus credits, overages
-- [**Kimi Code**](docs/providers/kimi.md) / session, weekly
-- [**MiniMax**](docs/providers/minimax.md) / coding plan session
-- [**OpenCode Go**](docs/providers/opencode-go.md) / 5h, weekly, monthly spend limits
-- [**Windsurf**](docs/providers/windsurf.md) / prompt credits, flex credits
-- [**Z.ai**](docs/providers/zai.md) / session, weekly, web searches
+# macOS: CLI only (no desktop .dmg in this fork — GUI → upstream OpenUsage)
+curl -fsSL https://raw.githubusercontent.com/barramee27/crossusage/feat/linux-windows-native-support/scripts/install.sh | INSTALL_MODE=cli bash
+```
 
-Community contributions welcome.
+**Windows** (PowerShell)
 
-Want a provider that's not listed? [Open an issue.](https://github.com/robinebers/openusage/issues/new)
+```powershell
+irm https://raw.githubusercontent.com/barramee27/crossusage/feat/linux-windows-native-support/scripts/install.ps1 | iex
+```
 
-## Open Source, Community Driven
+Linux **CLI-only** without a desktop package: add `INSTALL_MODE=cli` to the first command. Details: **[INSTALL.md](INSTALL.md)**.
 
-OpenUsage is built by its users. Hundreds of people use it daily, and the project grows through community contributions: new providers, bug fixes, and ideas.
+## What you get
 
-I maintain the project as a guide and quality gatekeeper, but this is your app as much as mine. If something is missing or broken, the best way to get it fixed is to contribute by opening an issue, or submitting a PR.
+- Tray panel with usage bars, badges, and refresh on a schedule you choose
+- **Classic or Modern UI** — pick at first run or in Settings → Appearance; same providers in both ([0.7 port spec](docs/OPENUSAGE-0.7-UI-SPEC.md))
+- Global shortcut to show/hide the panel
+- Plugin-based providers (ship updates without rebuilding core logic)
+- Optional **local usage history** (Settings → *Usage history*, SQLite on disk only)
+- **Usage insights** on the home panel (pace warnings, tightest quota, next reset, 7-day rollup when history is enabled)
+- **Pace burn-rate alerts** for primary quota lines (Settings → Usage Alerts)
+- **Cursor billing usage table** on provider detail (`usage-stats` / cstats parity)
+- **History CSV export** and `GET /v1/history/*` on the local API (with usage history enabled)
+- **[Local HTTP API](docs/local-http-api.md)** on `127.0.0.1:6736` while the app runs
+- Optional **[HTTP/SOCKS proxy](docs/proxy.md)** via `~/.crossusage/config.json`
 
-Plugins are currently bundled as we build our the API, but soon will be made flexible so you can build and load their own.
+## Providers
 
-<a href="https://www.star-history.com/?repos=robinebers%2Fopenusage&type=date&legend=top-left">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=robinebers/openusage&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=robinebers/openusage&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=robinebers/openusage&type=date&legend=top-left" />
- </picture>
-</a>
+- **Multi-account for all providers** — add Work/personal rows per provider in Settings (API keys + OAuth); credentials encrypted at rest. See **[multi-account credentials](docs/providers/multi-account-credentials.md)**.
 
-### How to Contribute
+| Provider | Docs |
+|----------|------|
+| Amp | [amp](docs/providers/amp.md) |
+| Antigravity / Antigravity CLI / Antigravity IDE | [antigravity](docs/providers/antigravity.md) · [cli](docs/providers/antigravity-cli.md) · [ide](docs/providers/antigravity-ide.md) |
+| Claude | [claude](docs/providers/claude.md) |
+| Codex | [codex](docs/providers/codex.md) |
+| Command Code | [command-code](docs/providers/command-code.md) |
+| Copilot | [copilot](docs/providers/copilot.md) |
+| CrofAI | [crofai](docs/providers/crofai.md) |
+| Cursor | [cursor](docs/providers/cursor.md) |
+| Cursor Nightly | [cursor](docs/providers/cursor.md) (separate install at `~/.config/Cursor Nightly` on Linux) |
+| DeepSeek | [deepseek](docs/providers/deepseek.md) |
+| Factory / Droid | [factory](docs/providers/factory.md) |
+| Fireworks AI | [fireworks-ai](docs/providers/fireworks-ai.md) |
+| Gemini Apps | [gemini-apps](docs/providers/gemini-apps.md) |
+| Grok | [grok](docs/providers/grok.md) |
+| JetBrains AI Assistant | [jetbrains-ai-assistant](docs/providers/jetbrains-ai-assistant.md) |
+| Kiro | [kiro](docs/providers/kiro.md) |
+| Kimi Code | [kimi](docs/providers/kimi.md) |
+| MiniMax | [minimax](docs/providers/minimax.md) |
+| Neuralwatt | [neuralwatt](docs/providers/neuralwatt.md) |
+| Ollama | [ollama](docs/providers/ollama.md) |
+| OpenCode Go | [opencode-go](docs/providers/opencode-go.md) |
+| OpenRouter | `plugins/openrouter` (API key: `OPENROUTER_API_KEY`) |
+| Perplexity | [perplexity](docs/providers/perplexity.md) |
+| Synthetic | [synthetic](docs/providers/synthetic.md) |
+| Devin | [devin](docs/providers/devin.md) |
+| Z.ai | [zai](docs/providers/zai.md) |
 
-- **Add a provider.** Each one is just a plugin. See the [Plugin API](docs/plugins/api.md).
-- **Fix a bug.** PRs welcome. Provide before/after screenshots.
-- **Request a feature.** [Open an issue](https://github.com/robinebers/openusage/issues/new) and make your case.
+New provider? [Fork issues](https://github.com/barramee27/crossusage/issues) for Linux/Windows packaging; [upstream issues](https://github.com/robinebers/openusage/issues) for core/plugin API.
 
-Keep it simple. No feature creep, no AI-generated commit messages, test your changes.
+## CLI
 
-## Built Entirely with AI
+Terminal UI and scripts share the same plugin engine as the desktop app.
 
-Not a single line of code in this project was read or written by hand. 100% AI-generated, AI-reviewed, AI-shipped — using [Cursor](https://cursor.com), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), and [Codex CLI](https://github.com/openai/codex).
+```bash
+crossusage-cli              # dashboard (default)
+crossusage-cli list           # table
+crossusage-cli probe          # JSON
+crossusage-cli export --format csv
+crossusage-cli usage-stats --provider cursor
+crossusage-cli --help
+```
 
-OpenUsage is a real-world example of what I teach in the [AI Builder's Blueprint](https://itsbyrob.in/EBDqgJ6) — a proven process for building and shipping software with AI, no coding background required.
+Build from clone: `cargo build -p crossusage-cli`. If plugins are missing, use `INSTALL_MODE=cli` or set `CROSSUSAGE_RESOURCES` to a tree with `bundled_plugins/` (see [`paths.rs`](crates/crossusage-core/src/paths.rs)).
 
-## Sponsors
+## Develop
 
-OpenUsage is supported by our sponsors. Become a sponsor to get your logo here and on [openusage.ai](https://openusage.ai).
+**Requirements:** [Bun](https://bun.sh), Rust, platform deps for [Tauri v2](https://v2.tauri.app/start/prerequisites/).
 
-[Become a Sponsor](https://github.com/sponsors/robinebers)
+```bash
+bun install
+bun run bundle:plugins
+bun run tauri:dev      # desktop
+bun run tauri:build    # release bundle — use npm script, not legacy `cargo tauri` v1
+```
 
-<!-- Add sponsor logos here -->
+```bash
+cargo run -p crossusage-cli -- list
+```
 
-## Credits
+App icon source: [`branding/crossusage-icon-color.svg`](branding/crossusage-icon-color.svg) → `rsvg-convert` + `bunx tauri icon`.
 
-Inspired by [CodexBar](https://github.com/steipete/CodexBar) by [@steipete](https://github.com/steipete). Same idea, very different approach.
+**Tests:** `bun run test` · **Plugins:** [Plugin API](docs/plugins/api.md) · **Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE) — fork contributors; original OpenUsage © Robin Ebers and contributors.
 
----
-
-<details>
-<summary><strong>Build from source</strong></summary>
-
-> **Warning**: The `main` branch may not be stable. It is merged directly without staging, so users are advised to use tagged versions for stable builds. Tagged versions are fully tested while `main` may contain unreleased features.
-
-### Stack
-
-...
+Inspired by [CodexBar](https://github.com/steipete/CodexBar) by [@steipete](https://github.com/steipete).

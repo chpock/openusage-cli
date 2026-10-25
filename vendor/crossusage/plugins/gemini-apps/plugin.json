@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "gemini-apps",
+  "name": "Gemini Apps",
+  "version": "0.0.1",
+  "entry": "plugin.js",
+  "icon": "icon.svg",
+  "brandColor": "#3186FF",
+  "links": [
+    { "label": "Usage", "url": "https://gemini.google.com/usage" },
+    { "label": "Gemini", "url": "https://gemini.google.com/app" }
+  ],
+  "lines": [
+    { "type": "progress", "label": "Current", "scope": "overview", "primaryOrder": 1 },
+    { "type": "progress", "label": "Weekly", "scope": "overview", "primaryOrder": 2, "period": "weekly" },
+    { "type": "text", "label": "Source", "scope": "detail" }
+  ]
+}

@@ -118,6 +118,8 @@ ctx.host.fs.writeText(statePath, JSON.stringify(state, null, 2))
 ```typescript
 host.crypto.decryptAes256Gcm(envelope: string, keyB64: string): string  // Throws on error
 host.crypto.encryptAes256Gcm(plaintext: string, keyB64: string): string // Throws on error
+host.crypto.sha256Hex(text: string): string
+host.crypto.sha1Hex(text: string): string
 ```
 
 AES-256-GCM helpers for plugins that need to read or write locally encrypted auth/config blobs.
@@ -141,6 +143,30 @@ const nextEnvelope = ctx.host.crypto.encryptAes256Gcm(JSON.stringify(auth, null,
 ctx.host.fs.writeText("~/.factory/auth.v2.file", nextEnvelope)
 ```
 
+`sha1Hex` / `sha256Hex` return lowercase hex digests (SAPISIDHASH, key fingerprints).
+
+## Chromium cookies
+
+```typescript
+host.chromiumCookies.read(opts: { hosts: string[], names: string[] }): Record<string, string>
+```
+
+Decrypts Chromium-family cookies (`v10`/`v11` AES-128-CBC) from the local profile Cookies DB. Values are never logged.
+
+- **Linux:** `secret-tool lookup application chrome` (and chromium/brave/edge) plus the `peanuts` fallback.
+- **macOS:** Keychain `Chrome Safe Storage` (1003 PBKDF2 iterations).
+- **Windows:** not supported (`v20` / DPAPI). `v12`/`v20` prefixes throw instead of returning junk.
+- Copies the DB first so a running Chrome lock does not fail the read.
+
+### Example
+
+```javascript
+const cookies = ctx.host.chromiumCookies.read({
+  hosts: [".google.com", "google.com"],
+  names: ["__Secure-1PSID", "SAPISID"],
+})
+```
+
 ## Environment
 
 ```typescript
@@ -153,7 +179,7 @@ Reads an environment variable by name.
 
 - Returns variable value as string when set
 - Returns `null` when missing
-- Variable must be whitelisted first in `src-tauri/src/plugin_engine/host_api.rs`
+- Variable must be whitelisted first in `crates/crossusage-core/src/plugin_engine/host_api.rs` (`GEMINI_COOKIE` is allowed)
 - Resolution order: current process env first, then a login+interactive shell lookup (macOS)
 - Values may be cached for the app session; restart OpenUsage after changing shell config
 
@@ -175,6 +201,7 @@ host.http.request({
   headers?: Record<string, string>,
   bodyText?: string,
   timeoutMs?: number         // Default: 10000
+  http1Only?: boolean        // Default: false. Gemini Apps needs this (HTTP/2 PROTOCOL_ERROR).
 }): {
   status: number,
   headers: Record<string, string>,
@@ -230,15 +257,16 @@ const resp = ctx.host.http.request({
 ## Keychain (macOS only)
 
 ```typescript
-host.keychain.readGenericPassword(service: string): string
+host.keychain.readGenericPassword(service: string, account?: string): string
 ```
 
-Reads a generic password from the macOS Keychain.
+Reads a generic password from the macOS Keychain. Pass `account` when the service stores multiple accounts and the plugin must avoid a service-wide match.
 
 ### Behavior
 
 - **macOS only**: Throws on other platforms
 - **Throws if not found**: Returns the password string if found, throws otherwise
+- **Optional account scope**: When `account` is set, lookup uses both service and account
 
 ### Example
 
@@ -425,6 +453,36 @@ ctx.line.badge({ label: "Plan", text: "Pro", color: "#000000" })
 ctx.line.badge({ label: "Status", text: "Connected", color: "#22c55e" })
 ```
 
+### `ctx.line.barChart(opts)`
+
+Creates a compact vertical bar chart line for usage history.
+
+```typescript
+ctx.line.barChart({
+  label: string,                    // Required: chart label
+  points: Array<{
+    label: string,                  // Required: point label, e.g. day
+    value: number,                  // Required: non-negative chart value
+    valueLabel?: string             // Optional: displayed value, e.g. "1.2M tokens"
+  }>,
+  note?: string,                    // Optional: small muted note below chart
+  color?: string,                   // Optional: hex color for bars
+}): MetricLine
+```
+
+**Example:**
+
+```javascript
+ctx.line.barChart({
+  label: "Usage Trend",
+  points: [
+    { label: "2/1", value: 1200, valueLabel: "1.2K tokens" },
+    { label: "2/2", value: 2400, valueLabel: "2.4K tokens" },
+  ],
+  note: "Estimated from local logs",
+})
+```
+
 ## Formatters
 
 Helper functions for formatting values.
@@ -490,11 +548,37 @@ ctx.line.progress({
 })
 ```
 
+## usageDaily (Persist daily token rows)
+
+```typescript
+host.usageDaily.ingest({
+  displayName?: string,
+  source?: string, // default "ccusage"; Cursor uses "cursor_transcripts"
+  daily: DailyUsage[],
+})
+```
+
+When **Settings → Usage history → Save usage snapshots** is enabled, plugins upsert daily token totals into local SQLite (`usage_daily` table, same DB as quota snapshots). Claude/Codex call this after a successful `host.ccusage.query`; Amp/Kimi/Copilot/OpenCode are filled automatically after probe via the same ccusage runner; Cursor uses `host.cursorLogs.queryDaily`. Settings shows these in **Daily tokens (local logs)**. No-op when saving is disabled.
+
+CrossUsage downloads ccusage on demand via `bunx` / `pnpm dlx` / `npm exec` / `npx` — users do **not** need a separate global `ccusage` install, but they do need one of those runners (Node/npm ecosystem) on the PATH.
+
+## cursorLogs (Cursor agent transcripts)
+
+```typescript
+host.cursorLogs.queryDaily(opts?: {
+  since?: string, // YYYYMMDD or YYYY-MM-DD; default last 30 days
+}):
+  | { status: "ok", data: { daily: CursorDailyUsage[] } }
+  | { status: "no_data", data: { daily: [] } }
+```
+
+Reads `~/.cursor/projects/*/agent-transcripts/**/*.jsonl` (override with `CURSOR_AGENT_HOME`). Token counts are **estimated** from message text length (chars ÷ 4), bucketed by transcript file mtime. Not billing usage.
+
 ## ccusage (Token Usage)
 
 ```typescript
 host.ccusage.query(opts: {
-  provider?: "claude" | "codex", // Optional; defaults to plugin id, then "claude"
+  provider?: "claude" | "codex" | "amp" | "kimi" | "copilot" | "opencode", // Optional; defaults to plugin id
   since?: string,                // Start date (YYYYMMDD or YYYY-MM-DD)
   until?: string,                // End date (YYYYMMDD or YYYY-MM-DD)
   homePath?: string,             // Provider home override (CLAUDE_CONFIG_DIR or CODEX_HOME)
@@ -505,10 +589,10 @@ host.ccusage.query(opts: {
   | { status: "runner_failed" }
 ```
 
-Queries local token usage via provider-specific ccusage CLIs:
+Queries local token usage via provider-focused ccusage commands:
 
-- Claude: [`ccusage`](https://github.com/ryoppippi/ccusage)
-- Codex: [`@ccusage/codex`](https://www.npmjs.com/package/@ccusage/codex)
+- Claude: [`ccusage claude daily`](https://github.com/ryoppippi/ccusage)
+- Codex: [`ccusage codex daily`](https://github.com/ryoppippi/ccusage)
 
 Returns a status envelope:
 
@@ -518,8 +602,10 @@ Returns a status envelope:
 
 ### Behavior
 
-- **Runtime runners**: Executes pinned `ccusage@18.0.10` (Claude) or `@ccusage/codex@18.0.10` (Codex) via fallback chain `bunx -> pnpm dlx -> yarn dlx -> npm exec -> npx`
+- **Runtime runners**: Executes pinned `ccusage@20.0.2` via fallback chain `bunx -> pnpm dlx -> yarn dlx -> npm exec -> npx`
 - **Provider-aware**: Resolves provider from `opts.provider` or plugin id (`claude`/`codex`)
+- **Focused commands**: Uses `ccusage claude daily` or `ccusage codex daily`; it intentionally does not use `ccusage daily` because that aggregates all detected agents
+- **Legacy fallback**: If `ccusage@20.0.2` cannot run through the package manager release-age policy, retries with release-age-safe `ccusage@18.0.11` for Claude or `@ccusage/codex@18.0.11` for Codex
 - **No provider API calls**: Usage is computed from local JSONL session files; the host does not call Claude/Codex (or other provider) APIs, but package runners may contact a package registry to download the `ccusage` CLI if it is not already available locally
 - **Graceful degradation**: returns `no_runner` when no runner exists, `runner_failed` when execution fails
 - **Pricing**: Uses ccusage's built-in LiteLLM pricing data
