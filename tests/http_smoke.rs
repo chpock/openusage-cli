@@ -212,7 +212,7 @@ async fn http_api_smoke_for_plugins_and_usage_refresh() {
     assert_eq!(config_json["enabledPlugins"], serde_json::json!(["mock"]));
     assert_eq!(
         config_json["enabledAuthSources"],
-        serde_json::json!({ "default": ["native", "opencode"] })
+        serde_json::json!({ "default": ["native", "opencode", "pi"] })
     );
     assert_eq!(
         config_json["availablePlugins"]["active"],

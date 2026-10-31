@@ -167,7 +167,7 @@ fn auth_sources_missing_default_uses_builtin_sources() {
     assert_account_calls(&accounts[2], "local", "native", &["remote", "local"]);
     assert_eq!(
         query_json(&paths, "config", &[])["enabledAuthSources"],
-        json!({ "default": ["native", "opencode"], "alpha": ["opencode"] })
+        json!({ "default": ["native", "opencode", "pi"], "alpha": ["opencode"] })
     );
 }
 
@@ -540,4 +540,110 @@ fn auth_sources_preserves_discovery_errors_and_full_result_validation() {
             matches!(&result.outputs[0].lines[0], MetricLine::Badge { label, .. } if label == "Error")
         );
     }
+}
+
+#[test]
+fn auth_sources_pi_defaults_and_explicit_lists_are_independent() {
+    assert_eq!(
+        serde_json::to_value(config::EnabledAuthSources::default()).unwrap(),
+        json!({"default": ["native", "opencode", "pi"]})
+    );
+    let sources: config::EnabledAuthSources =
+        serde_yaml::from_str("default: [native, opencode]\nalpha: [pi]\n").unwrap();
+    assert_eq!(
+        sources
+            .for_plugin("alpha")
+            .iter()
+            .map(|source| source.as_str())
+            .collect::<Vec<_>>(),
+        ["pi"]
+    );
+    assert_eq!(
+        sources.for_plugin("beta"),
+        &[AuthSource::Native, AuthSource::Opencode]
+    );
+}
+
+#[test]
+fn auth_sources_pi_filtering_preserves_identity_and_error_visibility() {
+    let script = r#"
+        globalThis.__openusage_plugin = {
+            discoverAccounts() {
+                discoveryCalls++;
+                return [
+                    {id:'same', errorPolicy:'hide-if-other-account'},
+                    {id:'same', origin:'opencode'},
+                    {id:'same', origin:'pi'}
+                ];
+            },
+            probe(ctx) {calls.push(ctx.account.id); throw 'credential error';}
+        };
+    "#;
+    let sources: Vec<AuthSource> = serde_yaml::from_str("[pi]").expect("Pi source is configurable");
+    let (all, _) = probe_script(script, DEFAULT_AUTH_SOURCES);
+    assert_eq!(all.outputs.len(), 2, "only the native error is suppressed");
+    let pi = all
+        .outputs
+        .iter()
+        .find(|output| output.account.origin == "pi")
+        .expect("Pi output");
+    let (selected, observed) = probe_script(script, &sources);
+    assert_eq!(observed["calls"], json!(["same"]));
+    assert_eq!(selected.outputs.len(), 1);
+    assert_eq!(selected.outputs[0].account, pi.account);
+    let (excluded, observed) = probe_script(script, &[AuthSource::Native, AuthSource::Opencode]);
+    assert_eq!(observed["calls"], json!(["same", "same"]));
+    assert!(
+        excluded
+            .outputs
+            .iter()
+            .all(|output| output.account.origin != "pi")
+    );
+}
+
+#[test]
+fn auth_sources_pi_cli_selection_replaces_explicit_config_and_serializes_public_account() {
+    let Some(paths) = hermetic::enter(
+        "auth_sources_pi_cli_selection_replaces_explicit_config_and_serializes_public_account",
+    ) else {
+        return;
+    };
+    write_plugins(&paths, false);
+    fs::write(
+        paths.root.join("plugins/alpha/plugin.js"),
+        r#"
+        var calls = [];
+        globalThis.__openusage_plugin = {
+            discoverAccounts() {return [{id:'default'}, {id:'pi-0',origin:'pi',name:'Pi'}];},
+            probe(ctx) {
+                calls.push(ctx.account.id);
+                return {lines:[{type:'text',label:'Calls',value:JSON.stringify(calls)}]};
+            }
+        };
+    "#,
+    )
+    .unwrap();
+    write_config("enabled_auth_sources:\n  default: [native, opencode]\n");
+    let excluded = query_json(&paths, "usage", &[]);
+    assert!(
+        excluded
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|output| output["account"]["origin"] != "pi")
+    );
+    let args = ["--enabled-auth-sources={default: [pi]}"];
+    let selected = query_json(&paths, "usage", &args);
+    let selected = selected.as_array().unwrap();
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0]["providerId"], "alpha");
+    assert_account_calls(&selected[0], "pi-0", "pi", &["pi-0"]);
+    assert_eq!(selected[0]["account"]["name"], "Pi");
+    assert_eq!(selected[0]["account"]["isActive"], true);
+    assert!(selected[0]["fetchedAt"].is_string());
+    assert!(selected[0].get("iconUrl").is_none());
+    assert_eq!(
+        query_json(&paths, "config", &args)["enabledAuthSources"],
+        json!({"default":["pi"]})
+    );
 }

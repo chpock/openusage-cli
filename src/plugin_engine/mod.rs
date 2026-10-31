@@ -1,4 +1,5 @@
 mod analytics;
+mod auth_file_lock;
 mod chromium_cookies;
 mod cursor_remote;
 mod fireworks;

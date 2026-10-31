@@ -233,6 +233,16 @@ it is absent or account probes are disabled. Creation, repair, replacement and
 deletion therefore use the same targeted refresh/discovery cycle. These providers
 do not subscribe to `accounts.json` or the config-directory auth candidate.
 
+## Pi authentication file
+
+Codex, Copilot, Claude and OpenRouter additionally predeclare
+`~/.pi/agent/auth.json` during override evaluation, including when absent or
+excluded by source selection. The declaration is collected through the same
+`ClearProvider` → discovery → `ReplaceProvider` lifecycle. Creation, repair,
+replacement or deletion refreshes the affected providers without restarting the
+daemon. Missing Pi files are not created during discovery. Authentication-file
+locking is separate from monitoring; see [Pi credentials](plugin-overrides.md#pi-credentials).
+
 ## Symbolic link limitation
 
 The monitor stores declared paths as lexical (non-canonicalised) paths.  If a

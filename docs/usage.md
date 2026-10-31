@@ -65,7 +65,7 @@ Runtime flags (`query`, `run-daemon`):
 
 - `--plugins-dir <path>`
 - `--enabled-plugins <csv-globs>` (default: `*`)
-- `--enabled-auth-sources <yaml-or-json-object>` (default: `{"default":["native","opencode"]}`)
+- `--enabled-auth-sources <yaml-or-json-object>` (default: `{"default":["native","opencode","pi"]}`)
 - `--app-data-dir <path>`
 - `--plugin-overrides-dir <path>`
 

@@ -6,6 +6,8 @@ use aes_gcm::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use rquickjs::{Ctx, Exception, Function, Object};
 use sha2::Digest;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
@@ -13,6 +15,7 @@ use std::path::{Component, Path, PathBuf};
 #[cfg(any(test, not(target_os = "linux")))]
 use std::process::Command;
 use std::process::Stdio;
+use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
 const WHITELISTED_ENV_VARS: [&str; 29] = [
@@ -841,6 +844,10 @@ fn inject_fs<'js>(
     policy: FilesystemPolicy,
 ) -> rquickjs::Result<()> {
     let fs_obj = Object::new(ctx.clone())?;
+    let auth_locks = Rc::new(RefCell::new(HashMap::<
+        PathBuf,
+        super::auth_file_lock::LockCheck,
+    >::new()));
     if let Some(home) = dirs::home_dir()
         && policy
             .resolve(&home.to_string_lossy(), FilesystemOperation::Exists)
@@ -902,10 +909,25 @@ fn inject_fs<'js>(
         "writeText",
         Function::new(ctx.clone(), {
             let policy = policy.clone();
+            let auth_locks = Rc::clone(&auth_locks);
             move |ctx_inner: Ctx<'_>, path: String, content: String| -> rquickjs::Result<()> {
                 let expanded = policy
                     .resolve(&path, FilesystemOperation::Write)
                     .map_err(|err| Exception::throw_message(&ctx_inner, &err))?;
+                {
+                    let locks = auth_locks.borrow();
+                    if !locks.is_empty() {
+                        let name =
+                            super::auth_file_lock::lock_path(&expanded).map_err(|error| {
+                                Exception::throw_message(&ctx_inner, &error.to_string())
+                            })?;
+                        if let Some(lock) = locks.get(&name) {
+                            lock.check().map_err(|error| {
+                                Exception::throw_message(&ctx_inner, &error.to_string())
+                            })?;
+                        }
+                    }
+                }
                 write_private_text(&expanded, &content)
                     .map_err(|e| Exception::throw_message(&ctx_inner, &e.to_string()))
             }
@@ -937,6 +959,58 @@ fn inject_fs<'js>(
                 }
                 names.sort();
                 Ok(names)
+            }
+        })?,
+    )?;
+
+    fs_obj.set(
+        "withAuthFileLock",
+        Function::new(ctx.clone(), {
+            let policy = policy.clone();
+            let auth_locks = Rc::clone(&auth_locks);
+            move |ctx_inner: Ctx<'js>,
+                  path: String,
+                  operation: Function<'js>|
+                  -> rquickjs::Result<rquickjs::Value<'js>> {
+                if path.trim().is_empty() {
+                    return Err(Exception::throw_message(
+                        &ctx_inner,
+                        "Auth file lock path must not be empty",
+                    ));
+                }
+                let expanded = policy
+                    .resolve(&path, FilesystemOperation::Subscribe)
+                    .map_err(|error| Exception::throw_message(&ctx_inner, &error))?;
+                let name = super::auth_file_lock::lock_path(&expanded)
+                    .map_err(|error| Exception::throw_message(&ctx_inner, &error.to_string()))?;
+                policy
+                    .resolve(&name.to_string_lossy(), FilesystemOperation::Write)
+                    .map_err(|error| Exception::throw_message(&ctx_inner, &error))?;
+                if auth_locks.borrow().contains_key(&name) {
+                    return Err(Exception::throw_message(
+                        &ctx_inner,
+                        "Auth file lock is already held by this probe",
+                    ));
+                }
+                let lock = super::auth_file_lock::AuthFileLock::acquire(&expanded)
+                    .map_err(|error| Exception::throw_message(&ctx_inner, &error.to_string()))?;
+                auth_locks.borrow_mut().insert(name.clone(), lock.checker());
+                let result = operation.call::<_, rquickjs::Value<'js>>(());
+                auth_locks.borrow_mut().remove(&name);
+                if let Err(error) = lock.release() {
+                    if result.is_ok() {
+                        return Err(Exception::throw_message(&ctx_inner, &error.to_string()));
+                    }
+                    log::warn!("Failed to release auth file lock after callback error: {error}");
+                }
+                let value = result?;
+                if value.is_promise() {
+                    return Err(Exception::throw_message(
+                        &ctx_inner,
+                        "Auth file lock callback must be synchronous",
+                    ));
+                }
+                Ok(value)
             }
         })?,
     )?;

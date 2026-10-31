@@ -538,3 +538,137 @@ fn host_http_and_plugin_logs_redact_current_provider_credentials() {
         );
     }
 }
+
+#[test]
+fn host_auth_file_lock_wraps_synchronous_work_and_releases_after_exceptions() {
+    let Some(paths) =
+        hermetic::enter("host_auth_file_lock_wraps_synchronous_work_and_releases_after_exceptions")
+    else {
+        return;
+    };
+    let result = probe(
+        &paths,
+        r#"
+        ctx.host.fs.writeText('auth.json', '{}');
+        var during = false, calls = 0;
+        var value = ctx.host.fs.withAuthFileLock('auth.json', function() {
+            calls++; during = ctx.host.fs.exists('auth.json.lock');
+            return 42;
+        });
+        var afterSuccess = ctx.host.fs.exists('auth.json.lock');
+        var message = '';
+        try {
+            ctx.host.fs.withAuthFileLock('./auth.json', function() {
+                calls++; throw 'callback failure';
+            });
+        } catch (error) { message = String(error); }
+        var result = {value:value, during:during, afterSuccess:afterSuccess,
+            afterError:ctx.host.fs.exists('auth.json.lock'), calls:calls, message:message};
+    "#,
+    );
+    assert_eq!(
+        result,
+        json!({"value":42,"during":true,"afterSuccess":false,"afterError":false,"calls":2,"message":"callback failure"})
+    );
+}
+
+#[test]
+fn host_auth_file_lock_does_not_escape_probe_sandbox() {
+    let Some(paths) = hermetic::enter("host_auth_file_lock_does_not_escape_probe_sandbox") else {
+        return;
+    };
+    let result = probe(
+        &paths,
+        r#"
+        var calls = 0, rejected = [];
+        ['../outside-auth.json','/outside-auth.json'].forEach(function(path) {
+            try {ctx.host.fs.withAuthFileLock(path, function() {calls++;});}
+            catch (error) {rejected.push(String(error));}
+        });
+        var result = {calls:calls,rejected:rejected};
+    "#,
+    );
+    assert_eq!(result["calls"], 0);
+    let rejected = result["rejected"].as_array().unwrap();
+    assert_eq!(rejected.len(), 2);
+    assert!(
+        rejected
+            .iter()
+            .all(|error| error.as_str().unwrap().contains("sandbox denied"))
+    );
+}
+
+#[test]
+fn host_auth_file_lock_rejects_reentry_and_async_callbacks() {
+    let Some(paths) = hermetic::enter("host_auth_file_lock_rejects_reentry_and_async_callbacks")
+    else {
+        return;
+    };
+    let result = probe(
+        &paths,
+        r#"
+        ctx.host.fs.writeText('auth.json','{}');
+        var nested = 0, errors = [];
+        ctx.host.fs.withAuthFileLock('auth.json',function() {
+            try {ctx.host.fs.withAuthFileLock('./auth.json',function() {nested++;});}
+            catch(error) {errors.push(String(error));}
+        });
+        try {ctx.host.fs.withAuthFileLock('auth.json',async function() {});}
+        catch(error) {errors.push(String(error));}
+        try {ctx.host.fs.withAuthFileLock('auth.json',function() {throw new Error('failure');});}
+        catch(error) {errors.push(String(error));}
+        var result = {nested:nested,errors:errors,held:ctx.host.fs.exists('auth.json.lock')};
+    "#,
+    );
+    assert_eq!(result["nested"], 0);
+    assert_eq!(result["held"], false);
+    let errors = result["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 3);
+    assert!(errors[0].as_str().unwrap().contains("already held"));
+    assert!(errors[1].as_str().unwrap().contains("must be synchronous"));
+    assert!(errors[2].as_str().unwrap().contains("failure"));
+}
+
+#[test]
+fn host_auth_file_lock_checks_ownership_before_write_even_if_callback_catches_error() {
+    let Some(paths) = hermetic::enter(
+        "host_auth_file_lock_checks_ownership_before_write_even_if_callback_catches_error",
+    ) else {
+        return;
+    };
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let lock_path = paths.root.join("auth.json.lock");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 1];
+        stream.read_exact(&mut request).unwrap();
+        fs::remove_dir(&lock_path).unwrap();
+        fs::create_dir(&lock_path).unwrap();
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .unwrap();
+    });
+    let result = probe(
+        &paths,
+        &format!(
+            r#"
+        ctx.host.fs.writeText('auth.json','original');
+        var writeFailed = false, operationFailed = false;
+        try {{ctx.host.fs.withAuthFileLock('auth.json',function() {{
+            ctx.host.http.request({{url:'http://{address}/replace-lock',method:'GET'}});
+            try {{ctx.host.fs.writeText('auth.json','corrupted');}}
+            catch(error) {{writeFailed = true;}}
+        }});}} catch(error) {{operationFailed = true;}}
+        var result = {{writeFailed:writeFailed,operationFailed:operationFailed,
+            content:ctx.host.fs.readText('auth.json'),replacementIntact:ctx.host.fs.exists('auth.json.lock')}};
+    "#
+        ),
+    );
+    server.join().unwrap();
+    assert_eq!(
+        result,
+        json!({"writeFailed":true,"operationFailed":true,"content":"original","replacementIntact":true})
+    );
+}

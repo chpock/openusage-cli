@@ -35,6 +35,20 @@ For predictability and safety, `openusage-cli` treats the daemon process environ
 
 For detailed documentation, see [Provider file monitoring](provider-file-monitoring.md).
 
+## Cooperative authentication-file locking
+
+`host.fs.withAuthFileLock(path, operation)` is a first-party synchronous host
+extension used by Pi credential overrides. Upstream does not expose this method.
+It uses Pi's lexical `.lock` directory protocol with a native heartbeat, validates
+the authentication and sidecar paths against the filesystem policy, and checks
+lease ownership before matching `writeText` calls. The callback receives no
+arguments and must not return a Promise; same-lock reentry is rejected.
+
+This coordinates Pi lock-taking reads and OAuth refresh/save operations without
+adding a Node runtime or dependency. It is not an atomic-write or hostile-writer
+guarantee. Protocol details, failure handling and limits are documented under
+[Pi credentials](plugin-overrides.md#pi-credentials).
+
 ## Multi-account discovery
 
 - **Upstream CrossUsage behavior**: the Rust host can receive a configured

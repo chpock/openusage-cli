@@ -1,5 +1,5 @@
 // ── Codex override: account discovery + source routing ────────────
-// This override adds opencode-* accounts to the Codex plugin.
+// This override adds OpenCode and Pi accounts to the Codex plugin.
 // Selected OpenCode accounts enter the native provider-auth branch with its
 // extra-account isolation guard; the default account keeps native fallback.
 
@@ -12,7 +12,9 @@ globalThis.__openusage_ast_patch = {
     { target: "fetchUsage", with: "patchFetchUsage", mode: "wrap" },
     { target: "fetchResetCredits", with: "patchFetchResetCredits", mode: "wrap" },
     { target: "saveAuth", with: "patchSaveAuth", mode: "wrap" },
-    { target: "refreshToken", with: "patchRefreshToken", mode: "wrap" }
+    { target: "refreshToken", with: "patchRefreshToken", mode: "wrap" },
+    { target: "needsRefresh", with: "patchNeedsRefresh", mode: "wrap" },
+    { target: "queryTokenUsage", with: "patchQueryTokenUsage", mode: "wrap" }
   ]
 };
 
@@ -53,7 +55,13 @@ function parseJsonStrict(text) {
   return JSON.parse(text);
 }
 
-function parseCredentialObject(block) {
+function parseCredentialObject(block, origin) {
+  if (origin === "pi" && (!isPlainObject(block) || block.type !== "oauth" ||
+      !isNonEmptyString(block.refresh) || !block.refresh.trim() ||
+      !isNonEmptyString(block.accountId) || !block.accountId.trim() ||
+      typeof block.expires !== "number" || !Number.isFinite(block.expires) || block.expires < 0)) {
+    return { error: "Invalid Pi openai-codex OAuth credentials." };
+  }
   if (!isPlainObject(block)) {
     return { error: "Provider block is not an object" };
   }
@@ -69,7 +77,8 @@ function parseCredentialObject(block) {
   return {
     credential: {
       access_token: accessToken,
-      refresh_token: refreshToken
+      refresh_token: refreshToken,
+      expiresAt: origin === "pi" ? block.expires : undefined
     },
     accountIdFromBlock: accountIdFromBlock
   };
@@ -87,7 +96,8 @@ function buildAuthStateFromCredential(cred, route) {
     auth.tokens.account_id = route.accountId;
   }
   return {
-    source: "opencode",
+    source: route.origin || "opencode",
+    expiresAt: cred.expiresAt,
     auth: auth,
     authPath: route.path,
     providerKey: route.providerKey
@@ -113,6 +123,8 @@ var OPENCODE_SOURCES = [
   }
 ];
 var OPENAI_PROVIDER_KEY = "openai";
+var PI_AUTH_PATH = "~/.pi/agent/auth.json";
+var PI_PROVIDER_KEY = "openai-codex";
 
 function discoverAccounts(ctx, originalDiscoverAccounts) {
   var keys = Object.keys(routes);
@@ -143,13 +155,14 @@ function discoverAccounts(ctx, originalDiscoverAccounts) {
     return accounts;
   }
 
-  function buildAccountDescriptor(id, label, stableSubjectKey) {
+  function buildAccountDescriptor(id, label, stableSubjectKey, origin) {
+    origin = origin || "opencode";
     var d = {
       id: id,
-      origin: "opencode",
+      origin: origin,
       isActive: true,
       name: label,
-      sourceRef: "opencode-auth:" + id
+      sourceRef: origin + "-auth:" + id
     };
     if (stableSubjectKey && typeof stableSubjectKey === "string") {
       d.stableSubjectKey = stableSubjectKey;
@@ -190,7 +203,7 @@ function discoverAccounts(ctx, originalDiscoverAccounts) {
     logWarn(ctx, "codex override: " + message + " (account: " + routeId + ")");
   }
 
-  function readJsonFile(path, missingState, kindLabel) {
+  function readJsonFile(path, missingState, kindLabel, emptyWhitespace) {
     var fileExists;
     try {
       if (typeof fs.exists === "function") {
@@ -216,7 +229,7 @@ function discoverAccounts(ctx, originalDiscoverAccounts) {
       return { kind: "error", error: "Failed to read " + kindLabel + " file: " + String(e) };
     }
 
-    if (!isNonEmptyString(text)) {
+    if (!isNonEmptyString(text) || (emptyWhitespace && !text.trim())) {
       return { kind: "empty" };
     }
 
@@ -431,6 +444,27 @@ function discoverAccounts(ctx, originalDiscoverAccounts) {
     }
   }
 
+  var piResult;
+  try {
+    piResult = fs.exists(PI_AUTH_PATH) ? fs.withAuthFileLock(PI_AUTH_PATH, function () {
+      return readJsonFile(PI_AUTH_PATH, "missing", "Pi auth", true);
+    }) : { kind: "missing" };
+  } catch (_) {
+    piResult = { kind: "error" };
+  }
+  if (piResult.kind === "error" || (piResult.kind === "value" && piResult.doc[PI_PROVIDER_KEY] !== undefined)) {
+    var piIndex = 0;
+    while (usedRouteIds["pi-" + piIndex]) piIndex++;
+    var piId = "pi-" + piIndex;
+    var parsedPi = piResult.kind === "value" ? parseCredentialObject(piResult.doc[PI_PROVIDER_KEY], "pi") : { error: "Failed to read or parse Pi auth.json." };
+    routes[piId] = parsedPi.error ? { type: "error", error: parsedPi.error } : {
+      origin: "pi", path: PI_AUTH_PATH, providerKey: PI_PROVIDER_KEY,
+      accountId: parsedPi.accountIdFromBlock, credentialAccountId: parsedPi.accountIdFromBlock,
+      credential: parsedPi.credential, type: "ready", persistFailed: false,
+      readSource: "auth", persistSource: "pi"
+    };
+    accounts.push(buildAccountDescriptor(piId, "Pi", parsedPi.accountIdFromBlock, "pi"));
+  }
   return accounts;
 }
 
@@ -496,6 +530,7 @@ function patchSaveAuth(originalSaveAuth, ctx, authState) {
     newTokens.refresh_token = tokens.refresh_token;
   }
 
+  if (route.origin === "pi") newTokens.expiresAt = authState.expiresAt;
   var saved = persistRouteTokens(ctx, route, newTokens);
   if (!saved) {
     route.persistFailed = true;
@@ -503,6 +538,7 @@ function patchSaveAuth(originalSaveAuth, ctx, authState) {
   } else {
     if (newTokens.access_token) route.credential.access_token = newTokens.access_token;
     if (newTokens.refresh_token) route.credential.refresh_token = newTokens.refresh_token;
+    if (route.origin === "pi") route.credential.expiresAt = newTokens.expiresAt;
     route.persistFailed = false;
   }
   return saved;
@@ -530,6 +566,30 @@ function patchRefreshToken(originalRefreshToken, ctx, authState) {
     throw "Token persistence failed for account " + accountId;
   }
 
+  if (route.origin === "pi") {
+    return ctx.host.fs.withAuthFileLock(route.path, function () {
+      var scoped = Object.create(ctx);
+      var util = Object.create(ctx.util);
+      util.request = function (request) {
+        var response = ctx.util.request(request);
+        if (response.status >= 200 && response.status < 300) {
+          var body = ctx.util.tryParseJson(response.bodyText);
+          if (!body || typeof body.expires_in !== "number" || !Number.isFinite(body.expires_in) || body.expires_in <= 0) {
+            throw "Invalid Pi openai-codex OAuth refresh expiry.";
+          }
+          authState.expiresAt = Date.now() + body.expires_in * 1000;
+        }
+        return response;
+      };
+      Object.defineProperty(scoped, "util", { value: util });
+      return refreshRouteToken(originalRefreshToken, scoped, authState, route);
+    });
+  }
+  return refreshRouteToken(originalRefreshToken, ctx, authState, route);
+}
+
+function refreshRouteToken(originalRefreshToken, ctx, authState, route) {
+  var accountId = ctx.account.id;
   var priorToken = route.credential && route.credential.access_token;
 
   var reloadedCredential = reloadCredentialFromRoute(ctx, route);
@@ -542,8 +602,13 @@ function patchRefreshToken(originalRefreshToken, ctx, authState) {
     ? reloadedCredential.access_token.trim()
     : "";
 
-  if (isNonEmptyString(currentAccessToken) && currentAccessToken !== priorToken) {
-    route.credential.access_token = currentAccessToken;
+  if (route.origin === "pi") {
+    route.selected = { access: reloadedCredential.access_token, refresh: reloadedCredential.refresh_token, expires: reloadedCredential.expiresAt };
+  }
+  if (isNonEmptyString(currentAccessToken) && currentAccessToken !== priorToken &&
+      (route.origin !== "pi" || reloadedCredential.expiresAt > Date.now() + 300000)) {
+    route.credential = reloadedCredential;
+    authState.expiresAt = reloadedCredential.expiresAt;
     if (isNonEmptyString(reloadedCredential.refresh_token)) {
       route.credential.refresh_token = reloadedCredential.refresh_token;
     }
@@ -556,6 +621,11 @@ function patchRefreshToken(originalRefreshToken, ctx, authState) {
     return currentAccessToken;
   }
 
+  if (route.origin === "pi") {
+    route.credential = reloadedCredential;
+    authState.auth.tokens.access_token = reloadedCredential.access_token;
+    authState.auth.tokens.refresh_token = reloadedCredential.refresh_token;
+  }
   var upstreamRefreshResult = originalRefreshToken(ctx, authState);
 
   if (authState && authState.auth && authState.auth.tokens) {
@@ -581,13 +651,44 @@ function patchIsExtraAccountInstance(original, ctx) {
   return id && id !== "default" ? true : original(ctx);
 }
 
-function patchReloadAuthState(original, ctx, authState) {
-  if (!authState || authState.source !== "opencode") return original(ctx, authState);
+function patchNeedsRefresh(original, ctx, auth, nowMs) {
   var route = routes[ctx.account.id];
+  return route && route.origin === "pi" ? route.credential.expiresAt <= nowMs + 300000 : original(ctx, auth, nowMs);
+}
+
+function patchQueryTokenUsage(original, ctx) {
+  var route = routes[ctx.account.id];
+  // Local Codex logs do not identify a Pi login.
+  return route && route.origin === "pi" ? { status: "no_runner", data: null } : original(ctx);
+}
+
+function patchReloadAuthState(original, ctx, authState) {
+  if (!authState || (authState.source !== "opencode" && authState.source !== "pi")) return original(ctx, authState);
+  var route = routes[ctx.account.id];
+  if (route.origin === "pi") {
+    return ctx.host.fs.withAuthFileLock(route.path, function () {
+      var result = reloadRouteState(ctx, authState, route);
+      if (route.credential.expiresAt <= Date.now() + 300000) {
+        // Native treats "changed" as usable without refresh, even after HTTP 401.
+        Object.assign(authState.auth.tokens, result.authState.auth.tokens);
+        authState.expiresAt = route.credential.expiresAt;
+        return { status: "unchanged", authState: authState };
+      }
+      return result;
+    });
+  }
+  return reloadRouteState(ctx, authState, route);
+}
+
+function reloadRouteState(ctx, authState, route) {
   var credential = reloadCredentialFromRoute(ctx, route);
   if (!credential) throw "Failed to reload auth file for account " + ctx.account.id;
   var tokens = authState.auth.tokens;
   if (credential.access_token === tokens.access_token && credential.refresh_token === tokens.refresh_token) {
+    if (route.origin === "pi") {
+      route.credential = credential;
+      authState.expiresAt = credential.expiresAt;
+    }
     return { status: "unchanged", authState: authState };
   }
   route.credential = credential;
@@ -704,7 +805,7 @@ function reloadCredentialFromRoute(ctx, route) {
     }
   }
   var block = readProviderBlock(ctx, route.path, route.providerKey);
-  var parsedBlock = parseCredentialObject(block);
+  var parsedBlock = parseCredentialObject(block, route.origin);
   if (parsedBlock.error) {
     return null;
   }
@@ -827,7 +928,27 @@ function persistToAccountsFile(ctx, path, providerKey, index, tokens, declaredAc
   }
 }
 
+function persistPiTokens(ctx, route, tokens) {
+  try {
+    var doc = JSON.parse(ctx.host.fs.readText(route.path));
+    var block = doc[route.providerKey];
+    var parsed = parseCredentialObject(block, "pi");
+    if (parsed.error || parsed.accountIdFromBlock !== route.credentialAccountId ||
+        block.access.trim() !== route.selected.access || block.refresh.trim() !== route.selected.refresh || block.expires !== route.selected.expires) return false;
+    if (typeof tokens.expiresAt !== "number" || !Number.isFinite(tokens.expiresAt) || tokens.expiresAt < 0) return false;
+    block.access = tokens.access_token;
+    if (isNonEmptyString(tokens.refresh_token)) block.refresh = tokens.refresh_token;
+    block.expires = tokens.expiresAt;
+    ctx.host.fs.writeText(route.path, JSON.stringify(doc));
+    route.selected = { access: block.access, refresh: block.refresh, expires: block.expires };
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 function persistRouteTokens(ctx, route, tokens) {
+  if (route.persistSource === "pi") return persistPiTokens(ctx, route, tokens);
   if (route.persistSource === "accounts") {
     return persistToAccountsFile(
       ctx,
@@ -852,6 +973,9 @@ for (var si = 0; si < OPENCODE_SOURCES.length; si++) {
   globalThis.__openusage_ctx.host.fs.subscribeFile(OPENCODE_SOURCES[si].accountsPath);
 }
 
+globalThis.__openusage_ctx.host.fs.subscribeFile(PI_AUTH_PATH);
+globalThis.patchNeedsRefresh = patchNeedsRefresh;
+globalThis.patchQueryTokenUsage = patchQueryTokenUsage;
 globalThis.patchDiscoverAccounts = discoverAccounts;
 globalThis.patchIsExtraAccountInstance = patchIsExtraAccountInstance;
 globalThis.patchReloadAuthState = patchReloadAuthState;
@@ -870,3 +994,5 @@ var patchRefreshToken = (globalThis.patchRefreshToken);
 var patchProbeWithAuthState = (globalThis.patchProbeWithAuthState);
 var patchFetchUsage = (globalThis.patchFetchUsage);
 var patchFetchResetCredits = (globalThis.patchFetchResetCredits);
+var patchNeedsRefresh = (globalThis.patchNeedsRefresh);
+var patchQueryTokenUsage = (globalThis.patchQueryTokenUsage);

@@ -22,6 +22,7 @@ pub const DEFAULT_LOG_LEVEL: &str = "error";
 pub enum AuthSource {
     Native,
     Opencode,
+    Pi,
 }
 
 impl AuthSource {
@@ -29,11 +30,13 @@ impl AuthSource {
         match self {
             Self::Native => "native",
             Self::Opencode => "opencode",
+            Self::Pi => "pi",
         }
     }
 }
 
-pub const DEFAULT_AUTH_SOURCES: &[AuthSource] = &[AuthSource::Native, AuthSource::Opencode];
+pub const DEFAULT_AUTH_SOURCES: &[AuthSource] =
+    &[AuthSource::Native, AuthSource::Opencode, AuthSource::Pi];
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(transparent)]
@@ -282,7 +285,7 @@ enabled_plugins:
 # Allowed credential sources, matched against discovered account origin.
 # Plugin ID entries replace default; [] disables all sources for that plugin.
 enabled_auth_sources:
-  default: [native, opencode]
+  default: [native, opencode, pi]
 
 # Directory for provider data/cache. null = platform default.
 # app_data_dir: /path/to/app-data
@@ -411,7 +414,7 @@ mod tests {
         assert_eq!(sources.for_plugin("codex"), &[AuthSource::Opencode]);
         assert_eq!(
             serde_json::to_value(sources.with_builtin_default()).expect("serialize sources"),
-            serde_json::json!({ "default": ["native", "opencode"], "codex": ["opencode"] })
+            serde_json::json!({ "default": ["native", "opencode", "pi"], "codex": ["opencode"] })
         );
     }
 

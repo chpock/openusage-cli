@@ -72,6 +72,8 @@ fn assert_subscriptions(obs: &Value, expected: &[&str]) {
         .as_array()
         .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
         .unwrap_or_default();
+    let mut expected = expected.to_vec();
+    expected.push("~/.pi/agent/auth.json");
     assert_eq!(subs, expected, "subscription mismatch");
     assert_eq!(obs["writes"], serde_json::json!([]), "no credential writes");
 }
@@ -1724,7 +1726,7 @@ fn copilot_override_run_probe_lifecycle() {
                 r#"{"token":"native-state-token"}"#
             );
         }
-        assert_eq!(result.subscriptions.len(), 4);
+        assert_eq!(result.subscriptions.len(), 5);
         for candidate in [
             ".local/share/opencode/auth.json",
             ".local/share/opencode/accounts.json",

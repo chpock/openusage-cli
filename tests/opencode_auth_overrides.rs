@@ -2,7 +2,7 @@ mod support;
 
 use openusage_cli::{
     config::{DEFAULT_AUTH_SOURCES, EnabledAuthSources},
-    plugin_engine::{manifest, runtime},
+    plugin_engine::manifest,
 };
 use serde_json::{Value, json};
 use std::{fs, path::Path};
@@ -11,154 +11,7 @@ use support::override_runner::{
     ProviderOutcome, ProviderSpec, run_provider_probe, run_provider_probe_with_auth_sources,
 };
 
-const AUTH: &str = ".local/share/opencode/auth.json";
-
-fn write(paths: &HermeticPaths, relative: &str, text: &str) {
-    let path = paths.root.join(relative);
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(path, text).unwrap();
-}
-
-fn auth() -> Value {
-    json!({
-        "anthropic": {"type":"oauth", "access":"oc-claude", "refresh":"oc-refresh", "expires":4102444800000_u64},
-        "openrouter": {"type":"api", "key":"oc-router"},
-        "unrelated": {"type":"api", "key":"untouched"}
-    })
-}
-
-fn install(paths: &HermeticPaths, id: &str, options: Value) -> manifest::LoadedPlugin {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut plugin = manifest::load_plugins_from_dir(&root.join("vendor/crossusage/plugins"))
-        .into_iter()
-        .find(|plugin| plugin.manifest.id == id)
-        .unwrap();
-    let source = root.join("plugin-overrides").join(format!("{id}.js"));
-    if source.exists() {
-        fs::copy(source, paths.overrides.join(format!("{id}.js"))).unwrap();
-    }
-    let observation = paths.root.join("observed.json");
-    let harness = format!(
-        r#";(function () {{
-            var ctx = globalThis.__openusage_ctx;
-            var options = {options}, path = {path};
-            var observed = {{requests: [], writes: [], subscriptions: [], localUsage: [], violations: []}};
-            var write = ctx.host.fs.writeText;
-            var read = ctx.host.fs.readText;
-            var subscribe = ctx.host.fs.subscribeFile;
-            function persist() {{ write(path, JSON.stringify(observed)); }}
-            ctx.host.fs.subscribeFile = function (file) {{
-                observed.subscriptions.push(file); persist();
-                return subscribe(file);
-            }};
-            ctx.host.fs.writeText = function (file, text) {{
-                observed.writes.push({{path:file, text:text}}); persist();
-                if (options.writeFailure && file === '~/.local/share/opencode/auth.json') throw new Error('fixture write failure');
-                return write(file, text);
-            }};
-            ctx.host.keychain = ctx.host.keychain || {{}};
-            ctx.host.ccusage = ctx.host.ccusage || {{}};
-            ctx.host.keychain.readGenericPassword = function () {{ return null; }};
-            ctx.host.keychain.readGenericPasswordForCurrentUser = function () {{ return null; }};
-            ctx.host.keychain.writeGenericPassword = function () {{
-                observed.violations.push('keychain write'); persist();
-                throw new Error('unexpected keychain write');
-            }};
-            ctx.host.ccusage.query = function (opts) {{
-                observed.localUsage.push(opts); persist();
-                return {{status:'ok', data:{{daily:[{{date:new Date().toISOString().slice(0,10), totalTokens:100, totalCost:1}}]}}}};
-            }};
-            ctx.host.http.request = function (request) {{
-                observed.requests.push(request); persist();
-                var url = request.url;
-                if (url === 'https://platform.claude.com/v1/oauth/token') {{
-                    if (options.changeDuringRefresh) {{
-                        var doc = JSON.parse(read('~/.local/share/opencode/auth.json'));
-                        doc.concurrentSibling = {{key:'preserve-latest'}};
-                        write('~/.local/share/opencode/auth.json', JSON.stringify(doc));
-                    }}
-                    if (options.corruptDuringRefresh) write('~/.local/share/opencode/auth.json', '{{bad');
-                    if (options.replaceLoginDuringRefresh) {{
-                        var doc = JSON.parse(read('~/.local/share/opencode/auth.json'));
-                        doc.anthropic = {{type:'oauth',access:'different-login',refresh:'different-refresh',expires:4102444800000}};
-                        write('~/.local/share/opencode/auth.json', JSON.stringify(doc));
-                    }};
-                    var body = {{access_token:'oc-renewed', expires_in:3600}};
-                    if (!options.noRotation) body.refresh_token = 'oc-rotated';
-                    return {{status:200, headers:{{}}, bodyText:JSON.stringify(body)}};
-                }}
-                var token = request.headers.Authorization;
-                if (options.reject && token.indexOf('oc-') >= 0) return {{status:401, headers:{{}}, bodyText:'{{}}'}};
-                if (options.retry && token === 'Bearer oc-claude' && url === 'https://api.anthropic.com/api/oauth/usage') {{
-                    return {{status:401, headers:{{}}, bodyText:'{{}}'}};
-                }}
-                if (url === 'https://api.anthropic.com/api/oauth/usage') {{
-                    return {{status:200, headers:{{}}, bodyText:JSON.stringify({{
-                        five_hour:{{utilization:token === 'Bearer native-claude' ? 11 : 37, resets_at:'2099-01-01T00:00:00Z'}},
-                        cedar_ember:{{}}
-                    }})}};
-                }}
-                if (url === 'https://api.anthropic.com/api/oauth/profile') {{
-                    return {{status:200, headers:{{}}, bodyText:JSON.stringify({{organization:{{organization_type:'claude_pro'}}}})}};
-                }}
-                if (url === 'https://openrouter.ai/api/v1/credits') {{
-                    return {{status:200, headers:{{}}, bodyText:JSON.stringify({{data:{{total_credits:10, total_usage:token === 'Bearer native-router' ? 2.5 : 4}}}})}};
-                }}
-                if (url === 'https://openrouter.ai/api/v1/key') {{
-                    return {{status:200, headers:{{}}, bodyText:JSON.stringify({{data:{{usage_daily:1.25}}}})}};
-                }}
-                observed.violations.push(request); persist();
-                throw new Error('unexpected HTTP fixture request');
-            }};
-            persist();
-        }})();
-        "#,
-        options = options,
-        path = json!(observation.to_string_lossy()),
-    );
-    plugin.entry_script = harness + plugin.entry_script.as_str();
-    plugin
-}
-
-fn observed(paths: &HermeticPaths) -> Value {
-    let observed: Value = serde_json::from_str(
-        &fs::read_to_string(paths.root.join("observed.json")).expect("fixture initialized"),
-    )
-    .unwrap();
-    assert_eq!(observed["violations"], json!([]), "{observed}");
-    assert!(
-        observed["subscriptions"]
-            .as_array()
-            .unwrap()
-            .contains(&json!(format!("~/{AUTH}")))
-    );
-    observed
-}
-
-fn probe(paths: &HermeticPaths, id: &str, options: Value) -> (Vec<Value>, Value) {
-    let plugin = install(paths, id, options);
-    let result = runtime::run_probe_in_sandbox(
-        &plugin,
-        &paths.app_data,
-        "test",
-        Some(&paths.overrides),
-        &paths.root,
-    );
-    assert!(
-        result
-            .subscriptions
-            .iter()
-            .any(|s| s.path == paths.root.join(AUTH)),
-        "missing OpenCode subscription: {:?}",
-        result.outputs.iter().map(|o| &o.lines).collect::<Vec<_>>()
-    );
-    let outputs = result
-        .outputs
-        .iter()
-        .map(|o| serde_json::to_value(o).unwrap())
-        .collect();
-    (outputs, observed(paths))
-}
+use support::credential_fixture::{AUTH, auth, probe, write};
 
 // Minimal plugin contracts isolate core source selection from provider HTTP and filesystem APIs.
 // Actual pinned probes and credential persistence are covered by the sandbox fixtures above.
@@ -184,6 +37,7 @@ fn selected_routes(id: &str, selection: &str, options: Value) -> (Vec<Value>, Va
         r#"
         function loadCredentials(ctx) {return {oauth:{accessToken:'native-claude'}};}
         function saveCredentials() {}
+        function refreshToken() {}
         function queryTokenUsage() {}
         function selectedToken(ctx) {return loadCredentials(ctx).oauth.accessToken;}
         "#
@@ -638,9 +492,17 @@ fn opencode_watch_survives_daemon_clear_discover_replace_lifecycle() {
                         panic!("replace after discovery");
                     };
                     assert_eq!(replaced, provider_id);
-                    assert_eq!(files.len(), 1);
-                    assert_eq!(files[0].path, expected_path);
-                    assert_eq!(files[0].existed_at_declaration, exists);
+                    assert_eq!(files.len(), 2);
+                    let auth = files
+                        .iter()
+                        .find(|file| file.path == expected_path)
+                        .unwrap();
+                    assert_eq!(auth.existed_at_declaration, exists);
+                    let pi = files
+                        .iter()
+                        .find(|file| file.path.ends_with(".pi/agent/auth.json"))
+                        .unwrap();
+                    assert!(!pi.existed_at_declaration);
                     ack.send(()).unwrap();
                 }
             }

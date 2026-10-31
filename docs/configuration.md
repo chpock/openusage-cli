@@ -36,7 +36,7 @@ used for account probes. Its keys are `default` and exact plugin IDs:
 
 ```yaml
 enabled_auth_sources:
-  default: [native, opencode]
+  default: [native, opencode, pi]
   codex: [opencode]
   copilot: [native]
 ```
@@ -47,13 +47,18 @@ enabled_auth_sources:
   Claude and OpenRouter overrides. Codex/Copilot support their `auth.json` and
   `accounts.json` candidates; Claude/OpenRouter read only
   `~/.local/share/opencode/auth.json` (see [provider details](plugin-overrides.md#claude-and-openrouter-opencode-credentials)).
+- `pi`: separate Pi accounts for Codex, Copilot, Claude and OpenRouter, read from
+  `~/.pi/agent/auth.json`. Their public `account.origin` is `pi` and name is `Pi`.
+  Codex uses only `openai-codex`, not Pi's newer `openai` OAuth family. See
+  [Pi credential formats and locking](plugin-overrides.md#pi-credentials).
 
 When an original plugin omits `origin`, even its OpenCode file reads count as
 `native`. The core uses the declared source, not a directory blacklist.
 
 A plugin entry completely replaces `default`. Plugins without an entry use
 `default`; an omitted section or omitted `default` uses the built-in
-`[native, opencode]`. An empty list disables all account probes for that
+`[native, opencode, pi]`. An explicitly configured list such as
+`[native, opencode]` is unchanged and excludes Pi. An empty list disables all account probes for that
 plugin without disabling the plugin itself. List order does not define
 priority, and repeated values do not cause repeated probes.
 
@@ -81,7 +86,7 @@ object and replaces the entire configuration-file object:
 
 ```bash
 openusage-cli query --use-daemon=false \
-  --enabled-auth-sources '{"default":["native","opencode"],"codex":["opencode"]}'
+  --enabled-auth-sources '{"default":["native","opencode","pi"],"codex":["pi"]}'
 ```
 
 `query --type=config` and `GET /v1/config` report the selected object as

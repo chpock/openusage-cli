@@ -231,7 +231,7 @@ Complete snapshot with a warning:
 | Property | Type | Presence | Meaning |
 | --- | --- | --- | --- |
 | `account.id` | string | Always | Opaque, provider-scoped output account ID |
-| `account.origin` | string | Always | Credential-source identifier; currently `native` or `opencode` for enabled sources |
+| `account.origin` | string | Always | Credential-source identifier; currently `native`, `opencode` or `pi` for enabled sources |
 | `account.isActive` | boolean | Always | Activity annotation supplied by discovery, defaulting to `true`; not a success or freshness flag |
 | `account.name` | string | Optional | Human-readable account label, when discovery provides one |
 
@@ -242,7 +242,9 @@ names need not be unique. `isActive: false` is not an instruction to the host to
 skip a probe; source selection is separate from this annotation.
 
 Single-account providers use `id: "default"`, `origin: "native"` and
-`isActive: true`. Discovery can add accounts such as `opencode-0`. When descriptor
+`isActive: true`. Discovery can add accounts such as `opencode-0` and `pi-0`.
+The bundled Codex, Copilot, Claude and OpenRouter overrides label Pi accounts with
+`origin: "pi"` and `name: "Pi"`. There is no separate public `source` field. When descriptor
 IDs collide, the host can emit deterministic IDs prefixed `acc_v1_` to preserve
 uniqueness. Clients must treat both original and generated IDs as opaque; an ID
 is not guaranteed unchanged after the credential identity or discovery topology
@@ -651,7 +653,7 @@ not by itself certify provider success.
 
 Discovery may suppress a failed account under its private
 `hide-if-other-account` policy when another enabled account descriptor exists,
-even if the other account also fails. OpenCode-origin errors remain visible.
+even if the other account also fails. OpenCode- and Pi-origin errors remain visible.
 Suppressed results are absent, not serialized with a hidden flag. See
 [Discovery error policy](plugin-overrides.md#discovery-error-policy).
 
@@ -753,7 +755,7 @@ resolved CLI/config/default selection and discovered plugin availability.
   "existingInstancePolicy": "error",
   "pluginsDir": "/usr/share/openusage-cli/plugins",
   "enabledPlugins": ["codex", "copilot"],
-  "enabledAuthSources": { "default": ["native", "opencode"], "codex": ["opencode"] },
+  "enabledAuthSources": { "default": ["native", "opencode", "pi"], "codex": ["opencode"] },
   "availablePlugins": { "active": ["codex", "copilot"], "inactive": ["claude"] },
   "appDataDir": "/home/example/.local/share/openusage-cli",
   "pluginOverridesDir": "/usr/share/openusage-cli/plugin-overrides",
@@ -772,7 +774,7 @@ resolved CLI/config/default selection and discovered plugin availability.
 | `existingInstancePolicy` | string | Always | `error`, `ignore` or `replace` |
 | `pluginsDir` | string or null | Always | Resolved plugin directory; normally populated |
 | `enabledPlugins` | array of strings | Always | Enabled-plugin selection masks, not necessarily expanded IDs |
-| `enabledAuthSources` | object mapping to arrays of strings | Always | `default` and optional exact plugin-ID policies; source values currently `native`, `opencode` |
+| `enabledAuthSources` | object mapping to arrays of strings | Always | `default` and optional exact plugin-ID policies; source values currently `native`, `opencode`, `pi` |
 | `availablePlugins` | object | Always | Active and inactive successfully discovered plugin IDs |
 | `availablePlugins.active` | array of strings | Always | Enabled IDs, regardless of account visibility or probe success |
 | `availablePlugins.inactive` | array of strings | Always | Discovered but disabled IDs |
@@ -811,7 +813,7 @@ Complete wrapped direct-config example:
     "existingInstancePolicy": "error",
     "pluginsDir": "/usr/share/openusage-cli/plugins",
     "enabledPlugins": ["*"],
-    "enabledAuthSources": { "default": ["native", "opencode"] },
+    "enabledAuthSources": { "default": ["native", "opencode", "pi"] },
     "availablePlugins": { "active": ["codex"], "inactive": [] },
     "appDataDir": "/home/example/.local/share/openusage-cli",
     "pluginOverridesDir": null,

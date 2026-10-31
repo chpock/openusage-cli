@@ -1,5 +1,5 @@
 // ── Copilot override: account discovery + source routing ──────────
-// This override adds opencode-* accounts to the Copilot plugin.
+// This override adds OpenCode and Pi accounts to the Copilot plugin.
 // It patches loadToken to route through exact selected credential sources
 // with no cross-file or native fallback.
 
@@ -63,6 +63,7 @@ function parseCopilotCredential(block) {
 var ROUTE_REGISTRY = {};
 
 var COPILOT_PROVIDER_KEY = "github-copilot";
+var PI_AUTH_PATH = "~/.pi/agent/auth.json";
 var OPENCODE_SOURCES = [
   {
     authPath: "~/.local/share/opencode/auth.json",
@@ -103,13 +104,14 @@ function discoverAccounts(ctx, originalDiscoverAccounts) {
     return accounts;
   }
 
-  function buildAccountDescriptor(id, label, stableSubjectKey) {
+  function buildAccountDescriptor(id, label, stableSubjectKey, origin) {
+    origin = origin || "opencode";
     var d = {
       id: id,
-      origin: "opencode",
+      origin: origin,
       isActive: true,
       name: label,
-      sourceRef: "opencode-auth:" + id
+      sourceRef: origin + "-auth:" + id
     };
     if (stableSubjectKey && typeof stableSubjectKey === "string") {
       d.stableSubjectKey = stableSubjectKey;
@@ -154,7 +156,7 @@ function discoverAccounts(ctx, originalDiscoverAccounts) {
     logWarn(ctx, "copilot override: " + message + " (path: " + path + ", account: " + routeId + ")");
   }
 
-  function readJsonFile(path, missingState, kindLabel) {
+  function readJsonFile(path, missingState, kindLabel, emptyWhitespace) {
     var fileExists;
     try {
       if (typeof fs.exists === "function") {
@@ -180,7 +182,7 @@ function discoverAccounts(ctx, originalDiscoverAccounts) {
       return { kind: "error", error: "Failed to read " + kindLabel + " file: " + String(e) };
     }
 
-    if (!isNonEmptyString(text)) {
+    if (!isNonEmptyString(text) || (emptyWhitespace && !text.trim())) {
       return { kind: "empty" };
     }
 
@@ -376,6 +378,37 @@ function discoverAccounts(ctx, originalDiscoverAccounts) {
     }
   }
 
+  var piResult;
+  try {
+    piResult = fs.exists(PI_AUTH_PATH) ? fs.withAuthFileLock(PI_AUTH_PATH, function () {
+      return readJsonFile(PI_AUTH_PATH, "missing", "Pi auth", true);
+    }) : { kind: "missing" };
+  } catch (_) {
+    piResult = { kind: "error" };
+  }
+  if (piResult.kind === "error" || (piResult.kind === "value" && piResult.doc[COPILOT_PROVIDER_KEY] !== undefined)) {
+    var piIndex = 0;
+    while (usedRouteIds["pi-" + piIndex]) piIndex++;
+    var piId = "pi-" + piIndex;
+    var route = { path: PI_AUTH_PATH, origin: "pi" };
+    if (piResult.kind === "error") {
+      route.error = "Failed to read or parse Pi auth.json.";
+    } else {
+      var entry = piResult.doc[COPILOT_PROVIDER_KEY];
+      if (!isPlainObject(entry) || entry.type !== "oauth" || typeof entry.access !== "string" ||
+          !isNonEmptyString(entry.refresh) || !entry.refresh.trim() ||
+          typeof entry.expires !== "number" || !Number.isFinite(entry.expires) || entry.expires < 0) {
+        route.error = "Invalid Pi github-copilot OAuth credentials.";
+      } else if (entry.enterpriseUrl !== undefined && entry.enterpriseUrl !== "" && entry.enterpriseUrl !== "github.com") {
+        route.error = "Pi Copilot Enterprise credentials are not supported.";
+      } else {
+        // Pi stores the GitHub token in refresh; access is an inference-only token.
+        route.token = entry.refresh.trim();
+      }
+    }
+    ROUTE_REGISTRY[piId] = route;
+    accounts.push(buildAccountDescriptor(piId, "Pi", piId, "pi"));
+  }
   return accounts;
 }
 
@@ -427,7 +460,7 @@ function patchLoadToken(originalLoadToken, ctx) {
     }
   }
 
-  return { token: route.token, source: "opencode", authPath: route.path };
+  return { token: route.token, source: route.origin || "opencode", authPath: route.path };
 }
 
 // Subscribe to candidate paths so the monitor knows about them.
@@ -436,6 +469,7 @@ for (var sj = 0; sj < OPENCODE_SOURCES.length; sj++) {
   globalThis.__openusage_ctx.host.fs.subscribeFile(OPENCODE_SOURCES[sj].accountsPath);
 }
 
+globalThis.__openusage_ctx.host.fs.subscribeFile(PI_AUTH_PATH);
 globalThis.patchDiscoverAccounts = discoverAccounts;
 return patchLoadToken;
 })();

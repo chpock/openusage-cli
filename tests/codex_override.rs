@@ -77,6 +77,8 @@ fn assert_subscriptions(obs: &Value, expected: &[&str]) {
         .as_array()
         .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
         .unwrap_or_default();
+    let mut expected = expected.to_vec();
+    expected.push("~/.pi/agent/auth.json");
     assert_eq!(subs, expected, "subscription mismatch");
 }
 
@@ -479,7 +481,7 @@ fn codex_override_private_state_stays_inside_closure() {
     assert!(result.outputs.is_empty(), "{result:?}");
     let obs = obs.unwrap();
     assert_eq!(obs["privateGlobals"], serde_json::json!([]));
-    assert_eq!(obs["subscriptions"].as_array().unwrap().len(), 4);
+    assert_eq!(obs["subscriptions"].as_array().unwrap().len(), 5);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -2363,11 +2365,12 @@ fn codex_override_run_probe_lifecycle() {
         ".local/share/opencode/accounts.json",
         ".config/opencode/auth.json",
         ".config/opencode/accounts.json",
+        ".pi/agent/auth.json",
     ]
     .iter()
     .map(|p| paths.root.join(p))
     .collect();
-    assert_eq!(result.subscriptions.len(), 4);
+    assert_eq!(result.subscriptions.len(), 5);
     for path in expected {
         let sub = result
             .subscriptions
@@ -2472,6 +2475,7 @@ async fn codex_override_daemon_disabled_sources_preserve_candidate_subscriptions
         ".local/share/opencode/accounts.json",
         ".config/opencode/auth.json",
         ".config/opencode/accounts.json",
+        ".pi/agent/auth.json",
     ]
     .iter()
     .map(|p| paths.root.join(p))

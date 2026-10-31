@@ -53,60 +53,86 @@ globalThis.__openusage_function_overrides = {
 };
 
 var patchLoadApiKey = (function () {
-  var authPath = "~/.local/share/opencode/auth.json";
-  var apiKey = null;
-  var credentialError = null;
+  var sources = [
+    { id: "opencode-0", origin: "opencode", name: "OpenCode", path: "~/.local/share/opencode/auth.json" },
+    { id: "pi-0", origin: "pi", name: "Pi", path: "~/.pi/agent/auth.json" },
+  ];
+  var routes = {};
 
   function isObject(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value);
   }
 
-  function readEntry(ctx) {
+  function readEntry(ctx, source) {
     var text;
     try {
-      if (!ctx.host.fs.exists(authPath)) return undefined;
-      text = ctx.host.fs.readText(authPath);
+      if (!ctx.host.fs.exists(source.path)) return undefined;
+      text = source.origin === "pi" ? ctx.host.fs.withAuthFileLock(source.path, function () {
+        return ctx.host.fs.readText(source.path);
+      }) : ctx.host.fs.readText(source.path);
     } catch (_) {
-      throw "Failed to read OpenCode auth.json.";
+      throw "Failed to read " + source.name + " auth.json.";
     }
     if (!text.trim()) return undefined;
     var doc;
     try {
       doc = JSON.parse(text);
     } catch (_) {
-      throw "Invalid OpenCode auth.json.";
+      throw "Invalid " + source.name + " auth.json.";
     }
-    if (!isObject(doc)) throw "Invalid OpenCode auth.json.";
+    if (!isObject(doc)) throw "Invalid " + source.name + " auth.json.";
     return doc.openrouter;
   }
 
+  function readKey(entry, source) {
+    if (!isObject(entry)) throw "Invalid " + source.name + " openrouter API credentials.";
+    var key;
+    if (source.origin === "opencode" && entry.type === "api") key = entry.key;
+    if (source.origin === "pi") {
+      if (entry.type === "api_key") {
+        key = entry.key;
+        if (typeof key === "string" && (key.trim().charAt(0) === "!" || key.indexOf("$") !== -1)) {
+          throw "Pi OpenRouter API-key expressions are not supported.";
+        }
+      } else if (entry.type === "oauth" && entry.refresh === "" &&
+          typeof entry.expires === "number" && Number.isFinite(entry.expires) && entry.expires >= 0) {
+        key = entry.access;
+      }
+    }
+    if (typeof key !== "string" || !key.trim()) throw "Invalid " + source.name + " openrouter API credentials.";
+    return key.trim();
+  }
+
   globalThis.patchDiscoverAccounts = function (ctx, original) {
-    apiKey = null;
-    credentialError = null;
+    routes = {};
     var accounts = original ? original(ctx) : [
       { id: "default", errorPolicy: "hide-if-other-account" },
     ];
-    try {
-      var entry = readEntry(ctx);
-      if (entry === undefined) return accounts;
-      if (!isObject(entry) || entry.type !== "api" ||
-          typeof entry.key !== "string" || !entry.key.trim()) {
-        throw "Invalid OpenCode openrouter API credentials.";
+    for (var i = 0; i < sources.length; i++) {
+      var source = sources[i];
+      var route = {};
+      try {
+        var entry = readEntry(ctx, source);
+        if (entry === undefined) continue;
+        route.key = readKey(entry, source);
+      } catch (error) {
+        route.error = error;
       }
-      apiKey = entry.key.trim();
-    } catch (error) {
-      credentialError = error;
+      routes[source.id] = route;
+      accounts.push({ id: source.id, origin: source.origin, name: source.name });
     }
-    accounts.push({ id: "opencode-0", origin: "opencode", name: "OpenCode" });
     return accounts;
   };
 
   globalThis.patchLoadApiKey = function (original, ctx) {
     if (ctx.account.id === "default") return original(ctx);
-    if (credentialError) throw credentialError;
-    return apiKey;
+    var route = routes[ctx.account.id];
+    if (route.error) throw route.error;
+    return route.key;
   };
 
-  globalThis.__openusage_ctx.host.fs.subscribeFile(authPath);
+  for (var i = 0; i < sources.length; i++) {
+    globalThis.__openusage_ctx.host.fs.subscribeFile(sources[i].path);
+  }
   return globalThis.patchLoadApiKey;
 })();

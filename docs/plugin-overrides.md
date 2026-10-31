@@ -75,6 +75,7 @@ fields:
   the runtime assigns `"native"` as the default. Known values:
   - `"native"` — credentials supplied by the original plugin.
   - `"opencode"` — OpenCode auth file credentials (Codex, Copilot, Claude and OpenRouter overrides).
+  - `"pi"` — Pi auth file credentials (the same four overrides).
   - Future releases may introduce additional identifiers.
 - `name` (optional string) — display label propagated to output
   `account.name`.
@@ -183,7 +184,7 @@ sent once per provider with the unioned subscriptions.
 Each provider refresh atomically replaces that provider's entire cache
 vector. A valid empty discovery list clears the provider's cached
 snapshots. The bundled Codex, Copilot, Claude and OpenRouter overrides use
-`discoverAccounts` for OpenCode discovery alongside the single default account.
+`discoverAccounts` for OpenCode and Pi discovery alongside the single default account.
 
 ### Claude and OpenRouter OpenCode credentials
 
@@ -216,7 +217,68 @@ OpenCode account. An unreadable file, malformed nonempty JSON or invalid provide
 entry produces an OpenCode error account without preventing native probing.
 Native errors are hidden when another enabled account exists, as for Codex and
 Copilot; successful native results remain visible. These overrides do not read
-`accounts.json`, `~/.config/opencode/auth.json` or Pi credentials.
+`accounts.json` or `~/.config/opencode/auth.json`. Their separate Pi source is
+specified below.
+
+### Pi credentials
+
+Codex, Copilot, Claude and OpenRouter also read **only**
+`~/.pi/agent/auth.json`. This fixed path is not overridden by
+`PI_CODING_AGENT_DIR`. Each present provider entry adds a distinct `pi-0` account
+with `origin: "pi"` and name `Pi`; a collision with an existing Codex/Copilot
+route reserves the next free `pi-*` identifier. Selection remains in the core.
+Selected Pi credentials never fall back to OpenCode or native credentials.
+
+| Usage provider | Pi provider key | Accepted credential |
+| --- | --- | --- |
+| Claude | `anthropic` | `type: "oauth"`, nonempty `access` and `refresh`, finite nonnegative epoch-ms `expires` |
+| Codex | `openai-codex` | OAuth fields above plus nonempty `accountId` |
+| Copilot | `github-copilot` | `type: "oauth"`, string `access`, nonempty `refresh`, finite nonnegative epoch-ms `expires` |
+| OpenRouter | `openrouter` | `type: "api_key"` with a literal nonempty `key`, or `type: "oauth"` with nonempty `access`, empty `refresh` and finite nonnegative `expires` |
+
+Pi's newer `openai` OAuth entry is **not** an alias for `openai-codex` and is
+not read by the Codex override: its client, refresh protocol and API resource
+are different. Ordinary Anthropic/OpenAI API keys do not provide subscription
+quota access. Copilot uses `refresh`, which contains Pi's GitHub device-flow
+token; `access` is a short-lived inference token and is not used for usage.
+Copilot Enterprise credentials are rejected rather than sent to public GitHub.
+OpenRouter API-key command/environment expressions are rejected, never executed
+or transmitted as keys; credential-local `env` resolution is not implemented.
+OpenRouter retains its independent USD correction and never writes Pi credentials.
+
+All four overrides subscribe to the Pi file during evaluation, even when absent
+or excluded from account probes. Missing/whitespace-only files and absent provider
+keys add no Pi account. Unreadable/malformed documents and invalid present entries
+produce Pi error accounts; other sources still probe independently.
+
+Pi reads take a short shared lease. Claude/Codex refresh holds the same lease
+through rereading the selected entry, deciding whether another holder already
+supplied usable credentials, requesting refresh and saving. Unchanged rejected
+tokens and changed but expired tokens still refresh. Only the selected entry's
+token fields and expiry change; sibling providers and metadata are preserved.
+Claude preserves Pi's five-minute renewal margin; Codex writes the expiry returned
+by the legacy token endpoint. Save-time credential replacement, malformed refresh
+expiry, lock/reload and persistence failures are visible account errors. Native
+transient-refresh behavior otherwise remains unchanged, including using the same
+prior token when it still succeeds. Local Claude Code/Codex logs are not added to
+Pi accounts because they cannot be attributed to that login.
+
+The shared host method is `ctx.host.fs.withAuthFileLock(path, operation)`, returning
+the synchronous callback's value. It uses Pi 1.4's `proper-lockfile` protocol:
+lexical absolute filename plus `.lock`, atomic directory creation, 30-second stale
+and acquisition-wait thresholds, and a 2-second native heartbeat that continues
+while JavaScript waits on native HTTP. It does not create the credential file or
+its parent directory. Nested acquisition of the same lock and Promise results
+are rejected. Private lease checks run before matching `writeText` truncation and
+on callback completion; exceptions still release an owned lease, while a
+compromised/replaced lock is not removed.
+
+This is a cooperative expiring lease, not an atomic-file transaction or fencing
+mechanism. It coordinates with Pi's lock-taking operations, not unlocked readers
+or arbitrary writers. Manual lock removal, process suspension, path aliases and
+incompatible lease settings retain protocol limitations; filesystem write failure
+can still leave a partial document. OpenCode refresh remains unlocked as described
+above. File monitoring retains its [symbolic-link limitation](provider-file-monitoring.md#symbolic-link-limitation).
 
 ## Example wrapper
 
