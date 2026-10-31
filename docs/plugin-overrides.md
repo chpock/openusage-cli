@@ -74,7 +74,7 @@ fields:
 - `origin` (optional string) — identifies the credential source. If absent,
   the runtime assigns `"native"` as the default. Known values:
   - `"native"` — credentials supplied by the original plugin.
-  - `"opencode"` — OpenCode auth file credentials (Codex/Copilot overrides).
+  - `"opencode"` — OpenCode auth file credentials (Codex, Copilot, Claude and OpenRouter overrides).
   - Future releases may introduce additional identifiers.
 - `name` (optional string) — display label propagated to output
   `account.name`.
@@ -182,8 +182,41 @@ sent once per provider with the unioned subscriptions.
 
 Each provider refresh atomically replaces that provider's entire cache
 vector. A valid empty discovery list clears the provider's cached
-snapshots. The bundled Codex and Copilot overrides use `discoverAccounts`
-for multi-account discovery alongside the single default account.
+snapshots. The bundled Codex, Copilot, Claude and OpenRouter overrides use
+`discoverAccounts` for OpenCode discovery alongside the single default account.
+
+### Claude and OpenRouter OpenCode credentials
+
+Both overrides read only `~/.local/share/opencode/auth.json` and subscribe to
+that path even when the file does not exist. Native credentials remain the
+`default` account; a present provider entry adds `opencode-0` with
+`origin: "opencode"` and name `OpenCode`. The core's `enabled_auth_sources`
+selection applies independently to those accounts. A selected OpenCode account
+never falls back to native credentials.
+
+Claude requires an `anthropic` entry with `type: "oauth"`, nonempty `access`
+and `refresh` strings, and a finite nonnegative `expires` number in milliseconds
+since the Unix epoch. It uses the native OAuth usage/profile/refresh flow. Token
+refresh re-reads the file and updates only the entry's `access`, `refresh` and
+`expires`, preserving other entry fields and providers. Persistence failure is
+an account error, not a successful refresh. A selected entry changed before the
+save-time read is rejected rather than overwritten. The read/modify/write is not
+a cross-process transaction with OpenCode: changes after that read can race, and
+a partial filesystem write can damage the file. Live usage still requires the token's
+server-granted permissions; no scopes are inferred from this file. Local Claude
+Code spend metrics remain exclusive to the native account because those logs
+cannot be attributed to the separate OpenCode login.
+
+OpenRouter requires an `openrouter` entry with `type: "api"` and a nonempty
+`key` string. It reuses native usage requests and retains the USD correction
+below; it never writes credentials.
+
+Missing files, whitespace-only files and absent provider entries add no
+OpenCode account. An unreadable file, malformed nonempty JSON or invalid provider
+entry produces an OpenCode error account without preventing native probing.
+Native errors are hidden when another enabled account exists, as for Codex and
+Copilot; successful native results remain visible. These overrides do not read
+`accounts.json`, `~/.config/opencode/auth.json` or Pi credentials.
 
 ## Example wrapper
 
@@ -291,8 +324,8 @@ behavioral regressions and conditions for removing the correction after an
 upstream fix. Read that register during every plugin update and before deleting
 an override or one of its callbacks.
 
-Not every override is temporary. Codex and Copilot also implement first-party
-OpenCode multi-account behavior. A native bug fix does not justify removing
+Not every override is temporary. Codex, Copilot, Claude and OpenRouter also
+implement first-party OpenCode account discovery and routing. A native bug fix does not justify removing
 those features. Prove corrected native behavior with only the relevant repair
 disabled, retain the regression, and record the verified-good upstream revision
 and removal disposition. Passing tests with the repair enabled is not evidence

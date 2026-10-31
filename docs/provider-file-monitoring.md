@@ -225,6 +225,14 @@ The predeclared paths are:
 Persistence and auth-priority behaviour for OpenCode accounts are defined by
 the overrides and may differ from the upstream plugin contract.
 
+## Claude and OpenRouter behaviour
+
+The Claude and OpenRouter overrides predeclare only
+`~/.local/share/opencode/auth.json` during override evaluation, including when
+it is absent or account probes are disabled. Creation, repair, replacement and
+deletion therefore use the same targeted refresh/discovery cycle. These providers
+do not subscribe to `accounts.json` or the config-directory auth candidate.
+
 ## Symbolic link limitation
 
 The monitor stores declared paths as lexical (non-canonicalised) paths.  If a

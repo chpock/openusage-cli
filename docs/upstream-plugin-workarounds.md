@@ -20,7 +20,7 @@ the shared host APIs retain their documented contracts.
 
 | ID | Native defect | Local correction | Status / retirement scope |
 | --- | --- | --- | --- |
-| [CU-001](#cu-001-openrouter-usd-text) | OpenRouter formats USD amounts as cents. | `openrouter.js`: `creditsLines` and `appendSpend` wrappers. | Implemented, regression-tested and independently reviewed. The file is currently correction-only. |
+| [CU-001](#cu-001-openrouter-usd-text) | OpenRouter formats USD amounts as cents. | `openrouter.js`: `creditsLines` and `appendSpend` wrappers. | Implemented, regression-tested and independently reviewed. Preserve the file's first-party OpenCode authentication support. |
 | [CU-002](#cu-002-deepseek-balance-currency) | DeepSeek accepts a CNY balance but declares USD output. | `deepseek.js`: currency selection tracking and probe wrapper. | Implemented, regression-tested and independently reviewed. The file is currently correction-only. |
 | [CU-003](#cu-003-codex-reset-detail-credentials) | Codex's optional reset-details request can use the pre-refresh token. | Three targeted wrappers inside `codex.js`. | Implemented, regression-tested and independently reviewed. Do **not** remove the whole Codex override. |
 | [CU-004](#cu-004-antigravity-cli-refresh-destination) | Antigravity CLI can read one keychain selector and refresh into another. | Caller-local `wrapProbe` correction in `antigravity-cli.js`. | Implemented, regression-tested and independently reviewed. The file is currently correction-only. |
@@ -112,8 +112,9 @@ cargo test --locked --test provider_metrics_override openrouter_override
 **Remove only when:** the candidate's native output represents those USD amounts
 correctly without these wrappers, including partial-data and large-number cases;
 progress values and shared formatter semantics remain correct. Disable both AST
-registrations for the native proof. Once proven, remove the whole correction-only
-file and adapt the fixture's optional loading, retaining the behavioral tests.
+registrations for the native proof. Once proven, remove only those monetary
+wrappers and registrations, retaining the behavioral tests and the file's
+first-party OpenCode account discovery, credential routing and file subscription.
 A credits-endpoint authorization change alone does not resolve this units bug;
 do not request a management key merely to make the fixture succeed.
 
@@ -377,8 +378,9 @@ removal review and integrated checks; none has been established yet.
 
 ## What is not an upstream plugin workaround
 
-- Codex/Copilot OpenCode multi-account discovery, origin filtering, source routing,
-  credential persistence and file subscriptions are first-party capabilities.
+- OpenCode account discovery, origin filtering, source routing, credential
+  persistence and file subscriptions in the Codex, Copilot, Claude and OpenRouter
+  overrides are first-party capabilities, not temporary upstream repairs.
 - Adapting an AST hook after legitimate upstream refactoring is compatibility
   maintenance, not proof that the refactoring was an upstream defect.
 - Closure-private registries and complete write-observation fixtures corrected

@@ -43,8 +43,10 @@ enabled_auth_sources:
 
 - `native`: authentication supported by the original plugin, including its
   own file, environment, and keychain mechanisms.
-- `opencode`: additional OpenCode authentication supplied by the Codex/Copilot
-  overrides, including their `auth.json` and `accounts.json` candidates.
+- `opencode`: additional OpenCode authentication supplied by the Codex, Copilot,
+  Claude and OpenRouter overrides. Codex/Copilot support their `auth.json` and
+  `accounts.json` candidates; Claude/OpenRouter read only
+  `~/.local/share/opencode/auth.json` (see [provider details](plugin-overrides.md#claude-and-openrouter-opencode-credentials)).
 
 When an original plugin omits `origin`, even its OpenCode file reads count as
 `native`. The core uses the declared source, not a directory blacklist.

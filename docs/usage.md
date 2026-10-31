@@ -212,8 +212,9 @@ http://127.0.0.1:6738
   provider's cached snapshots.
 
   Vendored plugins do not natively implement `discoverAccounts`, but the
-  bundled Codex and Copilot overrides add it. Alongside `default`, they inspect
-  these OpenCode auth candidates in stable path-index order:
+  bundled Codex, Copilot, Claude and OpenRouter overrides add it. Alongside
+  `default`, Codex and Copilot inspect these OpenCode auth candidates in stable
+  path-index order:
 
   1. `~/.local/share/opencode/auth.json` (candidate 0)
   2. `~/.config/opencode/auth.json` (candidate 1)
@@ -223,6 +224,11 @@ http://127.0.0.1:6738
   the `hide-if-other-account` policy; OpenCode account errors remain visible.
   An OpenCode account uses only its selected source and never falls back to a
   different OpenCode file or native credentials.
+
+  Claude and OpenRouter inspect only `~/.local/share/opencode/auth.json`, adding
+  `opencode-0` for their `anthropic` OAuth and `openrouter` API entries respectively.
+  The same source isolation and native-error policy apply; see
+  [credential formats and refresh behavior](plugin-overrides.md#claude-and-openrouter-opencode-credentials).
 
   Future multi-account providers will add additional items with the same
   `providerId` and a distinct output account `id`. The collection remains a flat
